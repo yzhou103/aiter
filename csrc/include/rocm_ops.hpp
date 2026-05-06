@@ -478,6 +478,17 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
+#define GEMM_A16W16_PYBIND                       \
+    m.def("gemm_a16w16_hip",                     \
+          &aiter::gemm_a16w16_hip,               \
+          "HIP gemm a16w16",                     \
+          py::arg("A"),                          \
+          py::arg("B"),                          \
+          py::arg("C"),                          \
+          py::arg("bpreshuffle"),                \
+          py::arg("add_bias"),                   \
+          py::arg("splitk") = -1);
+
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
           &gemm_a4w4_blockscale,    \

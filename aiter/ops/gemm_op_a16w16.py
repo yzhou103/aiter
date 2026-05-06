@@ -8,6 +8,17 @@ from ..jit.core import compile_ops
 import functools
 
 
+@compile_ops("module_gemm_a16w16")
+def gemm_a16w16_hip(
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    bpreshuffle: bool,
+    add_bias: int,
+    splitk: int = -1,
+) -> None: ...
+
+
 @compile_ops(
     "module_gemm_a16w16_asm",
     fc_name="gemm_a16w16_asm",
