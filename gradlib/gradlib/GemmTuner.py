@@ -650,6 +650,7 @@ class Gemm:
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,
+                            "testGraph": self.m * self.n * self.k * 2 < 5e8,
                         },
                         get_gemm_ref,
                         (
@@ -752,6 +753,7 @@ class Gemm:
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,
+                            "testGraph": self.m * self.n * self.k * 2 < 5e8,
                         },
                         get_gemm_ref,
                         (
@@ -884,6 +886,7 @@ class Gemm:
                     {
                         "num_warmup": self.num_warmup,
                         "num_iters": 101,
+                        "testGraph": self.m * self.n * self.k * 2 < 5e8,
                     },
                     get_gemm_ref,
                     (
@@ -953,6 +956,7 @@ class Gemm:
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
+                    "testGraph": self.m * self.n * self.k * 2 < 5e8,
                 },
                 get_gemm_ref,
                 (
@@ -1021,6 +1025,7 @@ class Gemm:
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
+                    "testGraph": self.m * self.n * self.k * 2 < 5e8,
                 },
                 get_gemm_ref,
                 (
@@ -1084,6 +1089,7 @@ class Gemm:
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
+                    "testGraph": self.m * self.n * self.k * 2 < 5e8,
                 },
                 get_gemm_ref,
                 (
@@ -1154,6 +1160,7 @@ class Gemm:
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
+                        "testGraph": self.m * self.n * self.k * 2 < 5e8,
                     },
                     get_gemm_ref if fast_mode == 0 else None,
                     (

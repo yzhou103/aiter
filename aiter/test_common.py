@@ -102,18 +102,21 @@ def perftest(
             avg = get_trace_perf(prof, num_iters)
 
             if testGraph:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    data = run_iters_rotate(num_iters, func, rotate_args)
-                with tpf.profile(
-                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                    profile_memory=True,
-                    with_stack=True,
-                    with_modules=True,
-                ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+                try:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        data = run_iters_rotate(num_iters, func, rotate_args)
+                    with tpf.profile(
+                        activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                        profile_memory=True,
+                        with_stack=True,
+                        with_modules=True,
+                    ) as prof:
+                        run_iters(1, graph.replay)
+                    avg = get_trace_perf(prof, num_iters)
+                    logger.info(f"avg: {avg} us/iter with hipgraph")
+                except Exception as e:
+                    logger.warning(f"hipgraph capture failed ({e}), using non-graph timing")
 
             return data, avg
 
