@@ -104,6 +104,11 @@ class OpusGemmInstance:
         elif self.kernel_tag == "a16w16_flatmm_splitk":
             parts.insert(tag_at, "flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a16w16_bhsd":
+            parts.insert(tag_at, "bhsd")
+        elif self.kernel_tag == "a16w16_bhsd_splitk":
+            parts.insert(tag_at, "bhsd_splitk")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a16w16_persistent":
             parts.insert(tag_at, "persistent")
         elif self.kernel_tag == "a16w16_mono_tile":
@@ -337,6 +342,90 @@ a16w16_flatmm_splitk_kernels_list_nooob = {
         inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU, has_oob=False,
     )
     for kid, inst in a16w16_flatmm_splitk_kernels_list.items()
+}
+
+
+# -- a16w16_bhsd (BHSD-fused batch GEMM: split-barrier + flatmm_splitk) -----
+# Reuses the same tile/MFMA configs as the base pipelines but with BHSD kargs.
+def _a16w16_bhsd(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True,
+                 cachectl_a=0, cachectl_b=17):
+    vec = 16 // 2
+    inst = OpusGemmInstance(
+        bs, bm, bn, bk, 2, tn, wm, wn, wk,
+        vec, vec, 4, 0, 0, 0,
+        "a16w16_bhsd",
+        ["fp32_t", "bf16_t"],
+        has_oob=has_oob,
+    )
+    inst.cachectl_a = cachectl_a
+    inst.cachectl_b = cachectl_b
+    return inst
+
+
+def _a16w16_bhsd_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
+    vec = 16 // 2
+    return OpusGemmInstance(
+        256, bm, bn, bk, 2, 1, 16, 16, 32,
+        vec, vec, 4, 0, 0, 0,
+        "a16w16_bhsd_splitk",
+        ["fp32_t"],
+        wg_per_cu,
+        has_oob=has_oob,
+    )
+
+
+# kid 650..655: BHSD split-barrier (mirror a16w16 kids 4..9)
+a16w16_bhsd_kernels_list = {
+    650: _a16w16_bhsd(256, 128, 256, 32,  2, 16, 16, 32),
+    651: _a16w16_bhsd(256, 256, 128, 32,  2, 16, 16, 32),
+    652: _a16w16_bhsd(512, 128, 128, 64,  4, 16, 16, 32),
+    653: _a16w16_bhsd(512, 256, 128, 64,  4, 16, 16, 32),
+    654: _a16w16_bhsd(512, 128, 256, 64,  4, 16, 16, 32),
+    655: _a16w16_bhsd(512, 256, 256, 64,  4, 16, 16, 32),
+}
+
+a16w16_bhsd_kernels_list_nooob = {
+    kid + 1000: _a16w16_bhsd(
+        inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
+        inst.T_N, inst.W_M, inst.W_N, inst.W_K, has_oob=False,
+        cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
+    )
+    for kid, inst in a16w16_bhsd_kernels_list.items()
+}
+
+# kid 600..623: BHSD flatmm_splitk (mirror a16w16_flatmm_splitk kids 200..223)
+a16w16_bhsd_splitk_kernels_list = {
+    600: _a16w16_bhsd_splitk( 64,  64,  64, 2),
+    601: _a16w16_bhsd_splitk( 32,  32,  64, 2),
+    602: _a16w16_bhsd_splitk( 32,  32, 128, 2),
+    603: _a16w16_bhsd_splitk( 32,  64,  64, 2),
+    604: _a16w16_bhsd_splitk( 32, 128,  64, 2),
+    605: _a16w16_bhsd_splitk( 64,  32,  64, 2),
+    606: _a16w16_bhsd_splitk( 64,  32, 128, 2),
+    607: _a16w16_bhsd_splitk(128,  32,  64, 2),
+    608: _a16w16_bhsd_splitk( 64,  64, 128, 1),
+    609: _a16w16_bhsd_splitk(256,  32,  64, 1),
+    610: _a16w16_bhsd_splitk( 32, 256,  64, 1),
+    611: _a16w16_bhsd_splitk( 32,  96,  64, 1),
+    612: _a16w16_bhsd_splitk( 32,  96,  64, 2),
+    613: _a16w16_bhsd_splitk( 32,  96, 128, 1),
+    614: _a16w16_bhsd_splitk( 64,  96,  64, 1),
+    615: _a16w16_bhsd_splitk( 64,  96,  64, 2),
+    616: _a16w16_bhsd_splitk( 64,  96, 128, 1),
+    617: _a16w16_bhsd_splitk( 96,  32,  64, 1),
+    618: _a16w16_bhsd_splitk( 96,  32,  64, 2),
+    619: _a16w16_bhsd_splitk( 96,  32, 128, 1),
+    620: _a16w16_bhsd_splitk( 96,  64,  64, 1),
+    621: _a16w16_bhsd_splitk( 96,  64,  64, 2),
+    622: _a16w16_bhsd_splitk( 96,  64, 128, 1),
+    623: _a16w16_bhsd_splitk( 96,  96,  64, 2),
+}
+
+a16w16_bhsd_splitk_kernels_list_nooob = {
+    kid + 1000: _a16w16_bhsd_splitk(
+        inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU, has_oob=False,
+    )
+    for kid, inst in a16w16_bhsd_splitk_kernels_list.items()
 }
 
 # -- a16w16 persistent (M-outer + N-fast XCD swizzle) ---------------------- Pipeline:
@@ -731,7 +820,7 @@ gfx942_kernels_list = {**gfx942_nosplit_kernels_list, **gfx942_splitk_kernels_li
 # -- gfx1250 kernel lists ----------------------------------------------------
 # Kid offset: gfx1250 kids live in the 20000+ range, disjoint from gfx950
 # (<10000) and gfx942 (50000+). Today only the cluster/TDM split-K (atomic
-# fp32 reduction) pipeline is wired (打通阶段：fp32 output, no bias).
+# fp32 reduction) pipeline is wired (????:fp32 output, no bias).
 GFX1250_KID_OFFSET = 20000
 
 
@@ -1012,6 +1101,10 @@ kernels_list = {
     **a16w16_persistent_kernels_list_nooob,
     **a16w16_persistent_kernels_list_cpol_nooob,
     **a16w16_mono_tile_kernels_list,
+    **a16w16_bhsd_kernels_list,
+    **a16w16_bhsd_kernels_list_nooob,
+    **a16w16_bhsd_splitk_kernels_list,
+    **a16w16_bhsd_splitk_kernels_list_nooob,
     **a16w16_kernels_list_4g_safe,
     **a16w16_kernels_list_4g_safe_nooob,
     **a16w16_persistent_kernels_list_4g_safe,
@@ -1036,6 +1129,8 @@ default_kernels_dict = {
 SPLITK_KIDS = (
     frozenset(a16w16_flatmm_splitk_kernels_list.keys())
     | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
+    | frozenset(a16w16_bhsd_splitk_kernels_list.keys())
+    | frozenset(a16w16_bhsd_splitk_kernels_list_nooob.keys())
     | frozenset(gfx942_splitk_kernels_list.keys())
     | frozenset(gfx1250_kernels_list.keys())
     | frozenset(gfx1250_clusterlaunch_kernels_list.keys())
@@ -1053,6 +1148,8 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_persistent_kernels_list_nooob.keys())
     | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
     | frozenset(a16w16_mono_tile_kernels_list.keys())
+    | frozenset(a16w16_bhsd_kernels_list.keys())
+    | frozenset(a16w16_bhsd_kernels_list_nooob.keys())
     | frozenset(gfx942_nosplit_kernels_list.keys())  # 10000/10001/10002/10003/10300
 )
 

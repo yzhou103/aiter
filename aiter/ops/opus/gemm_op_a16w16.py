@@ -529,8 +529,193 @@ def gemm_a16w16_opus(
 def opus_gemm_workspace_init() -> None: ...
 
 
+def _gen_opus_gemm_a16w16_bhsd_fake_tensors(
+    A: torch.Tensor,
+    W: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a16w16_bhsd",
+    gen_fake=_gen_opus_gemm_a16w16_bhsd_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a16w16_bhsd_raw(
+    A: torch.Tensor,
+    W: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+def batch_gemm_a16w16_bhsd_opus(
+    A: Tensor,
+    W: Tensor,
+    heads_per_group: int,
+    *,
+    kernelId: Optional[int] = None,
+    splitK: Optional[int] = None,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """BHSD-layout batch GEMM for MLA output projection.
+
+    Fuses the BHSD->BSHD transpose into the A-matrix address calculation,
+    avoiding a full HBM read-write pass for the transpose.
+
+    Parameters
+    ----------
+    A : [B, H, S, D] bf16 -- attention output in BHSD layout.
+        H = n_groups * heads_per_group, D = head_dim.
+    W : [G, R, K] bf16 -- wo_a weight reshaped to group form.
+        G = n_groups, R = o_lora_rank, K = heads_per_group * head_dim.
+    heads_per_group : int -- number of heads per group (e.g. 8 for DSv4).
+
+    Returns
+    -------
+    Tensor [B, S, G, R] -- the output projection result.
+    """
+    assert A.ndim == 4, f"A must be 4D [B, H, S, D], got {A.shape}"
+    assert W.ndim == 3, f"W must be 3D [G, R, K], got {W.shape}"
+    B, H, S, D = A.shape
+    G = W.shape[0]
+    R = W.shape[1]
+    K = W.shape[2]
+    assert H == G * heads_per_group, (
+        f"H={H} must equal G*hpg={G}*{heads_per_group}"
+    )
+    assert K == heads_per_group * D, (
+        f"K={K} must equal hpg*D={heads_per_group}*{D}"
+    )
+
+    # Reshape A: [B, H, S, D] -> [B*G, hpg, S, D]
+    A_reshaped = A.view(B, G, heads_per_group, S, D).permute(0, 1, 2, 3, 4)
+    A_reshaped = A_reshaped.reshape(B * G, heads_per_group, S, D).contiguous()
+
+    # Expand W: [G, R, K] -> [B*G, R, K]
+    W_expanded = W.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * G, R, K).contiguous()
+
+    # Allocate output
+    if out is not None:
+        assert out.shape == (B, S, G, R), f"out shape must be [{B},{S},{G},{R}]"
+        Y = out.view(B * G, S, R)
+    else:
+        Y = torch.empty(B * G, S, R, dtype=dtype, device=A.device)
+
+    # Default kid: 608 (64x64x128 WG=1 splitk) -- good for decode M<=4
+    kid = kernelId if kernelId is not None else 608
+    sk = splitK if splitK is not None else 0
+
+    _opus_gemm_a16w16_bhsd_raw(A_reshaped, W_expanded, Y, kid, sk)
+
+    return Y.view(B, G, S, R).permute(0, 2, 1, 3)  # [B, S, G, R]
+
+
+def batch_gemm_a16w16_bshd_opus(
+    A: Tensor,
+    W: Tensor,
+    heads_per_group: int,
+    *,
+    kernelId: Optional[int] = None,
+    splitK: Optional[int] = None,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    use_standard_pipeline: bool = True,
+) -> Tensor:
+    """BSHD-layout batch GEMM for MLA output projection.
+
+    A is in BSHD layout [B, S, H, D] (DSv4 default from sparse_attn).
+    Avoids the full HBM transpose by passing strided views to the kernel.
+
+    Two pipeline paths (selected by use_standard_pipeline):
+      True  -- standard a16w16 batch GEMM (kids 4-9 / 200-223): constructs
+              a strided 3D view [G, S, K] where K=hpg*D is contiguous within
+              each group. No head remapping needed.
+      False -- BHSD a_offset remapping pipeline (kids 600-655): constructs a
+              strided 4D view [G, hpg, S, D]. The kernel's a_offset does
+              div/mod to remap tile_k, but for BSHD this degenerates to an
+              identity (h*D+d == k_abs). Slightly more overhead per tile.
+
+    Parameters
+    ----------
+    A : [B, S, H, D] bf16 -- attention output in BSHD layout.
+    W : [G, R, K] bf16 -- wo_a weight.
+    heads_per_group : int -- number of heads per group (e.g. 8 for DSv4).
+    use_standard_pipeline : bool -- True uses standard kids, False uses BHSD
+        a_offset remapping kids. Default True (simpler, no div/mod).
+
+    Returns
+    -------
+    Tensor [B, S, G, R] -- the output projection result.
+    """
+    assert A.ndim == 4, f"A must be 4D [B, S, H, D], got {A.shape}"
+    assert W.ndim == 3, f"W must be 3D [G, R, K], got {W.shape}"
+    B, S, H, D = A.shape
+    G = W.shape[0]
+    R = W.shape[1]
+    K = W.shape[2]
+    assert H == G * heads_per_group, (
+        f"H={H} must equal G*hpg={G}*{heads_per_group}"
+    )
+    assert K == heads_per_group * D, (
+        f"K={K} must equal hpg*D={heads_per_group}*{D}"
+    )
+
+    if out is not None:
+        assert out.shape == (B, S, G, R), f"out shape must be [{B},{S},{G},{R}]"
+        Y_full = out
+    else:
+        Y_full = torch.empty(B, S, G, R, dtype=dtype, device=A.device)
+
+    hpg = heads_per_group
+
+    if use_standard_pipeline:
+        # Standard a16w16 batch GEMM path: K is contiguous within each group,
+        # so we build a strided 3D view and use standard kids directly.
+        kid = kernelId if kernelId is not None else 208
+        sk = splitK if splitK is not None else 0
+
+        for b in range(B):
+            # A[b] = [S, H, D] contiguous, strides [H*D, D, 1].
+            # View as [S, G, K] with strides [H*D, hpg*D, 1].
+            # Then transpose to [G, S, K] with strides [hpg*D, H*D, 1].
+            # K dimension is contiguous (stride=1), batch stride < row stride.
+            A_b = A[b].view(S, G, K).permute(1, 0, 2)  # [G, S, K]
+
+            Y_b = torch.empty(G, S, R, dtype=dtype, device=A.device)
+
+            # Bypass the Python layout check (it rejects stride_a_batch < M*K),
+            # go directly to the C++ entry which uses XQ.stride() correctly.
+            _opus_gemm_a16w16_tune_raw(A_b, W, Y_b, None, kid, sk)
+
+            Y_full[b] = Y_b.permute(1, 0, 2)  # [S, G, R]
+    else:
+        # BHSD a_offset remapping path: pass 4D strided view [G, hpg, S, D].
+        kid = kernelId if kernelId is not None else 608
+        sk = splitK if splitK is not None else 0
+
+        for b in range(B):
+            A_b = A[b].view(S, G, hpg, D).permute(1, 2, 0, 3)  # [G, hpg, S, D]
+
+            Y_b = torch.empty(G, S, R, dtype=dtype, device=A.device)
+
+            _opus_gemm_a16w16_bhsd_raw(A_b, W, Y_b, kid, sk)
+
+            Y_full[b] = Y_b.permute(1, 0, 2)  # [S, G, R]
+
+    return Y_full
+
+
 __all__ = [
     "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
+    "batch_gemm_a16w16_bhsd_opus",
+    "batch_gemm_a16w16_bshd_opus",
 ]

@@ -293,6 +293,18 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
+#define OPUS_GEMM_A16W16_BHSD_PYBIND              \
+    m.def("opus_gemm_a16w16_bhsd",                \
+          &opus_gemm_a16w16_bhsd,                 \
+          "BHSD-fused batch GEMM for MLA output " \
+          "projection (fuses transpose into A "   \
+          "address calculation)",                 \
+          py::arg("A"),                           \
+          py::arg("W"),                           \
+          py::arg("Y"),                           \
+          py::arg("kernelId") = 0,                \
+          py::arg("splitK")   = 0);
+
 #define OPUS_GEMM_WORKSPACE_INIT_PYBIND                              \
     m.def("opus_gemm_workspace_init",                                \
           &opus_gemm_workspace_init,                                 \

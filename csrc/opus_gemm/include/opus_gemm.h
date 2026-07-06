@@ -28,5 +28,15 @@ void opus_gemm_a16w16_tune(aiter_tensor_t& XQ,
                            int kernelId,
                            int splitK);
 
+// BHSD-fused batch GEMM for MLA output projection.
+// A: [batch, heads_per_group, seqlen, head_dim], bf16
+// W: [batch, N, K], bf16 (K = heads_per_group * head_dim)
+// Y: [batch, seqlen, N], bf16 or fp32
+void opus_gemm_a16w16_bhsd(aiter_tensor_t& A,
+                           aiter_tensor_t& W,
+                           aiter_tensor_t& Y,
+                           int kernelId,
+                           int splitK);
+
 // Per-stream splitk workspace init. See opus_gemm.cu for rationale.
 void opus_gemm_workspace_init();

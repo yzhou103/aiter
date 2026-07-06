@@ -322,6 +322,44 @@ void opus_gemm_a16w16_tune(
   }
 }
 
+// ── opus_gemm_a16w16_bhsd() — BHSD-fused batch GEMM entry ───────────────────
+
+void opus_gemm_a16w16_bhsd(
+    aiter_tensor_t &A,
+    aiter_tensor_t &W,
+    aiter_tensor_t &Y,
+    int kernelId,
+    int splitK)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(A.dim() == 4, "A must be 4D [batch, hpg, seqlen, head_dim]");
+  AITER_CHECK(W.dim() == 3, "W must be 3D [batch, N, K]");
+  AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, seqlen, N]");
+  AITER_CHECK(A.dtype() == AITER_DTYPE_bf16 && W.dtype() == AITER_DTYPE_bf16,
+              "A and W must be bf16");
+
+  if (opus_kid_is_splitk(kernelId))
+  {
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                || Y.dtype() == AITER_DTYPE_fp32,
+                "opus_gemm_a16w16_bhsd splitk kid requires bf16 or fp32 Y");
+    opus_a16w16_tune_dispatch<fp32_t>(kernelId)(A, W, Y, std::nullopt, splitK);
+  }
+  else if (Y.dtype() == AITER_DTYPE_bf16)
+  {
+    opus_a16w16_tune_dispatch<bf16_t>(kernelId)(A, W, Y, std::nullopt, splitK);
+  }
+  else if (Y.dtype() == AITER_DTYPE_fp32)
+  {
+    opus_a16w16_tune_dispatch<fp32_t>(kernelId)(A, W, Y, std::nullopt, splitK);
+  }
+  else
+  {
+    AITER_CHECK(false,
+                "opus_gemm_a16w16_bhsd: unsupported output dtype, expected bf16 or fp32");
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Splitk fp32 workspace: per-stream owner.
 //
