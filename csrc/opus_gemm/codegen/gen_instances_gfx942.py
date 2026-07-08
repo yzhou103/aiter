@@ -129,7 +129,8 @@ def splitk_reduce_extra_forward_decls():
         "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
         "    int split_k, int M, int N, int batch,\n"
         "    int padded_M, int padded_N,\n"
-        "    const D_BIAS_* bias, int stride_bias_batch);\n"
+        "    const D_BIAS_* bias, int stride_bias_batch,\n"
+        "    int stride_c, int stride_c_batch);\n"
         "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
         "         typename D_WS, typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
         "__global__ void splitk_reduce_kernel_exact_n_rowblock(\n"
@@ -146,10 +147,10 @@ def splitk_reduce_extra_device_instantiations():
         contents += (
             f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, true,  {out_type}, true>(\n"
             f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
-            f"    const {out_type}*, int);\n"
+            f"    const {out_type}*, int, int, int);\n"
             f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, false, {out_type}, true>(\n"
             f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
-            f"    const {out_type}*, int);\n"
+            f"    const {out_type}*, int, int, int);\n"
         )
     for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
         for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:

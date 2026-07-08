@@ -23,6 +23,7 @@ PIPELINE_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
+    "a16w16_interleave": "gfx950/opus_gemm_pipeline_a16w16_interleave_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
@@ -44,6 +45,7 @@ TRAITS_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_interleave": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
@@ -56,6 +58,7 @@ KERNEL_FUNC_MAP = {
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
     "a16w16": "gemm_a16w16_kernel",
+    "a16w16_interleave": "gemm_a16w16_interleave_kernel",
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
@@ -74,6 +77,7 @@ TRAITS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
     "a16w16": "opus_gemm_a16w16_traits_gfx950",
+    "a16w16_interleave": "opus_gemm_a16w16_traits_gfx950",
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
@@ -86,6 +90,7 @@ KARGS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
     "a16w16": "opus_gemm_noscale_kargs_gfx950",
+    "a16w16_interleave": "opus_gemm_noscale_kargs_gfx950",
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
@@ -694,6 +699,81 @@ void
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
 
+    # "_mmajor" sibling launcher for persistent (zero-copy wo_a path):
+    # identical kernel/traits, but reads XQ/Y with dim0=M, dim1=batch (the
+    # model-native [T(=M), G(=batch), K] / [T, G, N] layout) instead of
+    # dim0=batch, dim1=M -- avoids the explicit transpose+contiguous copy
+    # (~46us for the DSV4 wo_a shape). The persistent kernel already reads
+    # kargs.stride_a / stride_a_batch / stride_c / stride_c_batch generically
+    # (ptr + batch_id*stride_*_batch + row*stride_*), so this is a pure
+    # launcher change -- no new __global__ kernel. Registered into
+    # GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_* via the a16w16_persistent tag.
+    INSTANCE_IMPL_MMAJOR = f"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}_mmajor(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int /*splitK*/)   // persistent ignores splitK
+{{{{
+    // mmajor: dim0=M, dim1=batch (XQ/Y already [M, batch, *] in memory).
+    int M = XQ.size(0);
+    int batch = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+{k_check}
+    AITER_CHECK(!bias.has_value(),
+        "bias is not supported on a16w16_persistent kid; use a16w16 "
+        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+    AITER_CHECK(Y.stride(-1) == 1,
+        "{k.name}_mmajor requires Y's last (N) dim to be stride-1 (got ",
+        Y.stride(-1), ")");
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    // mmajor: swapped vs. the batch-major launcher.
+    kargs.stride_a = XQ.stride(0);
+    kargs.stride_b = WQ.stride(1);
+    kargs.stride_c = (int)Y.stride(0);
+    kargs.stride_a_batch = XQ.stride(1);
+    kargs.stride_b_batch = WQ.stride(0);
+    kargs.stride_c_batch = (int)Y.stride(1);
+{grid_setup}
+    auto stream = aiter::getCurrentHIPStream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+    with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
+        _f.write(INSTANCE_IMPL_MMAJOR)
+
+    inst_extra_param = ",\n    std::optional<aiter_tensor_t>,\n    int"
+    for CDtype in k.output_dtypes:
+        host_decl_mmajor = (
+            f"template void\n"
+            f"{k.name}_mmajor<{CDtype}>(\n"
+            f"    aiter_tensor_t &XQ,\n"
+            f"    aiter_tensor_t &WQ,\n"
+            f"    aiter_tensor_t &Y{inst_extra_param});\n"
+        )
+        # kid_name MUST be k.name (not "..._mmajor"): the mmajor launcher lives
+        # appended in the SAME impl .cuh and reuses the exact same
+        # kernel_func<Traits<CDtype>> device instantiation the non-mmajor
+        # launcher already emits.
+        cg._host_instantiations.append(
+            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
+        )
+
 
 def gen_scale_instance(
     cg,
@@ -819,7 +899,10 @@ def gen_noscale_instance_gfx950(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
-    is_a16w16_split_barrier = k.kernel_tag == "a16w16"
+    # "a16w16_interleave" shares the split-barrier launcher/traits/kargs exactly
+    # (same double-traits bias handling, same _mmajor variant); it only differs
+    # in the kernel body (interleaved schedule), routed via KERNEL_FUNC_MAP.
+    is_a16w16_split_barrier = k.kernel_tag in ("a16w16", "a16w16_interleave")
     is_a16w16_traits_with_tile_wave = (
         is_a16w16_split_barrier  # gfx950 noscale only a16w16 SB
     )
@@ -998,6 +1081,83 @@ void
         cg._device_instantiations.append(
             {"kid_name": k.name, "dtype": CDtype, "device_decl": _device_decl(CDtype)}
         )
+
+    # "_mmajor" sibling launcher (a16w16 split-barrier family only, kid 4-9):
+    # identical kernel/traits, reads XQ/Y with dim0=M, dim1=batch instead of
+    # dim0=batch, dim1=M -- i.e. it does the "which axis is batch" swap
+    # itself instead of requiring the caller to hand it a permuted/
+    # transposed view. This non-splitk kernel writes Y directly (no reduce
+    # kernel), and its device body already reads kargs.stride_c /
+    # stride_c_batch generically (see opus_gemm_pipeline_a16w16_gfx950.cuh),
+    # so reading them from Y's real strides instead of hardcoding N / M*N is
+    # a pure launcher change -- no new __global__ kernel. Not part of the
+    # general OpusA16W16TuneEntry dispatch table -- see
+    # GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_FP32 / opus_gemm_a16w16_mmajor.
+    if is_a16w16_split_barrier:
+        INSTANCE_IMPL_MMAJOR = f"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}_mmajor(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int /*splitK*/)
+{{{{
+    // mmajor: dim0=M, dim1=batch (XQ/Y already [M, batch, *] in memory).
+    int M = XQ.size(0);
+    int batch = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+{k_check}
+    AITER_CHECK(Y.stride(-1) == 1,
+        "{k.name}_mmajor requires Y's last (N) dim to be stride-1 (got ",
+        Y.stride(-1), ")");
+    {kargs_name} kargs{{}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    // mmajor: swapped vs. the batch-major launcher.
+    kargs.stride_a = XQ.stride(0);
+    kargs.stride_b = WQ.stride(1);
+    kargs.stride_c = (int)Y.stride(0);
+    kargs.stride_a_batch = XQ.stride(1);
+    kargs.stride_b_batch = WQ.stride(0);
+    kargs.stride_c_batch = (int)Y.stride(1);
+{kargs_init_extra}{bias_kargs_block}
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
+    dim3 block({k.BLOCK_SIZE});
+{launch_block}
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+        with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
+            _f.write(INSTANCE_IMPL_MMAJOR)
+
+        for CDtype in k.output_dtypes:
+            host_decl_mmajor = (
+                f"template void\n"
+                f"{k.name}_mmajor<{CDtype}>(\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y{inst_extra_param});\n"
+            )
+            # kid_name MUST be k.name (not "..._mmajor"): controls which
+            # impl/*.cuh the fused host TU #includes; the mmajor launcher
+            # lives appended in the SAME file. No new device instantiation:
+            # reuses the exact same kernel_func<Traits<CDtype>> the
+            # non-mmajor launcher above already emits.
+            cg._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
+            )
 
 
 def gen_mono_tile_instance(
@@ -1393,6 +1553,18 @@ void
                       batch * M, 1);
     dim3 block_reduce(REDUCE_BS);
 
+    // Read Y's real strides instead of assuming contiguous [batch,M,N] --
+    // for every existing (contiguous) caller these equal N / M*N exactly, so
+    // this is a no-op; it additionally lets a caller pass a genuinely
+    // strided Y view (e.g. a permuted slice of a larger BSHD-shaped output)
+    // and have the reduce kernel write straight into it, skipping a
+    // temp-buffer + transpose-copy round trip. N itself must stay stride-1.
+    AITER_CHECK(Y.stride(-1) == 1,
+        "flatmm_splitk requires Y's last (N) dim to be stride-1 (got ",
+        Y.stride(-1), ")");
+    const int y_stride_c       = (int)Y.stride(1);
+    const int y_stride_c_batch = (int)Y.stride(0);
+
     {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
     if (Y.dtype() == AITER_DTYPE_bf16) {{{{
         if (bias.has_value()) {{{{
@@ -1402,14 +1574,14 @@ void
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const __bf16*>(ptr_bias_),
-                    stride_bias_batch_);
+                    stride_bias_batch_, y_stride_c, y_stride_c_batch);
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     ws_handle_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
-                    nullptr, 0);
+                    nullptr, 0, y_stride_c, y_stride_c_batch);
         }}}}
     }}}} else {{{{
         if (bias.has_value()) {{{{
@@ -1419,22 +1591,220 @@ void
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_),
-                    stride_bias_batch_);
+                    stride_bias_batch_, y_stride_c, y_stride_c_batch);
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     ws_handle_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
-                    nullptr, 0);
+                    nullptr, 0, y_stride_c, y_stride_c_batch);
         }}}}
     }}}}
 
 }}}}
 #endif // launcher only on regular host pass
 """
+    # "_mmajor" sibling launcher: identical kernel/traits, but reads XQ/Y with
+    # dim0=M, dim1=batch (instead of dim0=batch, dim1=M) -- i.e. the caller's
+    # tensor is already [M, batch, K] / [M, batch, N] in memory (M outermost),
+    # matching e.g. DeepSeek-V4's `o = o.view(num_tokens, n_local_groups, -1)`
+    # (ATOM/atom/models/deepseek_v4.py) fed straight in with NO transpose --
+    # the launcher does the "which axis is batch" swap instead of the caller
+    # permuting a view. WQ is untouched (always batch-major: [batch, N, K]).
+    # Not part of the general OpusA16W16TuneEntry dispatch table (different
+    # calling convention) -- see GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_FP32 /
+    # opus_a16w16_tune_dispatch_mmajor_gfx950 / opus_gemm_a16w16_mmajor.
+    INSTANCE_IMPL_MMAJOR = f"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}_mmajor(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{{{{
+    static_assert(std::is_same<D_C, fp32_t>::value,
+        "splitk main kernel uses fp32 workspace; D_C template param must be fp32_t "
+        "(Y can be bf16 or fp32; reduce kernel handles the cast / passthrough)");
+
+    // mmajor: dim0=M, dim1=batch (XQ/Y already [M, batch, *] in memory).
+    int M = XQ.size(0);
+    int batch = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                || Y.dtype() == AITER_DTYPE_fp32,
+        "flatmm_splitk requires Y dtype bf16 or fp32 "
+        "(reduce kernel casts fp32 workspace to D_OUT)");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+        "M, N, K, batch must be >= 1");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+{BIAS_HOST_VALIDATE}
+    using Traits = {k.name}_Traits<D_C>;
+
+    int split_k = (splitK <= 1) ? 1 : splitK;
+
+    int total_iters = (K + {k.B_K} - 1) / {k.B_K};
+    constexpr int pfk = Traits::prefetch_k_iter;
+    while (split_k > 1) {{{{
+        int iters_full = (total_iters + split_k - 1) / split_k;
+        int last_loops = total_iters - (split_k - 1) * iters_full;
+        if (iters_full >= pfk && last_loops >= pfk) break;
+        split_k--;
+    }}}}
+    AITER_CHECK(total_iters >= pfk,
+        "K=", K, " too small for flatmm_splitk B_K={k.B_K}: "
+        "need total_iters >= pfk*B_K = ", pfk * {k.B_K},
+        " (pfk=", pfk, ")");
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    int padded_M    = num_tiles_m * {k.B_M};
+    int padded_N    = num_tiles_n * {k.B_N};
+
+    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+
+    auto stream = aiter::getCurrentHIPStream();
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
+    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
+
+    size_t ws_bytes = (size_t)split_k * (size_t)batch
+                    * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
+    {{
+        AITER_CHECK(!capturing,
+            "splitk workspace grow inside HIP graph capture is not "
+            "supported (hipMalloc / hipFree are stream-capture-illegal). "
+            "Warm the cache once eagerly with the largest workspace before "
+            "capturing. Call aiter.opus_gemm_workspace_init() on the capture "
+            "stream first.");
+
+        void* new_ptr = nullptr;
+        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
+        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+        HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
+        if (ws_handle_->ptr != nullptr)
+        {{
+            HIP_CALL(hipDeviceSynchronize());
+            HIP_CALL(hipFree(ws_handle_->ptr));
+        }}
+        ws_handle_->ptr = new_ptr;
+        ws_handle_->bytes = grow_bytes;
+    }}
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a         = XQ.data_ptr();
+    kargs.ptr_b         = WQ.data_ptr();
+    kargs.ws_handle     = ws_handle_;
+    kargs.ptr_c         = Y.data_ptr();
+    kargs.ptr_bias      = ptr_bias_;
+    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+    kargs.split_k = split_k;
+    // mmajor: swapped vs. the batch-major launcher (stride_a<->stride_a_batch
+    // read from XQ's dim0/dim1 the other way around).
+    kargs.stride_a        = XQ.stride(0);
+    kargs.stride_b        = WQ.stride(1);
+    kargs.stride_ws       = padded_N;
+    kargs.stride_c        = N;
+    kargs.stride_a_batch  = XQ.stride(1);
+    kargs.stride_b_batch  = WQ.stride(0);
+    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
+
+    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
+    dim3 block_main({k.BLOCK_SIZE});
+
+    constexpr int REDUCE_VEC = 16;
+    constexpr int REDUCE_BS  = 64;
+    dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),
+                      batch * M, 1);
+    dim3 block_reduce(REDUCE_BS);
+
+    // Y is also [M, batch, N] in memory (mmajor): dim0=M, dim1=batch, so the
+    // reduce kernel's stride_c/stride_c_batch read the SAME swapped indices.
+    AITER_CHECK(Y.stride(-1) == 1,
+        "flatmm_splitk (mmajor) requires Y's last (N) dim to be stride-1 (got ",
+        Y.stride(-1), ")");
+    const int y_stride_c       = (int)Y.stride(0);
+    const int y_stride_c_batch = (int)Y.stride(1);
+
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
+    if (Y.dtype() == AITER_DTYPE_bf16) {{{{
+        if (bias.has_value()) {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_,
+                    reinterpret_cast<__bf16*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    reinterpret_cast<const __bf16*>(ptr_bias_),
+                    stride_bias_batch_, y_stride_c, y_stride_c_batch);
+        }}}} else {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_,
+                    reinterpret_cast<__bf16*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    nullptr, 0, y_stride_c, y_stride_c_batch);
+        }}}}
+    }}}} else {{{{
+        if (bias.has_value()) {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_,
+                    reinterpret_cast<float*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    reinterpret_cast<const float*>(ptr_bias_),
+                    stride_bias_batch_, y_stride_c, y_stride_c_batch);
+        }}}} else {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_,
+                    reinterpret_cast<float*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    nullptr, 0, y_stride_c, y_stride_c_batch);
+        }}}}
+    }}}}
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+
+    with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
+        _f.write(INSTANCE_IMPL_MMAJOR)
+
+    inst_extra_param_mmajor = ",\n    std::optional<aiter_tensor_t>,\n    int"
+    for CDtype in k.output_dtypes:
+        host_decl_mmajor = (
+            f"template void\n"
+            f"{k.name}_mmajor<{CDtype}>(\n"
+            f"    aiter_tensor_t &XQ,\n"
+            f"    aiter_tensor_t &WQ,\n"
+            f"    aiter_tensor_t &Y{inst_extra_param_mmajor});\n"
+        )
+        # kid_name MUST be k.name (not "..._mmajor") here: this row only
+        # controls which impl/*.cuh the fused host TU #includes (see
+        # _emit_fused_host_tu's `impl_includes` set) and the mmajor launcher
+        # lives appended in the SAME impl/{k.name}.cuh file as the primary
+        # launcher (no separate file). No _device_instantiations entry is
+        # added: there's no new __global__ kernel to instantiate -- the
+        # mmajor launcher reuses the exact same kernel_func<Traits<CDtype>>
+        # device instantiation the primary (non-mmajor) launcher already
+        # emits in {k.name}_C{CDtype}.device.cu.
+        cg._host_instantiations.append(
+            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
+        )
 
 
 # =====================================================================
@@ -1446,6 +1816,7 @@ void
 # XQ: [batch, heads_per_group, seqlen, head_dim]   bf16
 # WQ: [batch, N, K]                                 bf16
 # Y:  [batch, seqlen, N]                            bf16/fp32
+
 
 def gen_bhsd_instance(
     cg,
@@ -1748,6 +2119,18 @@ void
                       batch * M, 1);
     dim3 block_reduce(REDUCE_BS);
 
+    // Read Y's real strides instead of assuming contiguous [batch,M,N] --
+    // for every existing (contiguous) caller these equal N / M*N exactly, so
+    // this is a no-op; it additionally lets a caller pass a genuinely
+    // strided Y view (e.g. a permuted slice of a larger BSHD-shaped output)
+    // and have the reduce kernel write straight into it, skipping a
+    // temp-buffer + transpose-copy round trip. N itself must stay stride-1.
+    AITER_CHECK(Y.stride(-1) == 1,
+        "bhsd_splitk requires Y's last (N) dim to be stride-1 (got ",
+        Y.stride(-1), ")");
+    const int y_stride_c       = (int)Y.stride(1);
+    const int y_stride_c_batch = (int)Y.stride(0);
+
     {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
     if (Y.dtype() == AITER_DTYPE_bf16) {{{{
         splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
@@ -1755,14 +2138,14 @@ void
                 ws_handle_,
                 reinterpret_cast<__bf16*>(Y.data_ptr()),
                 split_k, M, N, batch, padded_M, padded_N,
-                nullptr, 0);
+                nullptr, 0, y_stride_c, y_stride_c_batch);
     }}}} else {{{{
         splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
             <<<grid_reduce, block_reduce, 0, stream>>>(
                 ws_handle_,
                 reinterpret_cast<float*>(Y.data_ptr()),
                 split_k, M, N, batch, padded_M, padded_N,
-                nullptr, 0);
+                nullptr, 0, y_stride_c, y_stride_c_batch);
     }}}}
 
 }}}}
@@ -1776,6 +2159,7 @@ void
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
 register_emit("gfx950", "a16w16", gen_noscale_instance_gfx950)
+register_emit("gfx950", "a16w16_interleave", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)

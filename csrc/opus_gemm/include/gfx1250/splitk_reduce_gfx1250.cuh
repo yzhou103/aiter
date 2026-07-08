@@ -28,7 +28,11 @@ __global__ void splitk_reduce_kernel_gfx1250(
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
     const D_BIAS_* __restrict__ bias = nullptr,
-    int bias_stride_batch = 0)
+    int bias_stride_batch = 0,
+    // c_addr = b*stride_c_batch + m*stride_c + n; -1 sentinel => contiguous
+    // [batch,M,N] (stride_c=N, stride_c_batch=M*N). See splitk_reduce_gfx950.cuh.
+    int stride_c = -1,
+    int stride_c_batch = -1)
 {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx1250__)
@@ -101,8 +105,10 @@ __global__ void splitk_reduce_kernel_gfx1250(
     #pragma unroll
     for (int t = 0; t < VEC; ++t) out[t] = static_cast<D_OUT>(acc[t]);
 
+    const int eff_stride_c       = (stride_c >= 0) ? stride_c : N;
+    const int eff_stride_c_batch = (stride_c_batch >= 0) ? stride_c_batch : M * N;
     auto g_c = opus::make_gmem(c_out, (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
-    const int c_idx = b * M * N + m * N + n_base;
+    const int c_idx = b * eff_stride_c_batch + m * eff_stride_c + n_base;
 
     using opus::slice;
     using opus::number;

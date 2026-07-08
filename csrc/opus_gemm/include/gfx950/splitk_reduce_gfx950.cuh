@@ -74,7 +74,15 @@ __global__ void splitk_reduce_kernel(
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
     const D_BIAS_* __restrict__ bias = nullptr,
-    int bias_stride_batch = 0)
+    int bias_stride_batch = 0,
+    // c_out address strides, in elements: c_addr = b*stride_c_batch + m*stride_c + n.
+    // Sentinel -1 means "contiguous [batch,M,N]" (stride_c=N, stride_c_batch=M*N) --
+    // every pre-existing call site keeps working unchanged. A caller can pass a
+    // genuinely strided view instead (e.g. writing straight into a slice of a
+    // larger BSHD-shaped output) as long as the N axis itself stays stride-1
+    // (required by the vectorized dwordx4 stores below).
+    int stride_c = -1,
+    int stride_c_batch = -1)
 {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
@@ -110,7 +118,7 @@ __global__ void splitk_reduce_kernel(
     const int b = bm_id / M;
     const int m = bm_id - b * M;
 
-    // ── Bias prefetch (per-N vector load) ──────────────────────────────────
+    // -- Bias prefetch (per-N vector load) ----------------------------------
     // Bias is per-output-feature [N] (F.linear convention). Each thread
     // loads VEC bias values at its own n_base. Fired before the split-K
     // accumulation so the vmem loads overlap.
@@ -166,9 +174,11 @@ __global__ void splitk_reduce_kernel(
     #pragma unroll
     for (int t = 0; t < VEC; ++t) out[t] = static_cast<D_OUT>(acc[t]);
 
+    const int eff_stride_c       = (stride_c >= 0) ? stride_c : N;
+    const int eff_stride_c_batch = (stride_c_batch >= 0) ? stride_c_batch : M * N;
     auto g_c = opus::make_gmem(c_out,
                                (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
-    const int c_idx = b * M * N + m * N + n_base;  // in D_OUT elements
+    const int c_idx = b * eff_stride_c_batch + m * eff_stride_c + n_base;  // in D_OUT elements
 
     // Store-path macro helpers (compile-time offsets -> buffer_store_dwordx4/x2/dword/short).
     using opus::slice;
@@ -200,7 +210,7 @@ __global__ void splitk_reduce_kernel(
                     c_idx + g * STEP);
             });
         } else if (n_base < N) {
-            // Tail path: decompose valid ∈ [1, VEC-1] into descending
+            // Tail path: decompose valid ? [1, VEC-1] into descending
             // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
             // instead of VEC scalar stores.
             // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp

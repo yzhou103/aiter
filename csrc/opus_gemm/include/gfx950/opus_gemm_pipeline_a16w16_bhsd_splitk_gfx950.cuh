@@ -88,15 +88,38 @@ void gemm_a16w16_bhsd_splitk_kernel(opus_gemm_bhsd_splitk_kargs_gfx950 kargs) {
     const int k_start_h = k_start / kargs.head_dim;
     const int k_start_d = k_start % kargs.head_dim;
 
-    // num_records is sized from the post-k_start base, so subtract k_start_d to
-    // keep buffer-rsrc bounds inside the real tensor; otherwise splits with
-    // split_id>0 can expose unmapped VAs and trip a VM fault.
+    // Bound must span every head this split's K range may touch (h_delta can
+    // run from 0 up to heads_per_group-1-k_start_h within a single split, e.g.
+    // whenever split_k < heads_per_group), not just k_start_h's own row range
+    // -- a_offset() below adds h_delta * stride_a_head on top of this base.
+    // Sizing num_records to one head's worth (as (kargs.m - row) * stride_a_seq
+    // - k_start_d used to) silently OOB-zeros every h_delta >= 1 access,
+    // corrupting the result whenever a split spans more than one head (in
+    // particular split_k == 1, i.e. the non-split-K-aware default).
+    //
+    // Bound directly from the real (row, head, d) index ranges instead of
+    // assuming any particular stride nesting: this callsite is fed both a
+    // genuinely-contiguous BHSD tensor (stride_a_head = seqlen*stride_a_seq)
+    // *and* a strided BSHD view (batch_gemm_a16w16_bshd_opus's bhsd_remap
+    // path, where stride_a_seq is actually the LARGEST stride -- a
+    // (kargs.batch - batch_id)*stride_a_batch-based bound is far too small
+    // there and wrongly zeros real data). The formula below is the exact
+    // offset of the last real element (row=m-1, h=heads_per_group-1,
+    // d=head_dim-1) relative to this g_a's base, so it can never exceed the
+    // real tensor allocation (no fault) for any stride layout, while any
+    // overshoot beyond it safely OOB-zeros via the buffer descriptor -- those
+    // rows are discarded by the split-K reduce's own M/N bounds check
+    // downstream.
+    const int a_base_offset = k_start_h * kargs.stride_a_head
+                             + row * kargs.stride_a_seq
+                             + k_start_d;
+    const int a_num_records_elems = (kargs.m - 1 - row) * kargs.stride_a_seq
+                                   + (kargs.heads_per_group - 1 - k_start_h) * kargs.stride_a_head
+                                   + kargs.head_dim - k_start_d;
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
                          + batch_id * kargs.stride_a_batch
-                         + k_start_h * kargs.stride_a_head
-                         + row * kargs.stride_a_seq
-                         + k_start_d,
-                         ((kargs.m - row) * kargs.stride_a_seq - k_start_d) * sizeof(D_A));
+                         + a_base_offset,
+                         a_num_records_elems * sizeof(D_A));
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + batch_id * kargs.stride_b_batch + col * kargs.stride_b + k_start,
                          ((kargs.n - col) * kargs.stride_b - k_start) * sizeof(D_B));

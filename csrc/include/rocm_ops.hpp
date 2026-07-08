@@ -305,6 +305,19 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,                \
           py::arg("splitK")   = 0);
 
+#define OPUS_GEMM_A16W16_MMAJOR_PYBIND                  \
+    m.def("opus_gemm_a16w16_mmajor",                    \
+          &opus_gemm_a16w16_mmajor,                     \
+          "mmajor batched a16w16 GEMM: A/Y are "         \
+          "[M, batch, *] (dim0=M, dim1=batch), no "      \
+          "caller-side transpose for batch-in-middle "   \
+          "layouts (DSV4 wo_a, bshd batch GEMM)",        \
+          py::arg("O"),                                  \
+          py::arg("wo_a"),                               \
+          py::arg("Y"),                                  \
+          py::arg("kernelId") = 208,                      \
+          py::arg("splitK")   = 0);
+
 #define OPUS_GEMM_WORKSPACE_INIT_PYBIND                              \
     m.def("opus_gemm_workspace_init",                                \
           &opus_gemm_workspace_init,                                 \

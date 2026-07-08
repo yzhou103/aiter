@@ -17,7 +17,12 @@ __device__ __forceinline__ void splitk_reduce_kernel_fallback_body(
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
     const D_BIAS_* __restrict__ bias,
-    int bias_stride_batch)
+    int bias_stride_batch,
+    // c_addr = b*stride_c_batch + m*stride_c + n; -1 sentinel => contiguous
+    // [batch,M,N] (stride_c=N, stride_c_batch=M*N), matching every existing
+    // caller. See splitk_reduce_gfx950.cuh for the full rationale.
+    int stride_c = -1,
+    int stride_c_batch = -1)
 {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx942__)
@@ -110,9 +115,11 @@ __device__ __forceinline__ void splitk_reduce_kernel_fallback_body(
     #pragma unroll
     for (int t = 0; t < VEC; ++t) out[t] = static_cast<D_OUT>(acc[t]);
 
+    const int eff_stride_c       = (stride_c >= 0) ? stride_c : N;
+    const int eff_stride_c_batch = (stride_c_batch >= 0) ? stride_c_batch : M * N;
     auto g_c = opus::make_gmem(c_out,
                                (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
-    const int c_idx = b * M * N + m * N + n_base;
+    const int c_idx = b * eff_stride_c_batch + m * eff_stride_c + n_base;
 
     using opus::slice;
     using opus::number;
@@ -199,10 +206,13 @@ __global__ void splitk_reduce_kernel_fallback(
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
     const D_BIAS_* __restrict__ bias,
-    int bias_stride_batch)
+    int bias_stride_batch,
+    int stride_c = -1,
+    int stride_c_batch = -1)
 {
     splitk_reduce_kernel_fallback_body<VEC_, BLOCK_, float, D_OUT, HAS_BIAS_, D_BIAS_, HAS_OOB_>(
-        ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
+        ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch,
+        stride_c, stride_c_batch);
 }
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
@@ -214,10 +224,13 @@ __global__ void splitk_reduce_kernel_bf16ws_fallback(
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
     const D_BIAS_* __restrict__ bias,
-    int bias_stride_batch)
+    int bias_stride_batch,
+    int stride_c = -1,
+    int stride_c_batch = -1)
 {
     splitk_reduce_kernel_fallback_body<VEC_, BLOCK_, __bf16, D_OUT, HAS_BIAS_, D_BIAS_, HAS_OOB_>(
-        ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
+        ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch,
+        stride_c, stride_c_batch);
 }
 
 // Exact-N row-block fast path: static split_k unroll, guarded M tail.

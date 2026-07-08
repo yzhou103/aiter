@@ -189,6 +189,74 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl
     return inst
 
 
+def _a16w16_interleave(
+    bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl_b=17
+):
+    """Interleaved-schedule variant of the split-barrier a16w16 kernel.
+    Identical config space / validator / launcher as `_a16w16`; only the
+    kernel body (opus_gemm_pipeline_a16w16_interleave_gfx950.cuh) differs.
+    """
+    vec = 16 // 2
+    inst = OpusGemmInstance(
+        bs,
+        bm,
+        bn,
+        bk,
+        2,
+        tn,
+        wm,
+        wn,
+        wk,
+        vec,
+        vec,
+        4,
+        0,
+        0,
+        0,
+        "a16w16_interleave",
+        ["fp32_t", "bf16_t"],
+        has_oob=has_oob,
+    )
+    inst.cachectl_a = cachectl_a
+    inst.cachectl_b = cachectl_b
+    # Distinct symbol token so the generated instance name doesn't collide
+    # with the split-barrier `a16w16` kid of the same config (name is derived
+    # from config, not kernel_tag).
+    inst.name_tag = "interleave"
+    return inst
+
+
+# Interleaved-schedule a16w16 kids (40..49). v1 body == exact clone of the
+# split-barrier kernel (scaffold: kid 40 should match kid 9 perf/correctness);
+# the schedule rewrite lands on top in v2.
+a16w16_interleave_kernels_list = {
+    40: _a16w16_interleave(512, 256, 256, 64, 4, 16, 16, 32),  # == kid 9 config
+    # occupancy-lever tiles (smaller -> less LDS -> more WG/CU):
+    41: _a16w16_interleave(
+        256, 256, 128, 32, 2, 16, 16, 32
+    ),  # hipBLASLt-like 256x128, 4 wave
+    42: _a16w16_interleave(256, 128, 128, 32, 2, 16, 16, 32),  # 128x128, 4 wave
+}
+
+a16w16_interleave_kernels_list_nooob = {
+    kid
+    + 1000: _a16w16_interleave(
+        inst.BLOCK_SIZE,
+        inst.B_M,
+        inst.B_N,
+        inst.B_K,
+        inst.T_N,
+        inst.W_M,
+        inst.W_N,
+        inst.W_K,
+        has_oob=False,
+        cachectl_a=inst.cachectl_a,
+        cachectl_b=inst.cachectl_b,
+    )
+    for kid, inst in a16w16_interleave_kernels_list.items()
+}
+
+
 def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
@@ -497,6 +565,12 @@ a16w16_persistent_kernels_list_cpol_nooob = {
     )
     for kid, inst in a16w16_persistent_kernels_list_cpol.items()
 }
+
+# NOTE: B_K is hard-locked to 64 for the split-barrier / persistent family by
+# the ra/rb layout coupling (validator: B_K == T_N*W_K/2 == 4*32/2 == 64).
+# B_K=128 would need T_N=8 (-> 16 waves -> BLOCK 1024 > 512 cap) or W_K=64
+# (no such MFMA; only 16x16x32). So "coarsen K-tile to halve barrier count"
+# is architecturally unavailable here -- do not re-add B_K=128 persistent kids.
 
 # -- a16w16 mono-tile (single-MMA-per-K-iter, 8 waves) ---------------------
 #
@@ -1091,6 +1165,8 @@ kernels_list = {
     **a8w8_kernels_list,
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,
+    **a16w16_interleave_kernels_list,
+    **a16w16_interleave_kernels_list_nooob,
     **a16w16_kernels_list_cpol,
     **a16w16_kernels_list_cpol_nooob,
     **a16w16_flatmm_kernels_list,
@@ -1141,6 +1217,8 @@ SPLITK_KIDS = (
 NON_SPLITK_KIDS = (
     frozenset(a16w16_kernels_list.keys())
     | frozenset(a16w16_kernels_list_nooob.keys())
+    | frozenset(a16w16_interleave_kernels_list.keys())
+    | frozenset(a16w16_interleave_kernels_list_nooob.keys())
     | frozenset(a16w16_kernels_list_cpol.keys())
     | frozenset(a16w16_kernels_list_cpol_nooob.keys())
     | frozenset(a16w16_persistent_kernels_list.keys())
@@ -1190,6 +1268,12 @@ BIAS_AWARE_KIDS = (
 # Heuristic-dispatch fallback kids (gfx950).
 HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
     {
+        # wo_a_gemm_opus large-M default (num_tokens >= ~384): kid 9's
+        # non-splitk split-barrier pipeline (512x256x256x64) has far fewer
+        # explicit s_barrier syncs per K-iter than the flatmm_splitk family
+        # (no producer/consumer warp-specialization), which empirically wins
+        # decisively as M grows (see wo_a_gemm_opus's kid-selection comment).
+        9,
         # splitk fallback (small M / non-aligned big M)
         200,
         1200,  # cc tile 0: (64, 64, 64) WG=2
@@ -1200,6 +1284,30 @@ HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
         # persistent fallback (large M, tile-aligned)
         300,
         1300,  # persistent (256, 256, 64)
+        # persistent smaller tiles: more output tiles -> fills more CUs.
+        # 128x128 (303) measured ~2x faster than kid 9 on single 1024^2x4096;
+        # 256x128 (302) matches hipBLASLt's macro-tile. Force-compiled for
+        # experiments (see docs/dsv4_wo_a_opus_gemm_optimization.md).
+        301,
+        1301,  # persistent (128, 256, 64)
+        302,
+        1302,  # persistent (256, 128, 64)
+        303,
+        1303,  # persistent (128, 128, 64)
+        # BHSD-fused batch GEMM default (batch_gemm_a16w16_bhsd/bshd_opus use
+        # kid=608). Force-compiled so the fused MLA output-projection path
+        # works out of the box without a tuned CSV; +1000 nooob mirror.
+        608,
+        1608,  # bhsd_splitk (64, 64, 128) WG=1
+        650,
+        1650,  # bhsd (non-splitk) 256x128x256x32 WG=2 -- smallest bhsd tile
+        # interleaved-schedule prototype (a16w16_interleave, ?Phase 1).
+        40,
+        1040,
+        41,
+        1041,
+        42,
+        1042,
     }
 )
 

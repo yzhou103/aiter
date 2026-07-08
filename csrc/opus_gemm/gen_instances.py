@@ -99,20 +99,25 @@ LEGACY_OPUS_ARCH = "gfx950"
 
 def _splitk_reduce_baseline_instantiations(reduce_kernel, ws_ptr_type, has_oob):
     has_oob_str = "true" if has_oob else "false"
+    # Trailing (stride_c, stride_c_batch) pair lets the reduce kernel write
+    # straight into a strided Y view instead of assuming contiguous
+    # [batch,M,N] -- see splitk_reduce_gfx950.cuh. Explicit instantiations
+    # must match the full parameter list exactly (default args don't apply
+    # to explicit instantiation declarations).
     return (
         f"// HAS_OOB={has_oob_str} variants\n"
         f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, {has_oob_str}>(\n"
         f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
+        f"    const __bf16*, int, int, int);\n"
         f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, {has_oob_str}>(\n"
         f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
+        f"    const __bf16*, int, int, int);\n"
         f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  {has_oob_str}>(\n"
         f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
+        f"    const float*,  int, int, int);\n"
         f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  {has_oob_str}>(\n"
         f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
+        f"    const float*,  int, int, int);\n"
     )
 
 
@@ -298,8 +303,9 @@ class opus_gemm_codegen:
             _validate_a16w16_persistent,
         )
 
-        # gfx950 split-barrier (only "a16w16" tag uses this validator).
-        if k.kernel_tag == "a16w16":
+        # gfx950 split-barrier + interleave variant share this validator
+        # (same tile/wave/AGPR constraints; only the kernel body differs).
+        if k.kernel_tag in ("a16w16", "a16w16_interleave"):
             info = _validate_a16w16(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
@@ -569,15 +575,15 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
-        def _emit_map(f, macro_name, ctype):
+        def _emit_map(f, macro_name, ctype, tags=A16W16_TUNE_TAGS, name_suffix=""):
             f.write(f"#define {macro_name}(CTYPE) \\\n")
             rows = []
             for kid, k in kernels_dict.items():
-                if not (isinstance(kid, int) and k.kernel_tag in A16W16_TUNE_TAGS):
+                if not (isinstance(kid, int) and k.kernel_tag in tags):
                     continue
                 if ctype not in k.output_dtypes:
                     continue
-                rows.append((kid, k.name))
+                rows.append((kid, k.name + name_suffix))
             rows.sort(key=lambda r: r[0])
             n = len(rows)
             for i, (kid, name) in enumerate(rows):
@@ -595,6 +601,33 @@ class opus_gemm_codegen:
             # each opus_a16w16_tune_dispatch<CDat...
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_BF16", "bf16_t")
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_FP32", "fp32_t")
+            # "_mmajor" variants: same a16w16 / a16w16_flatmm_splitk kernels,
+            # but the launcher reads dim0 as M / dim1 as batch (no dim0<->dim1
+            # swap needed by the caller) -- see gen_flatmm_splitk_instance /
+            # gen_noscale_instance_gfx950's "_mmajor" emits and
+            # wo_a_gemm_opus in aiter/ops/opus/gemm_op_a16w16.py.
+            # a16w16_flatmm_splitk is fp32-only (matches its non-mmajor
+            # counterpart -- main kernel hardcodes D_C=float); a16w16
+            # split-barrier (non-splitk, writes Y directly) gets both.
+            _emit_map(
+                f,
+                "GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_FP32",
+                "fp32_t",
+                tags={
+                    "a16w16_flatmm_splitk",
+                    "a16w16",
+                    "a16w16_interleave",
+                    "a16w16_persistent",
+                },
+                name_suffix="_mmajor",
+            )
+            _emit_map(
+                f,
+                "GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_BF16",
+                "bf16_t",
+                tags={"a16w16", "a16w16_interleave", "a16w16_persistent"},
+                name_suffix="_mmajor",
+            )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
@@ -645,6 +678,19 @@ void
                     f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
                 else:
                     f.write(MANIFEST_SCALE.format(kernel_name=k.name))
+                # "_mmajor" sibling: same 4-arg signature, dim0=M/dim1=batch
+                # reads instead of dim0=batch/dim1=M. See
+                # gen_flatmm_splitk_instance / gen_noscale_instance_gfx950's
+                # "_mmajor" emits and GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_*.
+                if k.kernel_tag in (
+                    "a16w16_flatmm_splitk",
+                    "a16w16",
+                    "a16w16_interleave",
+                    "a16w16_persistent",
+                ):
+                    f.write(
+                        MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name + "_mmajor")
+                    )
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 
@@ -693,7 +739,8 @@ void
                 f"    {reduce_abi['ws_arg']}, D_OUT* c_out,\n"
                 "    int split_k, int M, int N, int batch,\n"
                 "    int padded_M, int padded_N,\n"
-                "    const D_BIAS_* bias, int stride_bias_batch);\n"
+                "    const D_BIAS_* bias, int stride_bias_batch,\n"
+                "    int stride_c, int stride_c_batch);\n"
                 f"{extra_forward_decls}"
             )
             contents = (

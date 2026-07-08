@@ -108,6 +108,20 @@ opus_a16w16_tune_dispatch(int id)
   }
 }
 
+// "_mmajor" tune dispatch: gfx950-only for now (no gfx942/gfx1250 "_mmajor"
+// launchers have been generated). Used by opus_gemm_a16w16_mmajor() below.
+template <typename CDataType>
+opus_gfx950_detail::OpusA16W16TuneKernel
+opus_a16w16_tune_dispatch_mmajor(int id)
+{
+  const auto &info = opus_get_arch_info();
+  AITER_CHECK(info.arch == OpusGfxArch::Gfx950,
+              "opus_gemm_a16w16_mmajor: mmajor dispatch is only implemented "
+              "for gfx950 today; current device ", info.dev,
+              " has gcnArchName='", info.name, "'.");
+  return opus_a16w16_tune_dispatch_mmajor_gfx950<CDataType>(id);
+}
+
 // ── opus_gemm() — top-level a16w16 / a8w8 entry ─────────────────────────────
 
 void opus_gemm(
@@ -191,6 +205,13 @@ static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
 // gfx1250 cluster/TDM split-K (fp32 workspace + reduce) kids: [20000, 21000).
 static constexpr int OPUS_GFX1250_SPLITK_KID_MIN = 20000;
 static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 21000;
+// BHSD-fused split-K kids (fp32 workspace + reduce, same as the 200-family):
+// gfx950 [600, 650) + nooob mirror [1600, 1650). See opus_gemm_common.py ::
+// a16w16_bhsd_splitk_kernels_list (600-623). Like the 200-family these have
+// only <fp32_t> instantiations, so they must be classified splitk to route to
+// the fp32 tune table (the non-splitk BHSD kids 650-655 stay bf16/fp32).
+static constexpr int OPUS_BHSD_SPLITK_KID_MIN = 600;
+static constexpr int OPUS_BHSD_SPLITK_KID_MAX = 650;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
@@ -214,7 +235,10 @@ static inline bool opus_kid_is_splitk(int kid)
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
           kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET) ||
          (kid >= OPUS_GFX1250_SPLITK_KID_MIN &&
-          kid < OPUS_GFX1250_SPLITK_KID_MAX);
+          kid < OPUS_GFX1250_SPLITK_KID_MAX) ||
+         (kid >= OPUS_BHSD_SPLITK_KID_MIN && kid < OPUS_BHSD_SPLITK_KID_MAX) ||
+         (kid >= OPUS_BHSD_SPLITK_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
+          kid < OPUS_BHSD_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET);
 }
 
 static inline bool opus_kid_is_a16w16_sb(int kid)
@@ -357,6 +381,47 @@ void opus_gemm_a16w16_bhsd(
   {
     AITER_CHECK(false,
                 "opus_gemm_a16w16_bhsd: unsupported output dtype, expected bf16 or fp32");
+  }
+}
+
+// ── opus_gemm_a16w16_mmajor() — mmajor batched a16w16 GEMM entry ───────────
+//
+// A/Y are [M, batch, *] (dim0=M, dim1=batch) so batch-in-the-middle layouts
+// need no caller-side transpose/permute. Shared by wo_a_gemm_opus (DeepSeek-V4
+// output-LoRA, A=[num_tokens, n_local_groups, K], replacing
+// `torch.einsum("sgd,grd->sgr", o, wo_a)`) and batch_gemm_a16w16_bshd_opus.
+// See aiter/ops/opus/gemm_op_a16w16.py.
+void opus_gemm_a16w16_mmajor(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    int kernelId,
+    int splitK)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(O.dim() == 3, "O must be 3D [num_tokens, n_local_groups, K]");
+  AITER_CHECK(wo_a.dim() == 3, "wo_a must be 3D [n_local_groups, o_lora_rank, K]");
+  AITER_CHECK(Y.dim() == 3, "Y must be 3D [num_tokens, n_local_groups, o_lora_rank]");
+  AITER_CHECK(O.dtype() == AITER_DTYPE_bf16 && wo_a.dtype() == AITER_DTYPE_bf16,
+              "O and wo_a must be bf16");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16 || Y.dtype() == AITER_DTYPE_fp32,
+              "opus_gemm_a16w16_mmajor requires bf16 or fp32 Y");
+  // splitk-family mmajor kids (200-299 range, flatmm_splitk) only have a
+  // <fp32_t> instantiation -- main kernel writes an fp32 workspace and the
+  // reduce kernel casts to Y's real dtype. Non-splitk a16w16 mmajor kids
+  // (4-9 range) write Y directly with D_C matching Y's dtype exactly, same
+  // as their non-mmajor counterparts (see opus_gemm_a16w16_bhsd above).
+  if (opus_kid_is_splitk(kernelId))
+  {
+    opus_a16w16_tune_dispatch_mmajor<fp32_t>(kernelId)(O, wo_a, Y, std::nullopt, splitK);
+  }
+  else if (Y.dtype() == AITER_DTYPE_bf16)
+  {
+    opus_a16w16_tune_dispatch_mmajor<bf16_t>(kernelId)(O, wo_a, Y, std::nullopt, splitK);
+  }
+  else
+  {
+    opus_a16w16_tune_dispatch_mmajor<fp32_t>(kernelId)(O, wo_a, Y, std::nullopt, splitK);
   }
 }
 

@@ -93,8 +93,31 @@ void gemm_a16w16_bhsd_kernel(opus_gemm_bhsd_kargs_gfx950 kargs) {
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 
-    // BHSD addressing: A base pointer uses stride_a_seq (= head_dim) as row stride
-    auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + row * kargs.stride_a_seq, (kargs.m - row) * kargs.stride_a_seq * sizeof(D_A));
+    // BHSD addressing: A base pointer uses stride_a_seq (= head_dim) as row stride.
+    // Bound must span every head this tile may touch, not just head 0's row
+    // range -- a_offset() below adds h * stride_a_head for h in
+    // [0, heads_per_group). Sizing num_records to (kargs.m - row) * stride_a_seq
+    // (one head's worth) silently OOB-zeros every h >= 1 access, corrupting
+    // the result for heads_per_group > 1.
+    //
+    // Bound directly from the real (row, head, d) index ranges instead of
+    // assuming any particular stride nesting: this callsite is fed both a
+    // genuinely-contiguous BHSD tensor (stride_a_head = seqlen*stride_a_seq,
+    // i.e. head is the 2nd-largest stride) *and* a strided BSHD view
+    // (batch_gemm_a16w16_bshd_opus's bhsd_remap path, where stride_a_seq is
+    // actually the LARGEST stride -- (kargs.batch - batch_id)*stride_a_batch
+    // as a bound is far too small there and wrongly zeros real data). The
+    // formula below is the exact offset of the last real element
+    // (row=m-1, h=heads_per_group-1, d=head_dim-1) relative to this g_a's
+    // base, so it can never exceed the real tensor allocation (no fault) for
+    // any stride layout, while any M-tail / tile overshoot beyond it safely
+    // OOB-zeros via the buffer descriptor -- those rows are already discarded
+    // by the store-side HAS_OOB predicate.
+    const int a_num_records_elems = (kargs.m - 1 - row) * kargs.stride_a_seq
+                                   + (kargs.heads_per_group - 1) * kargs.stride_a_head
+                                   + kargs.head_dim;
+    auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + row * kargs.stride_a_seq,
+        a_num_records_elems * sizeof(D_A));
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + col * kargs.stride_b, (kargs.n - col) * kargs.stride_b * sizeof(D_B));
     auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + row * kargs.stride_c + col);
 

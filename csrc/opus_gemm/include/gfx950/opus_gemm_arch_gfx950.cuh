@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// opus_gemm_arch_gfx950.cuh — gfx950-specific dispatch implementations.
+// opus_gemm_arch_gfx950.cuh -- gfx950-specific dispatch implementations.
 //
 // Provides:
-//   * opus_dispatch_a16w16_gfx950<T>      — tuned (M,N,K) lookup → heuristic
-//   * opus_a16w16_tune_dispatch_gfx950<T> — id-based tune dispatch
+//   * opus_dispatch_a16w16_gfx950<T>      -- tuned (M,N,K) lookup -> heuristic
+//   * opus_a16w16_tune_dispatch_gfx950<T> -- id-based tune dispatch
 //
 // This header is intended to be included exactly once, by opus_gemm.cu, where
 // the arch routers in that TU select the per-arch entry. Other TUs (the
@@ -102,16 +102,23 @@ namespace opus_gfx950_detail
 constexpr int kSplitkKidMin       = 200;
 constexpr int kSplitkKidMax       = 300;
 constexpr int kNooobKidOffset     = 1000;
+// BHSD-fused splitk kids [600, 650) (+nooob mirror). Same <fp32_t>-only
+// instantiation contract as the 200-family; see opus_gemm.cu OPUS_BHSD_SPLITK.
+constexpr int kBhsdSplitkKidMin   = 600;
+constexpr int kBhsdSplitkKidMax   = 650;
 
 constexpr bool kid_is_splitk(int kid) noexcept
 {
     return (kid >= kSplitkKidMin && kid < kSplitkKidMax) ||
            (kid >= kSplitkKidMin + kNooobKidOffset &&
-            kid < kSplitkKidMax + kNooobKidOffset);
+            kid < kSplitkKidMax + kNooobKidOffset) ||
+           (kid >= kBhsdSplitkKidMin && kid < kBhsdSplitkKidMax) ||
+           (kid >= kBhsdSplitkKidMin + kNooobKidOffset &&
+            kid < kBhsdSplitkKidMax + kNooobKidOffset);
 }
 }  // namespace opus_gfx950_detail
 
-// ── a16w16 tune dispatch (id-based, two specializations) ────────────────────
+// -- a16w16 tune dispatch (id-based, two specializations) --------------------
 //
 // The bf16 table omits splitk kids (their <bf16_t> instantiation doesn't
 // exist; splitk main kernel hardcodes D_C=float). The fp32 table includes
@@ -157,7 +164,61 @@ opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
     return it->func;
 }
 
-// ── a16w16 runtime dispatch (tuned lookup → heuristic fallback) ─────────────
+// -- a16w16 "_mmajor" tune dispatch (M-major XQ/Y, no caller-side transpose) -
+//
+// Same flatmm_splitk kernels as opus_a16w16_tune_dispatch_gfx950<fp32_t>,
+// but the launcher reads XQ/Y with dim0=M, dim1=batch (instead of dim0=batch,
+// dim1=M) -- i.e. it does the "which axis is batch" swap itself instead of
+// requiring the caller to hand it a permuted/transposed view. See
+// gen_flatmm_splitk_instance's "_mmajor" emit and
+// aiter/ops/opus/gemm_op_a16w16.py::wo_a_gemm_opus (DeepSeek-V4 grouped
+// output-LoRA: `o = o.view(num_tokens, n_local_groups, -1)` fed straight in).
+// fp32-only, same as the non-mmajor splitk table (splitk main kernel
+// hardcodes D_C=float).
+template <typename CDataType>
+inline opus_gfx950_detail::OpusA16W16TuneKernel
+opus_a16w16_tune_dispatch_mmajor_gfx950(int id);
+
+template <>
+inline opus_gfx950_detail::OpusA16W16TuneKernel
+opus_a16w16_tune_dispatch_mmajor_gfx950<fp32_t>(int id)
+{
+    using namespace opus_gfx950_detail;
+    static constexpr OpusA16W16TuneEntry kTune[] = {
+        GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_FP32(fp32_t)
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA16W16TuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
+                "Kernel id ", id,
+                " not found in a16w16 mmajor fp32 tune lookup table");
+    return it->func;
+}
+
+// bf16 mmajor table: only the a16w16 split-barrier (non-splitk) family has a
+// <bf16_t> instantiation (writes Y directly, D_C matches Y's dtype exactly);
+// a16w16_flatmm_splitk mmajor kids are fp32-only, same as their non-mmajor
+// counterparts (main kernel hardcodes D_C=float; no reduce-kernel cast step
+// exists on this non-splitk path).
+template <>
+inline opus_gfx950_detail::OpusA16W16TuneKernel
+opus_a16w16_tune_dispatch_mmajor_gfx950<bf16_t>(int id)
+{
+    using namespace opus_gfx950_detail;
+    static constexpr OpusA16W16TuneEntry kTune[] = {
+        GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_BF16(bf16_t)
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA16W16TuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
+                "Kernel id ", id,
+                " not found in a16w16 mmajor bf16 tune lookup table");
+    return it->func;
+}
+
+// -- a16w16 runtime dispatch (tuned lookup -> heuristic fallback) -------------
 //
 // On miss the heuristic returns an integer kid; we re-dispatch through
 // opus_a16w16_tune_dispatch_gfx950<>(). Splitk kids only have a <fp32_t>

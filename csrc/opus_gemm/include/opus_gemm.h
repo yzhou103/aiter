@@ -38,5 +38,18 @@ void opus_gemm_a16w16_bhsd(aiter_tensor_t& A,
                            int kernelId,
                            int splitK);
 
+// mmajor batched a16w16 GEMM: A/Y are [M, batch, *] (dim0=M, dim1=batch) so no
+// caller-side transpose is needed for batch-in-the-middle layouts. Used by both
+// the DeepSeek-V4 output-LoRA path (wo_a_gemm_opus, A=[num_tokens, n_groups, K])
+// and batch_gemm_a16w16_bshd_opus. See opus_gemm.cu for the full rationale.
+// A:  [M, batch, K], bf16
+// B:  [batch, N, K], bf16   (per-batch weight)
+// Y:  [M, batch, N], bf16 or fp32
+void opus_gemm_a16w16_mmajor(aiter_tensor_t& O,
+                            aiter_tensor_t& wo_a,
+                            aiter_tensor_t& Y,
+                            int kernelId,
+                            int splitK);
+
 // Per-stream splitk workspace init. See opus_gemm.cu for rationale.
 void opus_gemm_workspace_init();

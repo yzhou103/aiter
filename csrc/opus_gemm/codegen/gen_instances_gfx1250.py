@@ -59,10 +59,10 @@ def splitk_reduce_extra_device_instantiations():
         "// fp32-bias + bf16-out (gfx1250 f32 bias support)\n"
         "template __global__ void splitk_reduce_kernel_gfx1250<16, 64, __bf16, true,  float,  true>(\n"
         "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
-        "    const float*,  int);\n"
+        "    const float*,  int, int, int);\n"
         "template __global__ void splitk_reduce_kernel_gfx1250<16, 64, __bf16, true,  float,  false>(\n"
         "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
-        "    const float*,  int);\n"
+        "    const float*,  int, int, int);\n"
     )
 
 
