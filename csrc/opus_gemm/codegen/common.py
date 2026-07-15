@@ -35,6 +35,7 @@ _A16W16_TAGS = (
     "a16w16_interleave",
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
+    "a16w16_uniform",
     "a16w16_persistent",
     "a16w16_mono_tile",
     "a16w16_bhsd",

@@ -401,8 +401,53 @@ def _build_swa_batch(T, cache_size):
     return bid, pos, slot_map, num_slots, bs, n_pad
 
 
+def _build_swa_wrap_batch(T, cache_size):
+    """Ring-WRAPAROUND + cuda-graph-padding batch: exercises the path the plain
+    ``_build_swa_batch`` deliberately avoids (it asserts ``max(counts) <=
+    cache_size`` so ``pos % cache_size == pos`` and never wraps).
+
+    Here every seq starts at a LARGE base position so its consecutive positions
+    cross the ``cache_size`` boundary (``pos % cache_size`` truly wraps), while
+    keeping per-seq count <= cache_size so the ring cells stay DISTINCT within
+    the launch (concurrent writes to the same ring cell from different token
+    waves are a genuine race -- undefined, correctly excluded). Distinct slots
+    per seq keep cross-seq writes non-aliasing too.
+
+    Also appends CG-pad tokens (bid=-1) carrying a STALE, NON-ZERO position (the
+    realistic cuda-graph residual, unlike the plain builder's pos=0), so the
+    test proves padded rows are skipped by the ``bid < 0`` gate regardless of
+    their leftover position value. Returns the same tuple as ``_build_swa_batch``.
+    """
+    n_pad = min(3, T - 1) if T > 1 else 0
+    real = T - n_pad
+    # per-seq count <= cache_size (distinct ring cells within a seq).
+    min_bs = (real + cache_size - 1) // cache_size
+    bs = max(min(4, real), min_bs)
+    counts = [real // bs + (1 if i < real % bs else 0) for i in range(bs)]
+    assert max(counts) <= cache_size
+    bid_list, pos_list = [], []
+    for i, cnt in enumerate(counts):
+        # Large base that is NOT a multiple of cache_size, so the seq's
+        # positions straddle the wrap boundary: e.g. base=1000 -> ring starts
+        # at 1000%128=104, runs 104..127,0,1,... (distinct cells, wrapped).
+        base = 1000 + i * 257 + int(torch.randint(0, cache_size, (1,)).item())
+        for j in range(cnt):
+            bid_list.append(i)
+            pos_list.append(base + j)
+    for k in range(n_pad):
+        bid_list.append(-1)
+        pos_list.append(4096 + k)  # stale, non-zero (CG residual) -> must be skipped
+    bid = torch.tensor(bid_list, dtype=torch.int32, device=_DEV)
+    pos = torch.tensor(pos_list, dtype=torch.int64, device=_DEV)
+    num_slots = bs + 2
+    slot_map = torch.randperm(num_slots, device=_DEV)[:bs].to(torch.int32)
+    return bid, pos, slot_map, num_slots, bs, n_pad
+
+
 @benchmark()
-def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, GK=64):
+def test_fused_qk_norm_rope_group_quant_swa(
+    T, H, D, RD, *, is_neox, q_fp8, G, GK=64, builder=_build_swa_batch
+):
     NK = 1
     torch.manual_seed(0)
     random.seed(0)
@@ -412,7 +457,7 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     n_groups_k = nope // GK
     entry = D
 
-    bid, pos, slot_map, num_slots, bs, n_pad = _build_swa_batch(T, cache_size)
+    bid, pos, slot_map, num_slots, bs, n_pad = builder(T, cache_size)
     cos, sin = _cos_sin(int(pos.max().item()) + 4, RD, torch.bfloat16)
     q = (torch.randn(T, H, D, device=_DEV) * 0.1).bfloat16()
     kv = (torch.randn(T, NK, D, device=_DEV) * 0.1).bfloat16()
@@ -618,10 +663,18 @@ if args.swa or not args.no_swa:
     # body) runs; the fine-grained xlarge path asserts out SWA by design.
     swa_T = [t for t in args.T if t <= 1024] or [16, 64, 256]
     swa_rows = []
-    for G, H, neox in itertools.product(args.G, args.H, neox_modes):
-        for T in swa_T:
-            swa_rows.append(
-                test_fused_qk_norm_rope_group_quant_swa(
+    # Two builders: the collision-free non-wrapping layout, and the
+    # ring-WRAPAROUND + CG-padding layout (pos > cache_size so pos%cs wraps,
+    # plus bid=-1 pad rows with stale non-zero positions). The wrap builder
+    # covers the path the plain one asserts away.
+    swa_builders = [
+        ("nowrap", _build_swa_batch),
+        ("wrap+cgpad", _build_swa_wrap_batch),
+    ]
+    for tag, builder in swa_builders:
+        for G, H, neox in itertools.product(args.G, args.H, neox_modes):
+            for T in swa_T:
+                r = test_fused_qk_norm_rope_group_quant_swa(
                     T,
                     H,
                     args.D,
@@ -630,8 +683,10 @@ if args.swa or not args.no_swa:
                     q_fp8=q_fp8,
                     G=G,
                     GK=64,
+                    builder=builder,
                 )
-            )
+                r["mode"] = tag
+                swa_rows.append(r)
     swa_df = pd.DataFrame(swa_rows)
     aiter.logger.info(
         "fused_qk_norm_rope_group_quant SWA ring-write summary (markdown):\n%s",

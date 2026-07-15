@@ -31,6 +31,7 @@ from opus_gemm_common import (
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
+    a16w16_uniform_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
     default_kernels_dict,
@@ -156,6 +157,7 @@ NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 # the actual workspace dtype and the reduce launcher writes the requested Y.
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
+    "a16w16_uniform",
     "a16w16_cluster_tdm_splitk_ws",
     "a16w16_clusterlaunch_tdm_splitk_ws",
     *_SPLITK,
@@ -302,6 +304,7 @@ class opus_gemm_codegen:
             _validate_a16w16,
             _validate_a16w16_flatmm,
             _validate_a16w16_flatmm_splitk,
+            _validate_a16w16_uniform_gfx950,
             _validate_a16w16_mono_tile,
             _validate_a16w16_persistent,
         )
@@ -365,6 +368,14 @@ class opus_gemm_codegen:
                 f"slots={info['slots']} "
                 f"comrep=({info['com_rep_m']},{info['com_rep_n']}) "
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']} WG={k.WG_PER_CU}"
+            )
+        elif k.kernel_tag == "a16w16_uniform":
+            info = _validate_a16w16_uniform_gfx950(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']}"
             )
 
         pipeline_header = _pipeline_header_for(k)
@@ -621,6 +632,7 @@ class opus_gemm_codegen:
                     "a16w16",
                     "a16w16_interleave",
                     "a16w16_persistent",
+                    "a16w16_mono_tile",
                 },
                 name_suffix="_mmajor",
             )
@@ -628,7 +640,12 @@ class opus_gemm_codegen:
                 f,
                 "GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_BF16",
                 "bf16_t",
-                tags={"a16w16", "a16w16_interleave", "a16w16_persistent"},
+                tags={
+                    "a16w16",
+                    "a16w16_interleave",
+                    "a16w16_persistent",
+                    "a16w16_mono_tile",
+                },
                 name_suffix="_mmajor",
             )
 
@@ -727,6 +744,7 @@ void
                     "a16w16",
                     "a16w16_interleave",
                     "a16w16_persistent",
+                    "a16w16_mono_tile",
                 ):
                     f.write(
                         MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name + "_mmajor")
@@ -1086,6 +1104,7 @@ if __name__ == "__main__":
         "a16w16": a16w16_kernels_list,
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
+        "a16w16_uniform": a16w16_uniform_kernels_list,
         "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
         "gfx942_nosplit": gfx942_nosplit_kernels_list,
         "gfx942_splitk": gfx942_splitk_kernels_list,

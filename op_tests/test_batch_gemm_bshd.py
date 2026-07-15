@@ -44,7 +44,7 @@ def run_torch(A, W, heads_per_group, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_bshd_gemm(B, S, H, D, G, R, dtype, pipeline, splitk):
+def test_bshd_gemm(B, S, H, D, G, R, dtype, pipeline, splitk, kernelId=None):
     heads_per_group = H // G
     K = heads_per_group * D
     use_standard = pipeline == "standard"
@@ -57,8 +57,15 @@ def test_bshd_gemm(B, S, H, D, G, R, dtype, pipeline, splitk):
 
     candidates = {
         # opus BSHD-fused kernel -- the path the model really runs.
+        # kernelId=None lets the op pick its default kid (208 standard / 608
+        # bhsd_remap); pass an explicit kid to force a specific kernel.
         "opus": lambda: batch_gemm_a16w16_bshd_opus(
-            A, W, heads_per_group, splitK=splitk, use_standard_pipeline=use_standard
+            A,
+            W,
+            heads_per_group,
+            kernelId=kernelId,
+            splitK=splitk,
+            use_standard_pipeline=use_standard,
         ),
         # torch.einsum on the model's natural [B, S, G, d]/[G, R, d] operands.
         "torch_einsum": lambda: torch.einsum(
@@ -150,6 +157,14 @@ def main():
         help="""Split-K factor(s) to sweep.
         e.g.: -k 0 8""",
     )
+    parser.add_argument(
+        "--kernelId",
+        type=int,
+        default=None,
+        help="""Force a specific opus kid instead of the op's default
+        (208 standard / 608 bhsd_remap). e.g. --kernelId 9 for the
+        512x256x256 split-barrier kernel (T>=4096 winner).""",
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:
@@ -158,7 +173,9 @@ def main():
             args.shape, args.pipeline, args.splitk
         ):
             B, S, H, D, G, R = shape
-            df.append(test_bshd_gemm(B, S, H, D, G, R, dtype, pipeline, splitk))
+            df.append(
+                test_bshd_gemm(B, S, H, D, G, R, dtype, pipeline, splitk, args.kernelId)
+            )
         df = pd.DataFrame(df)
         aiter.logger.info(
             "bshd batch gemm summary (markdown):\n%s", df.to_markdown(index=False)

@@ -317,6 +317,19 @@ namespace py = pybind11;
           py::arg("Y"),                                  \
           py::arg("kernelId") = 208,                      \
           py::arg("splitK")   = 0);
+
+#define OPUS_GEMM_A8W8_SCALE_MMAJOR_PYBIND              \
+    m.def("opus_gemm_a8w8_scale_mmajor",                \
+          &opus_gemm_a8w8_scale_mmajor,                 \
+          "mmajor fp8 block-scale batched GEMM: O/Y "    \
+          "[M, batch, *], wo_a/w_scale batch-major, "    \
+          "x_scale [M, batch, K/GROUP_K] (zero-copy "    \
+          "DSV4 wo_a fp8)",                              \
+          py::arg("O"),                                  \
+          py::arg("wo_a"),                               \
+          py::arg("Y"),                                  \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"));
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
           &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \

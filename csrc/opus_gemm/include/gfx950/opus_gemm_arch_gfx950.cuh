@@ -107,11 +107,17 @@ constexpr int kNooobKidOffset     = 1000;
 constexpr int kBhsdSplitkKidMin   = 600;
 constexpr int kBhsdSplitkKidMax   = 650;
 
+constexpr int kUniformSplitkKidMin   = 500;
+constexpr int kUniformSplitkKidMax   = 600;
+
 constexpr bool kid_is_splitk(int kid) noexcept
 {
     return (kid >= kSplitkKidMin && kid < kSplitkKidMax) ||
            (kid >= kSplitkKidMin + kNooobKidOffset &&
             kid < kSplitkKidMax + kNooobKidOffset) ||
+           (kid >= kUniformSplitkKidMin && kid < kUniformSplitkKidMax) ||
+           (kid >= kUniformSplitkKidMin + kNooobKidOffset &&
+            kid < kUniformSplitkKidMax + kNooobKidOffset) ||
            (kid >= kBhsdSplitkKidMin && kid < kBhsdSplitkKidMax) ||
            (kid >= kBhsdSplitkKidMin + kNooobKidOffset &&
             kid < kBhsdSplitkKidMax + kNooobKidOffset);

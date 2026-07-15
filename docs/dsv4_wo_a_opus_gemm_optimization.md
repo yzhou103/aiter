@@ -11,6 +11,37 @@ DeepSeek-V4 形状:`o=[num_tokens, n_local_groups=8, K=4096]`,
 
 ---
 
+## opus a16w16 pipeline 家族总览(gfx950)
+
+所有 gfx950 a16w16 kernel 都用 **MFMA 16×16×32 bf16**(W_M=W_N=16, W_K=32),warp size=64,
+VEC=8(128-bit 向量访存)。**wave 数 = BLOCK_SIZE / 64**。区别在**数据切分方式 + wave 组织 + 同步**:
+
+| 家族(kid)| BLOCK / wave | T_M×T_N | tile 象限切分 | wave 组织 | 缓冲 | 同步 / barrier | 备注 |
+|---|---|---|---|---|---|---|---|
+| **split-barrier**(4–9)| 512 / **8-wave** | 2×4 | **2×2 quad**(HALF_B_M×HALF_B_N,`v_c[2][2]`)| 8 wave **协作**铺一个 tile | 2-deep(tic/toc)| 协作 shuffle,**2–4 barrier/K-tile** | 大 tile 高复用;kid 9=256×256 |
+| **interleave**(40–42)| kid40=512/8-wave;**kid41/42=256/4-wave** | kid40=2×4;**kid41/42=2×2** | 2×2 quad | 协作(header=split-barrier 克隆)| 2-deep | 同 split-barrier | 实验脚手架;**41/42 是仅有的 4-wave 2×2(协作-quad)**,实测慢于 8-wave |
+| **persistent**(300+)| 512 / **8-wave** | 2×4 | **2×2 quad** | 8 wave 协作 + **M-outer 持久化循环**(每 WG 顺序做 m_per_wg 个 tile)+ XCD swizzle | 2-deep | 同 split-barrier | batch 在 grid.z;kid 301=128×256 |
+| **flatmm / flatmm_splitk**(200+)| 256 / **4-wave** | 2×1(仅消费者)| **无 quad**;group-load 布局(NUM_LOAD_GROUPS_PER_BM/BK)| **warp-spec:2 生产者 + 2 消费者** | 深 ring(prefetch_k_iter=2/3)| producer↔consumer 握手,**~4 barrier/K-tile** | splitK;小 M 默认(kid 200/208)|
+| **mono_tile**(1400+)| 512 / **8-wave** | 2×4 | **整 tile**(E_M=B_M/(W_M·T_M),无 HALF)| 8 wave 协作,single-MMA-per-K | A 双 + B 三缓冲 | "no split barrier",实测仍 ~4/tile | B_M≤192;非-splitk |
+| **bhsd / bhsd_splitk**(600+)| 同 flatmm 系 | — | 4D `[G,hpg,S,D]` 视图 + a_offset **头重映射** | 类 flatmm | 深 ring | splitk 变体带 reduce | BHSD 布局 batch gemm |
+
+关键概念:
+- **象限切分(2×2 quad)只属于 split-barrier/interleave/persistent 族**:tile 切成 4 个
+  `HALF_B_M × HALF_B_N` 象限(c00/c01/c10/c11),`static_assert(HALF_B_M % (W_M*T_M)==0)`。
+  mono_tile 用整 tile,flatmm 用 group-load,都无 quad。
+- **wave 组织三类**:①协作(split-barrier/persistent/mono:8 wave 共铺一个 tile,跨 wave 共享 LDS);
+  ②warp-spec(flatmm:2 生产者搬数据 + 2 消费者算,每 K-tile 握手 barrier);③uniform(每 wave 自己
+  load+算,gfx950 **暂无**,gfx942 em3en4/kbuf2v 有——见文末移植章节)。
+- **每 wave 覆盖**:一个 wave 做 `W_M×W_N=16×16` 的 MFMA,在其负责的 M/N 范围内重复 `E_M×E_N` 次;
+  `E_M=HALF_B_M/(W_M·T_M)`(quad 族)或 `B_M/(W_M·T_M)`(mono)。
+- **B_K 锁 64**(split-barrier 族):`B_K==T_N·W_K/2`。flatmm 的 B_K 由 tile 配置定(32/64/128)。
+- **wave 数**:split-barrier/persistent/mono = 8-wave(BLOCK=512);flatmm/bhsd = 4-wave(BLOCK=256)。
+
+per-T 默认选择(`wo_a_gemm_opus`):`T<300 → flatmm_splitk kid 200 + fill-CU splitK`;
+`300≤T≤1024 → persistent kid 301`;`T>1024 → split-barrier kid 9`。
+
+---
+
 ## 0. 关键纪律
 
 - 测性能一律用 idle GPU + `rocprofv3 --kernel-trace`(真实 GPU 时间);
@@ -585,6 +616,19 @@ T=64 sk4=0.99x、T=128 **sk2=1.14x(自动选到真最优,优于硬编码 1.23x)*
 | 调度骨架 | PGR2 / SK / waitcnt / barrier 排布 | **原样复用** | 核心价值,不重写 |
 | 校验器/codegen | gfx942 emit | gfx950 新 tag + 校验(参考 interleave 接线)| 常规接线 |
 
+### ✅ gfx942 kid 10204 基线实测(2026-07-08,用户在 MI300 上跑)
+GEMM kernel 级 GPU 时间(**排除 reduce**),N=1024 K=4096 batch=8:
+
+| T | best sk | GEMM kernel(us)| einsum/hipBLASLt(us)| gap |
+|---|---|---|---|---|
+| 128 | 4 | 93 | 86 | **1.08x** |
+| 256 | 2 | 164 | 138 | 1.19x |
+| 1024 | 1 | 540 | 435 | 1.24x |
+| 4096 | 1 | 2165 | 1541 | 1.40x |
+
+**kernel 本身只差 hipBLASLt 1.08–1.40x**(远好于 opus 现有端到端的 1.4–1.6x),reduce 开销极低
+(sk=1 时 ~20us)。**uniform + 3-barrier + PGR2 调度骨架已确认有效**,是值得移植的基线。决定移植。
+
 ### 建议流程
 1. **(用户在 gfx942 上先做)** 跑通 kid 10204,确认它 uniform+PGR2+低barrier,记录它在
    `1024×1024×4096×8`(或 MI300 对应 shape)的 perf + ATT stall 分解,作为移植基线。
@@ -592,8 +636,445 @@ T=64 sk4=0.99x、T=128 **sk2=1.14x(自动选到真最优,优于硬编码 1.23x)*
    layout + 换 reduce,先 `err=0`。
 3. ATT 对齐调度(barrier/waitcnt 密度对齐 gfx942 参考),再逐 tile 档 + 填 CU,测 vs kid 301/hipB。
 
+### 移植 scoping 结论(2026-07-08):核心难点 = gfx950 无 asm helper 库
+通读 gfx942 两个 uniform 候选后确认:
+- **em3en4(kid 10204)**:~580 行手写 `v_mfma_f32_16x16x16_bf16` 内联 asm + `EM3EN4_PAIR_LO/HI`
+  K-半 packing + `ds_read/write_b128` offset asm,写死 E_M=3/E_N=4/E_K=8。
+- **kbuf2v**:uniform + 深缓冲(K-dbuf2 + V-dbuf)+ splitK,用 `make_tiled_mma` 抽象取类型/布局,
+  **但实际 MFMA+预取仍靠 `phase_a/b/ab_prefetch`**,定义在 `gfx942/opus_gemm_asm_mma16x16x16.cuh`。
+- **两者的 MFMA 都来自 gfx942 的 16x16x16 asm 头;gfx950 opus 没有对应 asm 头(全走 make_tiled_mma 抽象)。**
+
+→ 移植两条路:
+- **路 A**:写 gfx950 `opus_gemm_asm_mma16x16x32.cuh`(port 整个 asm helper 库到 16×16×32),再 port
+  em3en4/kbuf2v。忠实于已验证基线,但 ~数百行 ISA 手工活(K-packing/ds_read 布局/mfma 全改),多会话。
+- **路 B**:用 gfx950 现成 `make_tiled_mma` 抽象重表达 uniform+深缓冲调度(借结构、compute 走抽象 +
+  复用 gfx950 layout)。省去手写 16×16×32 asm,但需先验证抽象能否拆出**单条 ds_read / 单个 sub-mma**
+  (PGR2/PLR1 细粒度交错需要);抽象若只能整组 E_M×E_N×E_K 一次算则不可行,退回路 A。
+- **建议**:先低成本验证路 B 的抽象粒度,可行走 B,否则走 A。
+
+### ✅ 路 B 验证通过(2026-07-08)—— 走 B,不写 asm 库
+`csrc/include/opus/opus.hpp` 确认抽象层已够:
+- **native 16×16×32 bf16 MFMA**:line 2701 `DISPATCH_MFMA_(bf16,bf16,fp32,16,16,32,
+  __builtin_amdgcn_mfma_f32_16x16x32_bf16)`,别名 `mfma_f32_16x16x32_bf16`(2751)。W_K=32 时抽象直接
+  出 native 指令(gfx950 split-barrier 等已在用)。
+- **粒度**:`mfma` struct `operator()(a,b,c)`=单条 MFMA(2654/2676);`make_tiled_mma`=分组;
+  `load<VEC>(smem,layout)`=单条 ds_read。→ PGR2/PLR1 的细粒度交错可表达。
+- **深缓冲**:gfx1250 kernel 已用 `v_a[3]`+抽象,证明深寄存器/LDS 缓冲兼容。
+
+**→ 不需要写 16×16×32 asm 库(路 A 弃)。** 唯一真实风险:抽象能*表达* ≠ 编译器*排布*得和 em3en4
+手写 asm 一样好(我之前 PGR2+PLR1 用抽象正确但更慢就是这原因)。路 B 关键 = 用
+`sched_barrier`/`setprio`/精确 waitcnt 引导 + ATT 逐轮把编译器调度压到接近手写。
+
+### 路 B 构建计划
+1. 新 tag `a16w16_uniform`(codegen 5 张表各加一行 + `register_emit`)。
+2. 新 traits:4-wave(BLOCK=256)、tile 跟 em3en4 取向、W_K=32、**uniform layout**(每 wave load+compute,
+   无 producer/consumer role 拆分)。
+3. 新 pipeline header:深缓冲环(≥3 slot)+ 每 K-tile 1 barrier + `load()`/`mma()` 细粒度交错 + 计数
+   waitcnt,照 em3en4 调度骨架但 compute 走抽象。
+4. 复用 gfx950 layout helper(能复用则复用);splitK 复用 `splitk_reduce_gfx950`。
+5. 构建 err=0 → ATT 对齐 barrier/waitcnt 密度 → 测 vs kid 301 / hipBLASLt。
+
+### 关键调度工具:`sched_group_barrier`(解决"编译器排布不如手写"风险)
+参考 `csrc/include/pa_sparse_prefill_opus.h:485-515`(`sched_compute_qk`)。用
+`__builtin_amdgcn_sched_group_barrier(MASK, count, Group)` **显式命令编译器的指令交错顺序**——
+用抽象(`mma`/`load`)写 C++,再用它强制按 em3en4 手写 asm 的节奏排 MFMA/DS_READ,**免写裸 asm 也能
+拿到手写级调度**。这正是我之前 PGR2+PLR1(依赖默认编译器调度)更慢的根因补丁。
+mask:`MFMA=0x08, VALU=0x02, SALU=0x04, EXP=0x400, DS_READ=0x100`。用法(每组 mma/load 之后):
+```cpp
+opus::static_for<N>([&]{
+    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, Group);
+    // ... 精确 MFMA / ds_read 交替,复刻手写节奏
+});
+```
+
+### 新会话起点(构建路 B 的 checklist)
+- 参考调度骨架:`gfx942/opus_gemm_pipeline_a16w16_em3en4_lds1_pgr2_sk.cuh`(uniform+PGR2+3-barrier,
+  基线 1.08–1.4x)。**只借结构,compute 用抽象**。
+- native MFMA:`opus::mfma_f32_16x16x32_bf16`(opus.hpp:2701/2751),W_K=32。
+- 调度引导:`sched_group_barrier`(上文)。
+- splitK reduce:`splitk_reduce_gfx950.cuh`。
+- 接线套路:仿 interleave tag(codegen 5 张表 + register_emit + common.py 工厂/force-compile)。
+- 验证:`checkAllclose err=0` + `run_perftest` + ATT stall(目标 s_barrier→~10%)。
+
 ### 其它可参考的 gfx942 现代 pipeline
 `kbuf2v`(K 双缓冲)、`kbuf2v_bk128`、`wave_k_coop`(wave 间 K 协作)、`quad_mfma32_kbuf1`。
+
+### 补充:gfx950 已有 4-wave,缺的是 uniform 调度
+gfx950 **有** 4-wave kernel:`flatmm_splitk`(kid 200–2xx,`BLOCK_SIZE=256, T_M=2, T_N=1`,小 T wo_a
+默认走它)、interleave 41/42(实验)。8-wave 的是 split-barrier(4–9)/persistent(300+)/mono_tile。
+所以移植 gfx942 em3en4 时,**4-wave 的 grid/block/launcher 接线 gfx950 已有**(flatmm_splitk 就是),
+主要换内层调度(warp-spec → uniform)+ layout + MFMA 16×16×32。
+
+### flatmm_splitk 的 warp specialization(生产者/消费者)实现位置
+文件:`include/gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh`
+- **role 分配**(line 275):`int role = ((wave_id & 1) ^ ((wgid >> 8) & 1));` → 4 wave 里 2 生产者 2 消费者。
+- **生产者**(line 308,`if (role==0)`):只 `async_load`(global→LDS 填 ring slot),无 mma;每填一个
+  slot 做 `s_waitcnt_vmcnt + s_barrier` 通知消费者。
+- **消费者**(line 395,`else`):只 `ds_read + mma`,无 global load;每步先 `s_barrier` 等生产者。
+- **握手**:生产者第 N 个 `s_barrier` 与消费者第 N 个是**同一个 WG barrier(rendezvous)**,每 K-tile 一次
+  跨-role 握手 → 这就是 ATT 里的 44% s_barrier。
+- **对比 uniform**:em3en4 每 wave 自己 load 自己算(无 role 拆分),用深缓冲在**单 wave 内**重叠 load/compute,
+  同步基本靠 per-wave `s_waitcnt`,barrier 极少。即:flatmm 用"拆 wave(空间)"重叠,uniform 用"深缓冲(时间)"重叠。
+
+### traits / pipeline 家族如何区分(接线机制)
+每个 kid 带一个 `kernel_tag`(在 `opus_gemm_common.py` 工厂函数里设),codegen
+(`gen_instances_gfx950.py`)用一组**按 tag 索引的映射表**决定用哪套实现:
+`PIPELINE_HEADER_MAP` / `TRAITS_HEADER_MAP` / `TRAITS_NAME_MAP` / `KERNEL_FUNC_MAP` / `KARGS_NAME_MAP`
++ `register_emit("gfx950", tag, gen_xxx_instance)`(决定 launcher 的 grid/block/kargs 填法)。
+- `a16w16` 与 `a16w16_interleave` **共用同一个 traits 名**(`opus_gemm_a16w16_traits_gfx950`,含 HALF
+  quad-subtile)但用**不同 pipeline header**;`a16w16_flatmm_splitk`→`opus_flatmm_splitk_traits`(分组
+  warp-spec,无 HALF);`a16w16_mono_tile`→`..._mono_tile_traits`(整 tile,无 HALF)。
+- **traits 与其 pipeline 成对绑定**:traits 里的 `HALF_B_M`/`E_M`/`NUM_LOAD_GROUPS` 等常量假设必须和
+  对应 `.cuh` 的循环结构一致,不能跨族套用。
+- **HALF_B_M/HALF_B_N(2×2 quad-subtile)只属于 split-barrier 族**(split-barrier/interleave/persistent);
+  `static_assert(HALF_B_M % (W_M*T_M)==0)` 是保证"半 tile 的 M 能被一个 wave-tile 的 M footprint 整除"
+  (该 kernel 按 half 象限铺 wave)。mono_tile/flatmm_splitk 不用 HALF。
+
+→ **新加 uniform 家族 = 加新 tag + 在上述几张表各加一行 + 写对应 traits/pipeline/emit**(和 interleave
+当初接线同套路)。
+
+---
+
+## 追加(2026-07-08):路 B(uniform 4-wave + sched_group_barrier)实测 —— 证伪
+
+按 Route B 计划实现了 `a16w16_uniform`(4-wave / BLOCK=256 / full-tile mono_tile 式布局 /
+PGR1 K-loop / split-K fp32 workspace / `sched_group_barrier` 强制 MFMA·ds_read·valu·salu
+交错)。kid 500=128×128,kid 501=256×128。
+
+### 正确性(B_K=32 与 B_K=64 均 err=0)
+- **奇数 loops bug 修复**:mono_tile 原 2-tile-unroll 主循环在奇数 loops 会静默算错 → 换成 PGR1
+  单步循环,任意 loops≥1(含奇数)+ splitK 全对。
+- **B_K=32(E_K=1,smem_sub=16):err=0**。
+- **B_K=64(E_K=2,smem_sub=8==W_N/T_N):`rb` 退化已修,err=0**。
+  - bug:4-wave 下一行 smem 只装 `smem_sub=8` 个 N,但 MFMA 需 `W_N=16`,且 B 还带 `wave_id_n`
+    N-slab → mono_tile 的 `rb`(为 8-wave / smem_sub_e_n≥2 设计)行内放不下 → N 错排(`ra`/A 无此问题,
+    A 的 M 不按 wave 切)。探针二分定位到 100% 在 `rb`。
+  - 修法(关键):**不盲试 stride,而是从能工作的 B_K=32 反解出 store 的真实 N 公式**
+    `store_N(wave_id_n, E_N_rep, lane_n) = 32·E_N_rep + 16·wave_id_n + lane_n`
+    (之前误猜成 `64·wave+16·rep`,rep/wave 步长搞反),再代入 B_K=64 物理布局
+    (`sb row=4·iter+2·wm+wn`,`N=32·iter+16·wm+2·nslot+wn`)反推出 `rb` 行序
+    `row = 4·E_N_rep + 2·wave_id_n + (lane_n%T_N)`,in-row `nslot=lane_n/T_N`。
+    落进 `make_layout_rb` 的 `if constexpr(smem_sub_e_n==1)` 分支。
+  - 验证:P2(B-col)0 错列;kid500/501 全形状 err=0(奇数 loops、splitK sk=1..5 均过;大 K 的
+    ~1e-3 是 bf16 累加噪声)。
+  - **B_K=128 仍架构级堵死**(4-wave:smem_sub=4 < W_N/T_N=8 → smem_sub_e_m/n=0)。
+
+### 性能(rocprofv3 kernel-trace,batch=8,1024×1024×4096,单次 batched launch)
+B_K=32 是被削弱配置(K=4096→128 趟 K-loop = B_K=64 的 2× barrier)。B_K=64 现已数值正确
+(见上),下表为其真实性能:
+
+| kernel | 主 kernel | reduce | 合计 |
+|---|---:|---:|---:|
+| persistent **kid 301**(128×256,现有最优) | 91.8us | — | **92us** |
+| uniform kid 501(256×128,**B_K=32**) | 154.9us | 10.4us | 165us |
+| uniform kid 500(128×128,**B_K=32**) | 146.6us | 11.0us | 158us |
+| uniform kid 501(256×128,**B_K=64**) | 128.6us | 10.6us | **~139us** |
+| uniform kid 500(128×128,**B_K=64**) | 109.9us | 11.2us | **~121us** |
+| hipBLASLt(batched,§追加) | | | ~73us |
+
+- **B_K=64 确实更快(−17~25%,正是 barrier 砍半的效果)** —— B_K=32 的确是残缺对照。
+- **但即便 B_K=64,uniform 仍比现有 kid 301(92us)慢 ~1.3~1.4x、比 hipBLASLt 慢 ~1.7x。**
+- `sched_group_barrier` 没能逼出更快的流水;ATT 见下。
+
+### tile 朝向扫(2026-07-08 追测,B_K=64,batch=8 1024²×4096)
+| kid | tile | 主 kernel | +reduce | 合计 |
+|---|---|---:|---:|---:|
+| **500** | 128×128 | 118.8 | 11.0 | **~130us**(uniform 最快)|
+| 501 | 256×128 | 129.8 | 10.4 | ~140us |
+| 502 | 128×256 | 139.5 | 10.7 | ~150us(最慢)|
+| persistent 301 | 128×256 | — | — | **92.7us** |
+
+- **tile 朝向杠杆对 uniform 反向**:128×256(502)最慢,与 persistent(301=128×256 最优)相反。
+  uniform 是**最小方形 tile 128×128(kid 500)最快**(更多小 tile 填满 grid)。
+- 但 500 仍比 301 慢 ~1.4x;且 500 主 kernel 单独 119us 已 > 301 的 93us → **即使加 sk=1 直写去掉 reduce 也追不平**。
+- `sched_uniform_compute` 去留实测:去掉反而慢 ~3%(kid500 110→113, kid501 129→135),证实 44% STALL 是
+  结构性(waitcnt 全排空 + 无 PLR),不是调度提示过约束。
+
+### PGR2+PLR 实测(2026-07-08)——**更慢,已回退**
+把 PGR1 换成 PGR2+PLR(3-deep smem + 寄存器双缓冲,**1 s_barrier/tile**,ds_read 藏进 MFMA):
+- kid500 资源:VGPR 144→**212**,LDS 70→**105KiB**,无 spill。→ 占用率 2 WG/CU → **1 WG/CU(8→4 wave/CU 腰斩)**。
+- 性能(M=1024,batch=8):PGR1 **130us** → PLR **165us**,**更慢 27%**。
+- 原因:barrier 减半 + ds_read overlap 的收益,**盖不过占用率腰斩**(大 M 计算密集,靠多 wave 藏延迟)。
+  → 再次印证"少 barrier"不是这条路的杠杆;已回退 PGR1。
+
+### 多-T 扫(committed PGR1,batch=8,N=1024,K=4096,单 launch 全 8-batch,单位 us)
+口径:rocprofv3 kernel-trace,opus 一次 launch(batch 在 grid.z),hipBLASLt 用 batched
+`torch.bmm`(一次做全 8 batch,和文档 §追加 73us 对齐;**不能**用 8 次单-batch linear,那会报单-batch 时间)。
+| M | uniform 500 sk1 | uniform 500 **sk4** | persistent 301 | hipBLASLt(bmm) |
+|---|---:|---:|---:|---:|
+| 32   | 82.6 | **53.3** | 55.1 | ~20 |
+| 64   | 87.1 | **52.8** | 57.7 | 19.9 |
+| 128  | 88.3 | **53.7** | 62.5 | ~26 |
+| 512  | 98.4 | 89.0 | **84.6** | ~52 |
+| 1024 | 130.2 | 166.3 | **93.0 / 92.5** | **73.7** |
+| 4096 | 491.7 | 600.9 | **287.2** | 231.3 |
+
+(301=92.5us、hipBLASLt=73.7us @M1024 与文档 §追加 91.8us / 73us 一致 → 方法自洽。)
+
+- **小 M(≤128):uniform + splitK(sk4)= 53us,反超 persistent 301(55-62us)~5-15%** —— splitK 填满 grid,301 不 splitK。
+- 大 M(≥512):301 完胜;uniform 的 splitK 在大 M 反而拖累(sk4 > sk1)。交叉点 ~M=512。
+- 对 DSV4 wo_a 真实 T(通常大)uniform 不占优。
+
+### 小-T 再对比 kid 208(现有小-T 默认)—— uniform 无 niche
+| M | uniform 500 sk4 | uniform 501 sk4 | kid 208 sk1 | kid 208 sk2 |
+|---|---:|---:|---:|---:|
+| 32  | 53.3 | 61.8 | 30.6 | **21.8** |
+| 64  | 53.9 | 62.6 | 23.6 | **20.4** |
+| 128 | 53.3 | 64.4 | 45.8 | **33.3** |
+| 256 | 60.7 | 66.5 | **53.5** | 57.8 |
+
+- **kid 208(flatmm_splitk 64×64)在小 M 完胜 uniform(21-33us vs 53us,~2x)**。之前"uniform sk4 反超 301"只是因为 301 不 splitK;真正的小-T 冠军 208 uniform 追不上。
+- **最终定论:uniform 在任何 T 都不是最快** —— 小 T 输 208、大 T 输 301/9。它是正确的实验底座(B_K=64 rb 修复 + 奇数-loops 修复 + tile 已扫优),但**非生产竞争方案**。与 §8/§263/§350 完全合流:框架内到顶,追平 hipBLASLt 需独立 Stream-K 重写。
+
+### 追加:mono_tile mmajor 进入 wo_a tune 池 —— 新 opus 最优
+之前 mono_tile 1400..1404 虽然在普通 batch-major 测试中很快,但没有 `_mmajor` launcher,所以
+`wo_a_gemm_opus(o=[T,G,K])` 的零拷贝路径根本选不到它。已补:
+- `gen_mono_tile_instance` 生成 `_mmajor` sibling launcher(与 persistent mmajor 同套路,dim0=M、dim1=batch)。
+- `GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_{BF16,FP32}` 与 manifest 纳入 `a16w16_mono_tile`。
+- force-compile 1400..1404,使 tune/explicit `kernelId=1401` 可达。
+
+真实 `wo_a_gemm_opus` mmajor **manual candidate sweep**(显式 kernelId,不是自动 tuner;
+rocprofv3 kernel-trace,batch=8,N=1024,K=4096,单位 us):
+
+| T | kid208/sk2 | persistent 301 | mono 1401(128×256) | mono 1403(128×128) | hipBLASLt(bmm) |
+|---:|---:|---:|---:|---:|---:|
+| 64   | **19.9** | 57.7 | 36.1 | 29.1 | 21.9 |
+| 128  | 32.1 | 62.8 | 37.7 | **30.8** | 23.8 |
+| 256  | 57.6 | 64.1 | 39.8 | **33.1** | 42.3 |
+| 512  | 94.5 | 83.8 | **50.1** | 79.2 | 50.7 |
+| 1024 | 174.1 | 91.0 | **86.7** | 91.9 | 73.1 |
+| 2048 | 405.1 | 142.7 | **127.9** | 149.7 | 105.4 |
+| 4096 | 921.5 | 294.6 | **268.9** | 383.2 | 224.4 |
+| 8192 | — | 608.5 | 507.4 | — | 425.6 |
+| 16384 | — | 1256.9 | 987.0 | — | 811.8 |
+
+结论:
+- `T<128`:仍用 208/sk(auto splitK),小 T 的 flatmm_splitk 还是最强。
+- `128<=T<512`:mono 1403(128×128)最佳。
+- `512<=T<=4096`:mono 1401(128×256)是 opus 最优,全段优于 persistent 301/旧 kid9。
+- `T>=8192`:kid 9 重新领先 mono 1401(大 tile/复用率胜出),但仍慢于 hipBLASLt。
+- mono_tile 需要 N/K tile-aligned(`N%tile_N==0,K%64==0`;DSV4 `N=1024,K=4096` 满足),M-tail 由 bounded
+  gmem descriptor 处理。若 N/K 不兼容,回退到旧 persistent/kid9。
+
+`wo_a_gemm_opus` 默认策略已改为:
+`T<128 -> 200/208 splitK`, `128<=T<512 -> 1403`, `512<=T<8192 -> 1401`,
+`T>=8192 -> 9`(若 mono 不兼容则回退 301/9)。
+默认路径正确性已验证:T=64/128/256/512/1024 全 `err≈0`。
+
+#### mmajor tuner 接入
+已把 mono_tile 接入 batch/wo_a tuning infra:
+- `gen_mono_tile_instance` 生成 `_mmajor` launcher。
+- mmajor lookup/manifest 纳入 1400..1404。
+- `opus_gemm_tune.py --mmajor` 生成 `[M,batch,K]` / `[batch,N,K]` / `[M,batch,N]`
+  布局数据,调用 `opus_gemm_a16w16_mmajor` 计时,输出仍用全局 CSV schema
+  (`batch,M,N,K,solidx,splitK,us,...`; 实际列序为 `cu_num,batch,M,N,K,...`)。
+- tuned CSV / runtime lookup **已把 `batch` 纳入 key**。旧 CSV 没有 `batch` 列时按 `batch=1`
+  兼容;wo_a/mmajor tuning 会写出 `batch=G`(例如 DSV4 的 G=8),避免 batch=1 与 batch=8
+  的 winner 误匹配。
+- `wo_a_gemm_opus` 现在先查全局 tuned CSV(传 `batch=G`);命中后直接用 CSV 的 `solidx/splitK`,
+  miss 才走上述 heuristic。
+
+示例(单 shape debug tune,不会污染全局 CSV):
+```bash
+cd csrc/opus_gemm
+PYTHONPATH=/path/to/aiter \
+python3 opus_gemm_tune.py --mmajor \
+  -m 128 -n 1024 -k 4096 -b 8 \
+  --kid 208,301,1401,1403 \
+  -o /tmp/woa_mmajor_tuned.csv --iters 20 --warmup 5 --mp 1
+
+# 让运行时消费这个 CSV
+export AITER_OPUS_TUNED_CSV_GLOB=/tmp/woa_mmajor_tuned.csv
+```
+smoke 结果:T=128,N=1024,K=4096,batch=8 tuned CSV 带 `batch` 列,`wo_a_gemm_opus` 查表命中
+batch=8 row;同 shape 的 batch=1 lookup 不命中,err≈0。
+
+完整 mmajor tuner sweep(自动 tuner,非手动 kernelId sweep;候选含 200/206/208/9/300-303/1401/1403/1404;
+CSV schema 为 `cu_num,batch,M,N,K,...`):
+
+| T | tuned winner | splitK | tuner us | kernel |
+|---:|---:|---:|---:|---|
+| 16 | 200 | 4 | 19.3 | flatmm_splitk 64×64×64 WG=2 |
+| 32 | 206 | 2 | 20.6 | flatmm_splitk 64×32×128 WG=2 |
+| 64 | 200 | 4 | 19.9 | flatmm_splitk 64×64×64 WG=2 |
+| 128 | 1404 | 0 | 28.9 | mono_tile 64×128×64 |
+| 256 | 1403 | 0 | 33.1 | mono_tile 128×128×64 |
+| 512 | 1401 | 0 | 49.8 | mono_tile 128×256×64 |
+| 1024 | 1401 | 0 | 87.6 | mono_tile 128×256×64 |
+| 2048 | 1401 | 0 | 120.3 | mono_tile 128×256×64 |
+| 4096 | 9 | 0 | 260.1 | split-barrier 256×256×64 |
+| 8192 | 9 | 0 | 482.2 | split-barrier 256×256×64 |
+| 16384 | 9 | 0 | 933.0 | split-barrier 256×256×64 |
+
+默认 heuristic 同步为该 sweep 的近似分段;生产更推荐写入 tuned CSV 后由 `lookup_tuned(batch,M,N,K,...)`
+精确命中。
+
+与 hipBLASLt(batched `bmm` / einsum 同口径)的比值:
+
+| T | opus tuned | hipBLASLt | opus/hipB |
+|---:|---:|---:|---:|
+| 16 | 19.3 | 20.5 | **0.94x** |
+| 32 | 20.6 | 23.0 | **0.90x** |
+| 64 | 19.9 | 20.8 | **0.96x** |
+| 128 | 28.9 | 24.1 | 1.20x |
+| 256 | 33.1 | 42.1 | **0.79x** |
+| 512 | 49.8 | 52.0 | **0.96x** |
+| 1024 | 87.6 | 72.7 | 1.21x |
+| 2048 | 120.3 | 104.3 | 1.15x |
+| 4096 | 260.1 | 220.5 | 1.18x |
+| 8192 | 482.2 | 426.7 | 1.13x |
+| 16384 | 933.0 | 813.7 | 1.15x |
+
+结论:小 T(16/32/64)和 T=256/512,opus tuned winner 已经追平/略快 hipBLASLt;T=128 是
+异常弱点(1404 仍慢 20%);T>=1024 仍慢 13-21%,需要 Stream-K/手排流水才可能继续缩差。
+
+G=16(即 batch=16)再 tune/对比 hipBLASLt:
+
+| T | opus tuned | hipBLASLt | opus/hipB | winner |
+|---:|---:|---:|---:|---|
+| 16 | 32.5 | 26.6 | 1.22x | 200/sk4 |
+| 32 | 32.7 | 29.2 | 1.12x | 200/sk4 |
+| 64 | 31.0 | 34.2 | **0.91x** | 1404 |
+| 128 | 40.0 | 42.5 | **0.94x** | 1403 |
+| 256 | 57.2 | 62.0 | **0.92x** | 1403 |
+| 512 | 88.5 | 78.5 | 1.13x | 9 |
+| 1024 | 139.0 | 107.2 | 1.30x | 9 |
+| 2048 | 250.7 | 224.3 | 1.12x | 9 |
+| 4096 | 508.1 | 420.9 | 1.21x | 9 |
+| 8192 | 921.6 | 819.9 | 1.12x | 9 |
+| 16384 | 1806.4 | 1605.2 | 1.13x | 9 |
+
+G=16 结论:batch 更大后大 tile/kid9 提前成为最优;mono 只在 T=64/128/256 取胜。
+opus 在 T=64/128/256 反超 hipBLASLt,但 T=16/32 和 T>=512 仍慢。再次说明 **batch 必须进
+tune key**:同样 T/N/K, G=8 与 G=16 的 winner 会变。
+
+### ATT(kid 501,单 CU,wave 状态占比)
+STALL **44%** / WAIT(waitcnt+barrier)27% / EXEC(发射)27% / IDLE 1%。仅 ~27% 在发射,
+~71% 卡住。**印证 §263 的警告**:手动 `sched_group_barrier` 过度约束调度 → 串行化、暴露延迟,
+比让编译器自排更差。
+
+### 结论
+- 路 B 的核心假设(uniform + `sched_group_barrier` 逼出 hipBLASLt 式细粒度流水)**经公平实测(含 B_K=64)未成立**:
+  即使在其目标配置 B_K=64 上,也比现有 kid 301 慢 ~1.3x。
+- B_K=64 把 barrier 砍半确实有用(−17~25%),但填不平剩下的坑;单为追平 301 不值得去啃 `partition_layout_c`
+  修 `rb`(B_K=64 数值仍错,只有 timing 可用)。
+- 与 §8/§263/§350 的结论合流:**现有 split-barrier/persistent(kid 301)是框架内最优**;真要追平
+  hipBLASLt 只能整条重写(Stream-K + 手排 LDS + 细粒度计数等待),作为独立高风险任务。
+- 代码现状:`a16w16_uniform`(kids 500/501)默认 **B_K=64、err=0**(比 B_K=32 快 17-25%);
+  full-tile traits + PGR1 循环 + `partition_layout_c` fp32 store + `make_layout_rb` 的
+  `smem_sub_e_n==1` 分支(B_K=64 修复)全部就位。作为后续 Stream-K 重写 / sched_group_barrier
+  在正确内核上做 ATT 的实验底座。
+
+---
+
+## 追加(2026-07):T=8192 深挖 —— tile/PLR/B_K/uniform 四条快路全部撞墙 + 4-vs-8-wave co-execute 机理
+
+对象 shape:`B=1,S=8192,H=64,D=512,G=8,R=1024` → batch GEMM `M=8192, N=1024, K=4096, batch=8`。
+口径:opus 走 `batch_gemm_a16w16_bshd_opus(kernelId=...)`(新加 `--kernelId` 透传到
+`op_tests/test_batch_gemm_bshd.py`);wall-clock = `run_perftest`(~100 iter);stall = rocprofv3 ATT
+单 CU 稳态,按结构占比看(§0 纪律)。ATT driver:`op_tests/_att_drv.py`(kid9/hbl/mono/uniform 模式)。
+
+### 基线(同 shape,standard pipeline)
+| kernel | tile / wave | wall us | TFLOPS | vs hipBLASLt |
+|---|---|---|---:|---|
+| hipBLASLt(torch.einsum 背后 Cijk MT256x256) | 256×256 / 4-wave | ~405 | ~1356 | 1.00× |
+| kid 9(split-barrier) | 256×256 / 8-wave | ~465 | ~1182 | 0.87× |
+| **mono 1400**(最快 mono) | 192×256 / 8-wave | ~477 | ~1153 | 0.85× |
+| kid 208(bshd 默认,小 tile splitk) | 64×64 | 1554 | 354 | 0.26× |
+
+注意:默认 bshd standard 走 kid 208(大 T 上最差),不是 kid 9;要 kid 9 得显式 `--kernelId 9`。
+
+### kid9 vs hipBLASLt ATT stall(单 CU 稳态占比)
+| 类别 | kid9 | hipBLASLt |
+|---|---:|---:|
+| v_mfma | 33.0% | 39.9% |
+| **s_barrier** | **24.9%** | 8.8% |
+| ds_read/write | 11.2% | 4.0% |
+| buffer_load | 10.8% | 40.5% |
+| buffer_store | 10.6% | 1.1% |
+| s_waitcnt | 3.7% | 5.1% |
+
+kid9 = 2×2 象限拆分(`v_c[2][2]`),每象限一道 `s_barrier`(ATT 里 8 段 MFMA + 块间 barrier);
+hipBLASLt = per-wave MIWT8_8 连续大 MFMA 流(1 大块),无块间 barrier → barrier 只 8.8%。
+资源/grid(rocprofv3 grid 单位是**线程数**,须 ÷block):kid9 block512(8wave)、1024 WG、VGPR120、LDS132KiB;
+hipBLASLt block256(4wave)、**256 WG(persistent/Stream-K,一 WG 吃多 tile)**、VGPR256、LDS132KiB。
+
+### 四条"快路"实验(全部证伪/失败)
+| 杠杆 | 做法 | 结果 | 根因 |
+|---|---|---|---|
+| 加大 tile | kid 1405 = mono 256×256(2-槽 B) | err=0 但慢(**865** < 1400 的 1153) | 256×256 用 3-槽 B 超 160KiB → 逼成 2-槽浅流水,barrier 28%+waitcnt 25% 双升 |
+| PLR 深流水 | 寄存器双缓冲 v_a/v_b | **证伪,不做** | mono1400 的 s_waitcnt 拆成 **vmcnt 11.5% / lgkmcnt 0.1%**;LDS read 延迟已藏住,PLR 无处可压 |
+| 加大 B_K | kid 1406 = 128×128×**128** | **err=0.87 错 + 522 慢,已删** | mono make_layout_ra/rb 隐含 B_K=64(E_K=2);E_K=4 算错 |
+| 修 uniform 调度 | 去掉 uniform_mma 的 `sched_group_barrier` | **证伪**:1329 vs 1301us 无变化 | uniform 瓶颈是 **vmcnt 52.9%(全局 load)**、barrier 仅 3.2%;schedule 不是瓶颈 |
+
+### 4-wave vs 8-wave × co-execute(本轮最有价值的机理)
+每线程累加器 VGPR = `B_M·B_N /(num_waves·64)`,**与波数成反比**。实测:uniform 4-wave VGPR 132-208 vs
+mono 8-wave 88-120。gfx950 每 CU 4 个 SIMD;两家都被 LDS 卡在 1 WG/CU,但:
+- **8-wave**:8 waves/1WG ÷ 4 SIMD = **2 waves/SIMD** → 一个 wave 等 load 时另一个 wave 的 MFMA 顶上(intra-WG co-execute)→ mono1400 vmcnt 仅 **11.5%**。
+- **4-wave**:4 waves ÷ 4 SIMD = **1 wave/SIMD**,一卡没得切 → uniform501 vmcnt **52.9%**。
+
+4-wave 想拿 2 waves/SIMD 只能靠塞 2 个 WG/CU,但受 LDS:
+| uniform kid | tile | LDS/WG | WG/CU | main us(kernel-trace, 8-batch) |
+|---|---|---:|---|---:|
+| 501 | 256×128 | 103 KiB | 2×=206>160 → **1 WG** | 1301 |
+| 500 | 128×128 | 70 KiB | 2×=140<160 → **2 WG** | 1007 |
+
+即 **4-wave 二选一:大 tile → LDS 锁死 1 WG(延迟暴露);小 tile → 2 WG 有 co-execute 但算术强度低(带宽 bound)**。
+8-wave 两个都占:8 waves 塞进 1 WG 天然给 2 waves/SIMD,且寄存器省撑得起大 tile。这就是 8-wave 是甜点的根因。
+> ATT 方法学坑:ATT `att_target_cu=1`+串行化**照不到 inter-WG(2 个独立 WG)的 co-execute**——kid500 真实
+> 更快(1007<1301)但 ATT vmcnt 仍 ~50%。跨 WG 的 occupancy 效果只能靠 kernel-trace 时间看,不能靠 ATT stall%。
+
+### "减 barrier"方向(为何在本 shape 反向)
+8-wave 的 barrier 来自 cooperative LDS load(waves 共享 A/B 复用)。"弱化 wave 间依赖减 barrier" = 各 wave 自己 load
+→ 丢 LDS 复用 → 全局流量 ×wave_N(A)/×wave_M(B)= ×2~4。本 shape **已是全局-load bound**,砍依赖=加流量=净亏。
+且 barrier 本就不是 mono 的头号 stall(17.7%,排 mfma/buffer_load 之后)。正解是 hipBLASLt 那样"保留共享+barrier
+但用深流水藏到 8.8%",而深流水在 gfx950 被 occupancy 堵死。
+
+### 本轮总结论
+opus 在 gfx950 上受 **LDS 160KiB + VGPR(4-wave 大 tile 208+)+ 全局带宽** 三重锁死,`tile/PLR/B_K/uniform 调度/减barrier`
+五个单点杠杆各自撞回同一堵墙:**kid9 / mono1400 ≈ hipBLASLt 的 0.85× 就是框架内现实天花板**。追平只能上
+hipBLASLt 式 per-wave 独立 load + Stream-K persistent + 深交织流水的**整体重写**(文档多处已定性为高风险独立任务)。
+
+### 代码/产物现状
+- **保留**:kid 1405(mono 256×256,2-槽 B,err=0,慢,留作对照)+ pipeline 的 `B_SLOTS` 自动选槽机制
+  (`opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh`;现有 1400-1404 仍走 3-槽,二进制不变)。
+- **移除**:坏 kid 1406(B_K=128,err=0.87)。
+- 工具:`op_tests/_att_drv.py`(kid9/hbl/mono/uniform 模式)+ `test_batch_gemm_bshd.py --kernelId` 透传;
+  ATT yaml `att_kid9.yaml` / `bshd_att_einsum.yaml` / `att_mono.yaml` / `att_uni501.yaml`。
+
+---
+
+## fp8 blockscale uniform 变体 fork 清单(2026-07-15)
+
+目标:把在建的 **uniform bf16 内核**(`gemm_a16w16_uniform_kernel`,4-wave/full-tile/PGR1/
+sched_group_barrier,barrier ~10%)扩成 **fp8 + 128×128 blockscale**,让 fp8 从 a8w8_scale 的
+69us(barrier 31%)进一步下压(a8w8_scale 是 8-wave quad,barrier 高)。
+
+基底文件:
+- pipeline:`gfx950/opus_gemm_pipeline_a16w16_uniform_gfx950.cuh`(fork 成 `..._uniform_scale_...`)
+- 可复用件(来自 `opus_gemm_pipeline_a8w8_scale_gfx950.cuh`):`scale_c_tile<E_M,E_N,...>`、
+  `u_sfa`/`vtype_sfa`/`vtype_sfb` scale 寄存器布局、`sfa_offset`/`sfb_offset`。
+
+改动清单:
+1. **新 traits** `opus_uniform_scale_traits_gfx950`:fork `opus_uniform_traits_gfx950`,DTYPE 5-tuple
+   `<fp8, fp8, fp32(D_C ws), fp32(D_ACC), fp32(D_SF)>`,加 `GROUP<1,128,128>`,MFMA `W=16×16×128`
+   (fp8),B_K=128(=GROUP_K,每 K-tile 正好一个 K-scale-block,简化缩放)。
+2. **kargs**:uniform 用 `opus_gemm_flatmm_splitk_kargs`(有 splitk ws)。fp8 需再带
+   `ptr_sfa/sfb + stride_sfa/sfb + stride_sfa_batch/sfb_batch`。要么扩这个 kargs(加 scale 字段),
+   要么新建 `opus_gemm_uniform_scale_kargs`。
+3. **K-loop 改缩放累加**(核心):uniform 现在是 `v_c = mma(v_a, v_b, v_c)`(直接累加)。改成每 K-tile:
+   `v_mma = mma(v_a, v_b, 0, 0)`(新鲜)→ `scale_c_tile<E_M,E_N,...>(v_mma, v_sfa, v_sfb, v_c)`
+   (按 (m,n) 乘 sfa[m]·sfb[nb] 再加进 v_c)。B_K=128=GROUP_K 保证一个 K-tile 一个 scale-block。
+4. **scale 预取**:把 sfa/sfb 纳入 PGR1 ping-pong(和 A/B 一起预取 + 计数 waitcnt),砍 waitcnt。
+5. **layout**:加 `u_sfa`(sfa 寄存器布局,对齐 v_c 的 m 分区);sfb 类似。mmajor 版 sfa=[M,batch,K/128]。
+6. **codegen 接线**:新 tag `a16w16_uniform_scale`(5 张 map 各加行 + register_emit),launcher(batch-major
+   + mmajor 两版,mmajor 带 sfa/sfb stride,复用本文件前述 a8w8_scale mmajor 的 stride 逻辑),
+   kid 注册 + force-compile。
+7. **验证**:err vs bf16 einsum(~3.7% fp8 固有)+ ATT(目标 barrier 降到 ~10-15%、MFMA 升)+ 计时 vs
+   a8w8_scale 69us / bf16 85us。
+
+注意:uniform 注释指出 PGR2 在大 M 反而慢(占用率减半),PGR1 更好——fp8 版也从 PGR1 起步。
 
 ---
 
@@ -605,6 +1086,15 @@ export PYTHONPATH=/home/jun_chen2_qle/yzhou_aiter/aiter
 # 正确性 + 回归
 python op_tests/test_batch_gemm_bshd.py -k 0 8
 python op_tests/test_batch_gemm_bhsd.py  -k 0 8
+# T=8192 单 shape、强制指定 kid(2026-07 追加的 --kernelId 透传)
+python op_tests/test_batch_gemm_bshd.py -s 1,8192,64,512,8,1024 -l standard --kernelId 9     # split-barrier
+python op_tests/test_batch_gemm_bshd.py -s 1,8192,64,512,8,1024 -l standard --kernelId 1400  # mono 甜点 192x256
+python op_tests/test_batch_gemm_bshd.py -s 1,8192,64,512,8,1024 -l standard --kernelId 1405  # mono 256x256(2-槽B,慢,对照)
+# ATT(kid9 / hipBLASLt / mono / uniform),产物在 bshd_profile/att_*
+rocprofv3 -i att_kid9.yaml        -- python op_tests/_att_drv.py kid9    -s 1,8192,64,512,8,1024 --iters 5
+rocprofv3 -i bshd_att_einsum.yaml -- python op_tests/_att_drv.py hbl     -s 1,8192,64,512,8,1024 --iters 5
+rocprofv3 -i att_mono.yaml        -- python op_tests/_att_drv.py mono --kid 1400 -s 1,8192,64,512,8,1024 --iters 5
+rocprofv3 -i att_uni501.yaml      -- python op_tests/_att_drv.py uniform --kid 501 -s 1,8192,64,512,8,1024 --iters 5
 # 强制重编译 opus 模块(改了 csrc 后)
 rm -f  aiter/jit/module_deepgemm_opus.so
 rm -rf aiter/jit/build/module_deepgemm_opus

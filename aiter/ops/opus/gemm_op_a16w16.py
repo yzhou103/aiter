@@ -519,6 +519,7 @@ def gemm_a16w16_opus(
         outdtype=dtype,
         scaleAB=False,
         bpreshuffle=False,
+        batch=batch,
     )
     if cfg is not None:
         kid = cfg["solidx"]
@@ -586,6 +587,35 @@ def _gen_opus_gemm_a16w16_mmajor_fake_tensors(
     splitK: int = 0,
 ) -> torch.Tensor:
     return Y
+
+
+def _gen_opus_gemm_a8w8_scale_mmajor_fake_tensors(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    return Y
+
+
+# mmajor fp8 block-scale raw binding: O(A)/Y are [M, batch, *] (dim0=M,
+# dim1=batch), x_scale [M, batch, K/GROUP_K] (per-token M); wo_a + w_scale stay
+# batch-major. Zero-copy DSV4 wo_a fp8 (no caller-side transpose). Y is fp32.
+# See csrc/opus_gemm/opus_gemm.cu :: opus_gemm_a8w8_scale_mmajor.
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_scale_mmajor",
+    gen_fake=_gen_opus_gemm_a8w8_scale_mmajor_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_scale_mmajor_raw(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor: ...
 
 
 # mmajor raw binding: A(O)/Y are read with dim0=M, dim1=batch, so
@@ -845,28 +875,59 @@ def wo_a_gemm_opus(
     # (N=o_lora_rank, K=heads_per_group*head_dim, batch=n_local_groups). Stable
     # run_perftest numbers, see docs/dsv4_wo_a_opus_gemm_optimization.md.
     #
-    # Small T is MEMORY/occupancy bound: too few output tiles to fill the 256 CUs,
-    # so we split the long K across workgroups. The auto (splitK=0) heuristic
-    # under-splits badly here; an explicit split-K on the flatmm_splitk kernel
-    # (kid 200) is a big win and even beats hipBLASLt at T=64:
-    #   T=64  kid200/sk4=21.8us (hipB 21.8; was 29us at sk0)
-    #   T=128 kid200/sk4=33us   (hipB 27;   was 46us  -> 1.72x collapses to 1.2x)
-    #   T=192 kid200/sk4=43us   (hipB 41)
-    #   T=256 kid200/sk0=49us   (split-K no longer helps -> back to sk0)
-    # Medium T (300..1024): persistent 128x256 (kid 301) zero-copy mmajor wins
-    #   (T=384 70us vs kid9 84us). Large T (>=2048): kid 9 (big-tile reuse).
+    # Latest mmajor tuner sweep (batch=8, N=1024, K=4096):
+    #   T=16:    kid200/sk4
+    #   T=32:    kid206/sk2
+    #   T=64:    kid200/sk4
+    #   T=128:   kid1404
+    #   T=256:   kid1403
+    #   T=512..2048: kid1401
+    #   T>=4096: kid9
+    # mono_tile is no-OOB in N/K (requires R%tile_N==0 and K%64==0), but M-tail
+    # is handled by bounded buffer descriptors. DSV4 wo_a satisfies N=1024,
+    # K=4096, so mono_tile can be the default for T>=128. Fall back to the
+    # previous persistent/split-barrier choices if a caller supplies an
+    # incompatible N/K.
     auto_sk = 0
     if kernelId is not None:
         kid = kernelId
-    elif T < 300:
-        # small M: flatmm_splitk (kid 200) + fill-CU split-K (batch-aware,
-        # generalizes to any batch/N/K instead of a hardcoded per-shape value).
-        kid = 200
-        auto_sk = _wo_a_auto_splitk(T, R, K, G)
-    elif T <= 1024:
-        kid = 301
     else:
-        kid = 9
+        cfg = _opus_common.lookup_tuned(
+            T,
+            R,
+            K,
+            False,
+            o.dtype,
+            dtype,
+            False,
+            False,
+            batch=G,
+        )
+        if cfg is not None and _opus_common.mono_kid_shape_ok(cfg["solidx"], R, K):
+            kid = int(cfg["solidx"])
+            auto_sk = int(cfg["splitK"])
+        else:
+            kid = None
+
+    if kid is None and T < 24:
+        kid = 200
+        auto_sk = 4
+    elif kid is None and T < 48:
+        kid = 206
+        auto_sk = 2
+    elif kid is None and T < 128:
+        kid = 200
+        auto_sk = 4
+    elif kid is None and T < 192 and _opus_common.mono_kid_shape_ok(1404, R, K):
+        kid = 1404  # mono_tile 64x128x64, best at T=128
+    elif kid is None and T < 512 and _opus_common.mono_kid_shape_ok(1403, R, K):
+        kid = 1403  # mono_tile 128x128x64, best at T=256
+    elif kid is None and T < 4096 and _opus_common.mono_kid_shape_ok(1401, R, K):
+        kid = 1401  # mono_tile 128x256x64, best at T=512..2048
+    elif kid is None and T <= 1024:
+        kid = 301  # persistent fallback for non-mono-compatible N/K
+    elif kid is None:
+        kid = 9  # large-M split-barrier fallback for non-mono-compatible N/K
     sk = splitK if splitK is not None else auto_sk
 
     if out is not None:
