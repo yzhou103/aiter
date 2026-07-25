@@ -15,13 +15,14 @@ Usage:
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_flatmm_splitk_raw
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 

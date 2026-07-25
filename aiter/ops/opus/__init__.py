@@ -37,17 +37,17 @@ def _make_unsupported_arch_stub(name: str):
 
 
 if _arch_ok:
-    from .gemm_op_a16w16 import (  # noqa: E402
-        opus_gemm_a16w16_tune,
-        gemm_a16w16_opus,
-        opus_gemm_workspace_init,
-    )
-    from .bmm_op import (  # noqa: E402
+    from .bmm_op import (
         _opus_bmm_a8w8_mxscale_flatmm_splitk_raw,
         _opus_bmm_a8w8_mxscale_raw,
         _opus_bmm_a8w8_mxscale_splitk_raw,
         _opus_bmm_a8w8_scale_raw,
         bmm_a8w8_mxscale_opus,
+    )
+    from .gemm_op_a16w16 import (
+        gemm_a16w16_opus,
+        opus_gemm_a16w16_tune,
+        opus_gemm_workspace_init,
     )
 
     def opus_gemm_a8w8_blockscale_bpreshuffle_tune(*args, **kwargs):
@@ -80,13 +80,13 @@ else:
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
-    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
-    "bmm_a8w8_mxscale_opus",
     "_opus_bmm_a8w8_mxscale_flatmm_splitk_raw",
     "_opus_bmm_a8w8_mxscale_raw",
     "_opus_bmm_a8w8_mxscale_splitk_raw",
     "_opus_bmm_a8w8_scale_raw",
+    "bmm_a8w8_mxscale_opus",
     "gemm_a16w16_opus",
+    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
 ]

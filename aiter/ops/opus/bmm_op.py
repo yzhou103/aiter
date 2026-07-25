@@ -9,7 +9,6 @@ underlying kernels still live in the shared opus GEMM backend.
 
 import functools
 import logging
-from typing import Optional
 
 import torch
 
@@ -107,8 +106,12 @@ def _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
 #   2. otherwise look up the per-(gfx, g, m, n, k) tuned winner in the opus
 #      mxscale CSV (aiter/configs/opus_bmm_a8w8_mxscale_tuned.csv). On hit,
 #      launch that kid (+ its tuned splitK).
-#   3. CSV miss -> a coarse M/G heuristic that picks the strongest kid whose
-#      tile actually divides (m, n, k); anything unaligned falls back to
+#   3. CSV miss + large tile-unaligned M -> split M into an aligned bulk (run
+#      the strong large-M tile, kid 157/150) plus a <256-row remainder (an
+#      OOB-safe tile). Without this the bulk would drop to the slow k32 fused
+#      kernel (~0.35x bf16); the split recovers ~1.15x.
+#   4. CSV miss otherwise -> a coarse M/G heuristic that picks the strongest kid
+#      whose tile actually divides (m, n, k); anything unaligned falls back to
 #      kernelId=0 (the C++ k32 fused kernel, which runs arbitrary shapes).
 #
 # The CSV is intentionally a separate file per scale type (see the note in
@@ -180,9 +183,13 @@ def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
         return a % b == 0
 
     # 256x256 scale_pipe: dominates once M is large and the tile fits.
-    if div(m, 256) and div(n, 256) and div(k, 128):
-        if m >= 2048 or (m >= 1024 and g >= 8):
-            return 150
+    if (
+        div(m, 256)
+        and div(n, 256)
+        and div(k, 128)
+        and (m >= 2048 or (m >= 1024 and g >= 8))
+    ):
+        return 150
     # Sub-tile M (< 64): the main-launcher kids mask partial M via buffer OOB,
     # so a B_M=32/64 tile runs any M. Prefer the small m32n64k256 tile (640,
     # B_M=32, needs K % 256) to minimise wasted rows, else the m64n64k128
@@ -206,11 +213,11 @@ def bmm_a8w8_mxscale_opus(
     wo_a: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
     *,
     dtype: torch.dtype = torch.bfloat16,
-    kernelId: Optional[int] = None,
-    splitK: Optional[int] = None,
+    kernelId: int | None = None,
+    splitK: int | None = None,
 ) -> torch.Tensor:
     """Shape-driven opus fp8 e8m0 mxscale (block-scale) BMM.
 
@@ -227,7 +234,9 @@ def bmm_a8w8_mxscale_opus(
 
     * ``kernelId`` given  -> forwarded verbatim (bypasses lookup/heuristic).
     * ``kernelId`` None   -> per-(gfx, G, M, N, K) tuned CSV lookup; on miss a
-      coarse M/G heuristic picks a runnable kid.
+      coarse M/G heuristic picks a runnable kid. A large tile-unaligned M on a
+      CSV miss is split into an aligned bulk (strong large-M tile) + a <256-row
+      remainder so it does not drop to the slow k32-fused fallback.
     * ``splitK`` defaults to the tuned value on a CSV hit, else 1.
 
     Returns the [M, G, N] output tensor.
@@ -246,6 +255,32 @@ def bmm_a8w8_mxscale_opus(
             kernelId = int(cfg["kernelId"])
             if splitK is None:
                 splitK = int(cfg["splitK"])
+        elif (
+            splitK is None
+            and n % 256 == 0
+            and k % 128 == 0
+            and m >= 512
+            and m % 256 != 0
+        ):
+            # CSV miss on a large, tile-unaligned M. The coarse heuristic can
+            # only offer an OOB-safe small tile here (kid 0/138/653) because the
+            # high-throughput large-M tiles (kid 157/150) require M % 256 == 0 --
+            # so a shape like M=157404 drops to the k32-fused fallback at ~0.35x
+            # bf16. Instead split M into an aligned bulk (strong tile) plus a
+            # <256-row remainder (OOB-safe tile); the bulk dominates, recovering
+            # ~1.15x bf16 (M=157404: 543 -> 1766 TFLOPS, tail verified correct).
+            # Both slices are zero-copy dim0 views; each launch uses splitK=1
+            # (split-K accumulation is unreliable on these fallback kids).
+            m_bulk = (m // 256) * 256
+            bulk_kid = 157 if k >= 4096 else 150
+            tail_kid = _heuristic_mxscale_kid(g, m - m_bulk, n, k)
+            _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+                x[:m_bulk], wo_a, Y[:m_bulk], x_scale[:m_bulk], w_scale, 1, bulk_kid
+            )
+            _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+                x[m_bulk:], wo_a, Y[m_bulk:], x_scale[m_bulk:], w_scale, 1, tail_kid
+            )
+            return Y
         else:
             kernelId = _heuristic_mxscale_kid(g, m, n, k)
     if splitK is None:
