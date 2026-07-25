@@ -239,7 +239,7 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
 // Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
 
-template<typename Traits, bool K1024_ONLY>
+template<typename Traits, bool K1024_ONLY, bool PRELOAD_SFA_LDS = false>
 __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
@@ -254,9 +254,21 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
 
     const int grid_dim_x = opus::grid_size_x() / opus::block_size_x();
     int wgid = (opus::block_id_y() * grid_dim_x) + opus::block_id_x();
+    // L2-locality rasterization (Triton-style GROUP_M grouping): process a panel
+    // of GROUP_M m-tiles across all n-tiles before advancing, iterating m-tiles
+    // fastest within the panel. This keeps each B[n_tile] (~1 MiB weights) hot in
+    // L2 across the panel's GROUP_M reuses, recovering high-G / large-M throughput.
+    constexpr int GROUP_M = 16;
+    const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
-    int row = (wgid / num_tiles_n) * T::B_M;
-    int col = (wgid % num_tiles_n) * T::B_N;
+    const int tiles_per_group = GROUP_M * num_tiles_n;
+    const int group_id = wgid / tiles_per_group;
+    const int first_m = group_id * GROUP_M;
+    const int local = wgid - group_id * tiles_per_group;
+    const int m_remaining = num_tiles_m - first_m;
+    const int group_rows = m_remaining < GROUP_M ? m_remaining : GROUP_M;
+    int row = (first_m + (local % group_rows)) * T::B_M;
+    int col = (local / group_rows) * T::B_N;
 
     int batch_id = opus::block_id_z();
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
@@ -331,19 +343,69 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         return half_tile_n * (T::HALF_B_N / T::GROUP_N) * kargs.stride_sfb + tile_k * (T::B_K / T::GROUP_K);
     };
 
+    // kid157: preload the whole A-scale panel into LDS once, then read per-tile
+    // A-scale from LDS (ds_read/lgkmcnt) in the main loop instead of a per-tile
+    // global buffer_load_b8 (vmcnt) every K iteration. The panel is a compact
+    // [B_M/GROUP_M rows][K/B_K K-blocks] row-major byte tile (GROUP_M==1 and
+    // B_K==GROUP_K for this traits). The LDS buffer is sized for a compile-time
+    // K upper bound (SFA_K_MAX); the actual packed K-tile count is a runtime
+    // value so any K<=SFA_K_MAX (and K%B_K==0) works. SFA_K_MAX=8192 keeps the
+    // panel <=16 KiB, so total LDS stays 1 WG/CU.
+    constexpr int SFA_K_MAX     = 8192;
+    constexpr int SFA_K_TILES_MAX = PRELOAD_SFA_LDS ? (SFA_K_MAX / T::B_K) : 1;
+    constexpr int SFA_ROWS      = T::B_M / T::GROUP_M;
+    constexpr int SFA_LDS_BYTES =
+        PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_K_TILES_MAX * (int)sizeof(D_SF)) : 1;
+    __shared__ char smem_sfa[SFA_LDS_BYTES];
+    D_SF* s_sfa_ptr = reinterpret_cast<D_SF*>(smem_sfa);
+    // Runtime packed K-tile count (== loops); used as the compact LDS M-row
+    // stride so the read layout reuses make_layout_sfa with stride_sfa replaced.
+    const int sfa_k_tiles = PRELOAD_SFA_LDS ? (kargs.k / T::B_K) : 1;
+    auto u_sfa_lds = make_layout_sfa<T>(lane_id, wave_id_m, sfa_k_tiles);
+    auto sfa_lds_offset = [&](int half_tile_m, int tile_k) {
+        return half_tile_m * (T::HALF_B_M / T::GROUP_M) * sfa_k_tiles +
+               tile_k * (T::B_K / T::GROUP_K);
+    };
+    auto load_sfa = [&](int half_tile_m, int tile_k) {
+        if constexpr (PRELOAD_SFA_LDS) {
+            auto s = make_smem(s_sfa_ptr + sfa_lds_offset(half_tile_m, tile_k));
+            return load(s, u_sfa_lds);
+        } else {
+            return load(g_sfa, u_sfa, sfa_offset(half_tile_m, tile_k));
+        }
+    };
+
     if constexpr (K1024_ONLY) {
         static_assert(T::B_K == 128, "K1024_ONLY expects eight 128-wide K tiles");
         if (kargs.k != 1024) return;
     }
+    if constexpr (PRELOAD_SFA_LDS) {
+        if (kargs.k > SFA_K_MAX || (kargs.k % T::B_K) != 0) return;
+    }
     const int loops = K1024_ONLY ? 8 : ceil_div(kargs.k, T::B_K);
     int tic = 0, toc = 1;
 
+    // kid157: cooperative one-shot fill of the A-scale panel into LDS. Grid-stride
+    // over the SFA_ROWS*sfa_k_tiles scalar bytes; a barrier publishes the panel
+    // before the first per-tile read below.
+    if constexpr (PRELOAD_SFA_LDS) {
+        auto s_sfa = make_smem(s_sfa_ptr);
+        const int tid = opus::thread_id_x();
+        const int sfa_total = SFA_ROWS * sfa_k_tiles;
+        for (int idx = tid; idx < sfa_total; idx += T::BLOCK_SIZE) {
+            int m   = idx / sfa_k_tiles;
+            int kt  = idx % sfa_k_tiles;
+            s_sfa.template store<1>(load<1>(g_sfa, m * kargs.stride_sfa + kt), idx);
+        }
+        __builtin_amdgcn_s_barrier();
+    }
+
     // Prologue
-    v_sfa[tic][0] = load(g_sfa, u_sfa, sfa_offset(0, 0));
+    v_sfa[tic][0] = load_sfa(0, 0);
     v_sfb[tic][0] = load(g_sfb, sfb_offset(0, 0));
     async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0));
     async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0));
-    v_sfa[tic][1] = load(g_sfa, u_sfa, sfa_offset(1, 0));
+    v_sfa[tic][1] = load_sfa(1, 0);
     v_sfb[tic][1] = load(g_sfb, sfb_offset(1, 0));
     async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
     async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
@@ -353,7 +415,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
     __builtin_amdgcn_s_barrier();
 
-    v_sfa[toc][0] = load(g_sfa, u_sfa, sfa_offset(0, 1));
+    v_sfa[toc][0] = load_sfa(0, 1);
     v_sfb[toc][0] = load(g_sfb, sfb_offset(0, 1));
     async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1));
     async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1));
@@ -385,7 +447,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfa[toc][1] = load(g_sfa, u_sfa, sfa_offset(1, tile + 1));
+        v_sfa[toc][1] = load_sfa(1, tile + 1);
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
         async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2));
         __builtin_amdgcn_s_barrier();
@@ -417,10 +479,14 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfa[tic][0] = load(g_sfa, u_sfa, sfa_offset(0, tile + 2));
+        v_sfa[tic][0] = load_sfa(0, tile + 2);
         v_a[0] = load<T::VEC_A>(s_a[toc][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2));
-        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
+        s_waitcnt_vmcnt(number<
+            2 * T::a_buffer_load_insts +
+            T::b_buffer_load_insts +
+            2 * T::sfa_buffer_load_insts +
+            T::sfb_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
@@ -436,7 +502,9 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         // Second tile
         v_sfb[tic][1] = load(g_sfb, sfb_offset(1, tile + 2));
         v_b = load<T::VEC_B>(s_b[toc][0], u_rb);
-        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2));
+        async_load<T::VEC_B>(
+            g_b, s_b[tic][1].ptr, u_gb, u_sb,
+            b_offset(1, tile + 2));
         s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -451,7 +519,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfa[tic][1] = load(g_sfa, u_sfa, sfa_offset(1, tile + 2));
+        v_sfa[tic][1] = load_sfa(1, tile + 2);
         v_a[1] = load<T::VEC_A>(s_a[toc][1], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3));
         __builtin_amdgcn_s_barrier();
@@ -483,7 +551,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfa[toc][0] = load(g_sfa, u_sfa, sfa_offset(0, tile + 3));
+        v_sfa[toc][0] = load_sfa(0, tile + 3);
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 3));
         s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
@@ -516,7 +584,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_sfa[toc][1] = load(g_sfa, u_sfa, sfa_offset(1, tile + 1));
+        v_sfa[toc][1] = load_sfa(1, tile + 1);
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
         __builtin_amdgcn_s_barrier();
 
@@ -634,6 +702,20 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a8w8_scale_k1024_l
 #endif // __HIP_DEVICE_COMPILE__
 }
 
+// EXPERIMENTAL (kid157): kid150 with the entire A-scale panel preloaded into LDS
+// once, so the steady-state loop reads per-tile A-scale from LDS (ds_read) rather
+// than issuing a per-tile global buffer_load_b8 (vmcnt) every K iteration.
+// Supports any K<=8192 (K%B_K==0); LDS panel sized for the compile-time upper
+// bound, packed K-tile count resolved at runtime.
+template<typename Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
+void gemm_a8w8_scale_preload_sfa_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    gemm_a8w8_scale_kernel_impl<Traits, false, true>(kargs);
+#endif // __gfx950__
+#endif // __HIP_DEVICE_COMPILE__
+}
 
 // Split-K main kernel: computes one K partition into fp32 workspace.
 template<typename Traits>

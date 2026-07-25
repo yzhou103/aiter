@@ -171,8 +171,18 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(std::is_same_v<D_SF, unsigned char>, "mxscale flatmm splitK consumes e8m0 uint8 scales");
 
     // 4 waves per WG: 2 producer waves + 2 consumer waves.
-    static constexpr int T_M = 2;
-    static constexpr int T_N = 1;
+    //
+    // Two consumer-wave layouts, selected at compile time from B_M:
+    //   tileM (B_M >= 32): consumers split M (T_M=2, T_N=1). Default; used by
+    //     all pre-existing kids (64/128 rows). Bit-identical to the original.
+    //   tileN (B_M == 16): consumers split N (T_M=1, T_N=2). A 16-row A tile
+    //     maps to a single MFMA M-wave, so small-M / decode BMM shapes stop
+    //     over-computing a fat B_M tile (the ~10 us floor on kid320=64x32 for
+    //     M<=32 came from computing 64 rows for 8 valid ones). The two consumer
+    //     waves instead each own half of B_N.
+    static constexpr bool IS_TILE_N = (B_M == 16);
+    static constexpr int T_M = IS_TILE_N ? 1 : 2;
+    static constexpr int T_N = IS_TILE_N ? 2 : 1;
     static constexpr int T_K = 1;
     static_assert(T_K == 1);
     static_assert(BLOCK_SIZE == 256, "flatmm splitK requires 4 wave64 waves");
@@ -198,8 +208,12 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
 
     // async group load geometry; fp8-specific B_K=128 path uses one MFMA per
     // LOAD_GROUP_K, unlike a16w16 flatmm where LOAD_GROUP_K=W_K*2.
-    static constexpr int LOAD_GROUP_M = 32;
-    static constexpr int LOAD_GROUP_N = 32;
+    // tileN uses 16-wide A/B async-load groups so that (a) a B_M=16 A tile is a
+    // single load group and (b) LOAD_GROUP_M == LOAD_GROUP_N keeps a single
+    // `slots` value valid for both A and B (no A/B slot decoupling needed), and
+    // B_N=32 splits into two 16-col groups -- one per consumer N-wave.
+    static constexpr int LOAD_GROUP_M = IS_TILE_N ? 16 : 32;
+    static constexpr int LOAD_GROUP_N = IS_TILE_N ? 16 : 32;
     static constexpr int LOAD_GROUP_K = W_K;
     static constexpr int LOAD_GROUP_M_LANE = 1;
     static constexpr int LOAD_GROUP_N_LANE = 1;
@@ -214,7 +228,12 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int COM_REP_N = B_N / (W_N * T_N);
     static constexpr int COM_REP_K = B_K / (W_K * T_K);
     static_assert(COM_REP_M == 1 || COM_REP_M == 2 || COM_REP_M == 4,
-                  "mxscale flatmm splitK currently supports 32, 64, or 128 rows per tile");
+                  "mxscale flatmm splitK supports 16 (tileN) / 32 / 64 / 128 rows per tile");
+    static_assert(COM_REP_N >= 1, "B_N must be a multiple of W_N*T_N");
+    // tileN splits B_N across two consumer waves, so B_N must contain 2*W_N cols
+    // and every N scale group must be wave-splittable without straddling.
+    static_assert(!IS_TILE_N || (B_N % (W_N * T_N) == 0),
+                  "tileN requires B_N divisible by W_N*T_N (=32)");
     static_assert(COM_REP_K == NUM_LOAD_GROUPS_PER_BK);
     static_assert(B_N <= 2 * GROUP_N,
                   "mxscale flatmm splitK supports up to two 128-column B scale blocks");

@@ -84,10 +84,30 @@ class OpusGemmInstance:
     cluster_wg_m: int = 4
     cluster_wg_n: int = 4
 
+    # --- a8w8_mxscale BMM flatmm-splitK axes (kernel_tag ==
+    # "a8w8_mxscale_bmm_flatmm_splitk"). The BMM main kernel template is
+    #   gemm_a8w8_mxscale_flatmm_splitk_kernel<Traits, D_OUT, DIRECT_ONLY,
+    #                                          PREFETCH_SCALE>
+    # so unlike a16w16 each kid carries two compile-time booleans in addition to
+    # the tile. direct_only == consumer-self-load direct-store (splitK==1 only);
+    # prefetch_scale == scale-prefetch variant; fused_reduce == splitK==2 fused
+    # tail-reduce launch path. These drive both the launcher body and the set of
+    # device instantiations gen_instances emits for the kid.
+    direct_only: bool = False
+    prefetch_scale: bool = False
+    fused_reduce: bool = False
+    # a8w8_mxscale BMM flatmm-splitK only: preload this split's SFA (per-token) +
+    # SFB (block) scale panels into LDS once, then read scales from LDS in the
+    # consumer instead of a per-K-tile global buffer_load. Maps to the kernel's
+    # 5th template bool PRELOAD_SF_LDS.
+    preload_sf: bool = False
+    # Symbol root ("opus_gemm" for GEMM, "opus_bmm" for the batched frontends).
+    name_root: str = "opus_gemm"
+
     @property
     def name(self) -> str:
         parts = [
-            "opus_gemm",
+            self.name_root,
             "x".join(map(str, [self.BLOCK_SIZE, self.B_M, self.B_N, self.B_K])),
             "x".join(map(str, [self.T_M, self.T_N])),
             "x".join(map(str, [self.W_M, self.W_N, self.W_K])),
@@ -97,7 +117,17 @@ class OpusGemmInstance:
             parts.insert(1, self.arch_prefix)
         # tag inserts shift right by one slot when arch_prefix is set
         tag_at = 1 + (1 if self.arch_prefix else 0)
-        if self.kernel_tag == "a16w16_flatmm":
+        if self.kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk":
+            # opus_bmm_a8w8_mxscale_flatmm_splitk_<geom>_wgpcu{N}[_selfload][_scaleprefetch]
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_splitk")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.direct_only:
+                parts.append("selfload")
+            if self.prefetch_scale:
+                parts.append("scaleprefetch")
+            if self.preload_sf:
+                parts.append("sfpreload")
+        elif self.kernel_tag == "a16w16_flatmm":
             parts.insert(tag_at, "flatmm")
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a16w16_flatmm_splitk":
@@ -239,7 +269,7 @@ def _a16w16_flatmm(bm, bn, bk, wg_per_cu):
 a8w8_scale_kernels_list = {
     1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
     # 128x256 variant used by the fp8 block-scale BMM mmajor path
-    # (opus_bmm_a8w8_scale_mmajor). 128 B_M -> 2x the output tiles -> fills more
+    # (opus_bmm_a8w8_scale). 128 B_M -> 2x the output tiles -> fills more
     # CUs on the batched wo_a shape; B_N stays 256 (GROUP_N=128 requires
     # HALF_B_N>=128). bf16 + fp32 outputs (direct-store BMM writes bf16 Y).
     720: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["bf16_t", "fp32_t"]),
@@ -252,42 +282,140 @@ for _inst in a8w8_mxscale_kernels_list.values():
     _inst.name_tag = "a8w8_mxscale"
 
 
-def _a8w8_uniform_scale(bm, bn, bk, wg_per_cu=2, has_oob=True):
-    """fp8 block-scale uniform (Route B fp8): 4-wave full-tile, MFMA 16x16x128,
-    128x128 blockscale, PGR1 + sched_group_barrier, DIRECT store to Y."""
-    vec = 16  # VEC_A = VEC_B = 16 for fp8 (16 bytes / 1 byte)
+def _a8w8_mxscale_bmm_flatmm_splitk(
+    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False
+):
+    """fp8 e8m0 mxscale BATCHED matmul flatmm split-K tile.
+
+    Backs opus_bmm_a8w8_mxscale_flatmm_splitk(); the main kernel
+    (gemm_a8w8_mxscale_flatmm_splitk_kernel) writes an fp32 workspace and a
+    shared reduce kernel casts to the Y dtype (bf16/fp32), so output_dtypes is
+    fp32 workspace here. Locked geometry (matches the hand-written traits in
+    opus_bmm.cu): BLOCK_SIZE=256 (4 waves), T_M=2/T_N=1, MFMA 16x16x128 (fp8),
+    VEC=(16,16,4), GROUP=(1,128,128) (per-token M, 128x128 block scale).
+    direct_only / prefetch_scale are the two kernel compile-time booleans.
+    """
+    # tileN (bm==16): consumers split N (T_M=1, T_N=2). tileM (bm>=32): split M
+    # (T_M=2, T_N=1). The real T_M/T_N is derived in the C++ traits from B_M;
+    # these values only drive the generated symbol name, so keep them honest.
+    t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
-        256,
-        bm,
-        bn,
-        bk,
-        2,
-        2,  # T_M, T_N (4-wave)
-        16,
-        16,
-        128,  # MFMA 16x16x128 (fp8)
-        vec,
-        vec,
-        4,  # VEC
-        1,
-        128,
-        128,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
-        "a8w8_uniform_scale",
-        ["bf16_t", "fp32_t"],  # direct store: Y bf16 or fp32 (v_c fp32 -> D_C)
+        256,            # BLOCK_SIZE
+        bm, bn, bk,     # BLOCK tile
+        t_m, t_n,       # T_M, T_N (4-wave warp-spec; tileN=1,2 / tileM=2,1)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        # Single <fp32_t> host instantiation: the launcher is templated on D_C
+        # only to satisfy the codegen host-decl machinery; its body ignores D_C
+        # and branches on Y.dtype() at runtime (native __bf16/float), exactly
+        # like the hand-written _impl. The fp32 split-K workspace dtype is fixed
+        # inside the traits, and the reduce kernel casts to the runtime Y dtype.
+        ["fp32_t"],
         wg_per_cu,
-        has_oob=has_oob,
     )
-    inst.name_tag = "a8w8_uniform_scale"
+    inst.name_root = "opus_bmm"
+    inst.direct_only = direct_only
+    inst.prefetch_scale = prefetch_scale
+    inst.preload_sf = preload_sf
     return inst
 
 
-# fp8 block-scale uniform family. B_N must equal GROUP_N (=128) so one sfb value
-# covers the whole tile-N; B_K must equal GROUP_K (=128). Direct store to Y (no
-# split-K workspace/reduce). kid 700 = 128x128x128, kid 701 = 256x128x128.
-a8w8_uniform_scale_kernels_list = {
-    700: _a8w8_uniform_scale(128, 128, 128, 2),
-    701: _a8w8_uniform_scale(256, 128, 128, 1),
+# fp8 e8m0 mxscale BMM flatmm split-K tiles. kid numbers preserved from the
+# hand-written opus_bmm.cu switch so existing tuned CSVs / heuristics keep
+# working. Each kid = (B_M, B_N, B_K, WG_PER_CU, direct_only, prefetch_scale).
+# The specialized big-tile pipelines (mouter / minterleave / wave*n* / nphase /
+# pipeline, kids 129/131/132/133/134/140-163/149/150-152) stay monolithic in
+# opus_bmm.cu for now and are NOT migrated here.
+_BMM_MXSCALE_SPLITK_TILES = {
+    # tileN (B_M=16): consumers split N (T_M=1, T_N=2). A single 16-row MFMA
+    # M-wave, so small-M / decode BMM shapes (M<=32) stop over-computing a fat
+    # B_M tile. Targets the G=2, K=4096, M<=32 gap vs hipBLASLt bf16 (which uses
+    # 16x16 macro-tiles there). B_N=32 -> two 16-col consumer N-waves.
+    316: (16,  32,  256, 2, False, False),
+    317: (16,  32,  256, 2, False, True),    # scale prefetch
+    318: (16,  32,  128, 2, False, False),
+    # tileN prefetch-depth sweep: the tiny 16x32 tile has small LDS, so at
+    # WG_PER_CU=2 prefetch_k_iter balloons to ~12 (vs 3 for kid320), making the
+    # pipeline prologue dominate a 16-iter K loop. Higher WG_PER_CU shrinks the
+    # per-WG LDS budget -> shallower prefetch (WG=8 -> ~3, WG=4 -> ~6) and lifts
+    # occupancy, which the small-M/few-tile shapes want.
+    319: (16,  32,  256, 4, False, False),
+    314: (16,  32,  512, 2, False, False),   # fewer K-iters (8) per WG
+    # wider-N tileN: B_M=16 keeps M-compute minimal but larger B_N raises
+    # COM_REP_N (more MFMA/iter) to hide ds_read+scale latency in the K loop.
+    # WG_PER_CU chosen to keep prefetch_k_iter >= 3.
+    313: (16,  64,  256, 2, False, False),   # COM_REP_N=2
+    312: (16, 128,  256, 1, False, False),   # COM_REP_N=4
+    # M=16/32 refinement candidates (G=2 N=1024 K=4096 last-mile vs bf16):
+    #   311 = tileN wide-K (8 K-iters, half the producer/consumer barriers) +
+    #         scale prefetch.
+    #   321/323 = 32x32 tileM: exact fit for M=32 (no OOB waste) with COM_REP_N=2
+    #         (2 MFMA/iter) to hide K-loop latency better than the 16x32 tileN.
+    311: (16,  32,  512, 2, False, True),
+    321: (32,  32,  256, 2, False, True),
+    323: (32,  32,  128, 2, False, True),
+    # fine tiles (small / mid M)
+    320: (64,  32,  256, 2, False, False),
+    322: (64,  32,  256, 1, False, False),
+    # kid324 = kid320 tile (64x32x256, wg2) with SFA+SFB scale panels preloaded
+    # into LDS (PRELOAD_SF_LDS). Targets the mid-M valley (M~192-320) where ATT
+    # shows ~20% of consumer cycles stalled on the per-K-tile global scale load
+    # (s_waitcnt vmcnt gating do_scaled_mma). Preloading converts that vmcnt
+    # stall into a short LDS ds_read (lgkmcnt). Handled via the preload-tiles
+    # dict below (needs the preload_sf flag, not expressible in the 6-tuple).
+    # NOTE: the mid-M valley (M~192-320, G4 K4096: fp8 only 0.87-1.00x vs bf16) was
+    # attacked on this 64x32 tile with (a) scaleprefetch, (b) B_K=128/512, (c) wg4,
+    # and on the 64x64 tile with splitK=2/4. ALL measured at or below kid320
+    # (64x32x256, B_K=256): scaleprefetch = within noise; B_K=128 = worse (K-loop
+    # overhead, M256 0.90 vs 0.95); B_K=512 = LDS overflow (won't compile); splitK
+    # on 64x64 = reduce-pass overhead dominates (M256 kid653 sK2=434 < kid320=485).
+    # UPDATE: kid324 (== this tile + PRELOAD_SF_LDS, below) DID break the ceiling.
+    # ATT on kid320 showed ~20% of consumer cycles stalled on s_waitcnt vmcnt
+    # gating do_scaled_mma (the per-K-tile global SFA/SFB scale load). Staging both
+    # scale panels into LDS once (read via ds_read/lgkmcnt in the loop) lifts G4
+    # K4096: M256 0.934->1.000x, M512 0.939->1.011x, M192 0.911->0.980x vs bf16
+    # (+8-26% TFLOPS over kid320 across M=128..1024). The residual valley at
+    # M~320/384/768 is the odd/low tile-count (stream-K) gap, not scale loads.
+    640: (32,  64,  256, 2, False, False),
+    642: (32,  64,  256, 1, False, False),
+    646: (32,  64,  256, 2, True,  False),   # consumer self-load (splitK==1)
+    650: (64,  64,  128, 2, False, False),
+    653: (64,  64,  128, 2, False, True),    # scale prefetch
+    # NOTE: a 64x64x256 tile mirroring bf16 hipBLASLt's MT64x64x256 Tensile kernel
+    # was tried on the mid-M valley (G4 K4096). B_K=256 -> P=3 LDS ~198KB forces
+    # wg_per_cu=1, so at M=256 it runs only 256 WG @ 1/CU (half of kid320's 512 WG
+    # @ 2/CU) and lands at 0.77x vs bf16 (kid320 = 0.96x). It only wins at M=192
+    # (off the power-of-2 grid). bf16 gets away with this tile ONLY via stream-K
+    # (SK3) refilling the low tile count -- which the flatmm pipeline lacks. So the
+    # missing ingredient is stream-K, not the tile shape; no 64x64x256 kid kept.
+    128: (128, 128, 128, 1, False, False),
+    137: (128, 128, 128, 1, False, True),    # scale prefetch
+    138: (64,  128, 256, 1, False, False),
+    139: (128, 64,  256, 1, False, False),
+    # baseline tiles (guaranteed-runnable fallbacks; kid 0 is the heuristic default)
+    256: (32,  256, 128, 1, False, False),
+    64:  (64,  128, 128, 2, False, False),
+    0:   (32,  128, 128, 2, False, False),
+    32:  (32,  128, 128, 2, False, False),
 }
+a8w8_mxscale_bmm_flatmm_splitk_kernels_list = {
+    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, direct, prefetch)
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+}
+
+# SFA/SFB-into-LDS preload variants (PRELOAD_SF_LDS). Kept in a separate dict so
+# the base 6-tuple stays untouched; each entry is (B_M, B_N, B_K, WG_PER_CU) and
+# always sets preload_sf=True (non-direct, non-prefetch).
+_BMM_MXSCALE_SPLITK_PRELOAD_TILES = {
+    324: (64, 32, 256, 2),  # = kid320 + SFA/SFB scale panels preloaded to LDS
+}
+a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
+    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
+
 
 a8w8_kernels_list = {
     2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8", ["fp32_t"]),
@@ -1066,7 +1194,6 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 kernels_list = {
     **a8w8_scale_kernels_list,
     **a8w8_mxscale_kernels_list,
-    **a8w8_uniform_scale_kernels_list,
     **a8w8_kernels_list,
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,

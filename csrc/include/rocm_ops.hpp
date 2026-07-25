@@ -298,9 +298,9 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
-#define OPUS_BMM_A8W8_SCALE_MMAJOR_PYBIND               \
-    m.def("opus_bmm_a8w8_scale_mmajor",                 \
-          &opus_bmm_a8w8_scale_mmajor,                  \
+#define OPUS_BMM_A8W8_SCALE_PYBIND               \
+    m.def("opus_bmm_a8w8_scale",                 \
+          &opus_bmm_a8w8_scale,                  \
           "mmajor fp8 block-scale BMM: O/Y "             \
           "[M, batch, *], wo_a/w_scale batch-major, "    \
           "x_scale [M, batch, K/GROUP_K] (zero-copy "    \
@@ -310,9 +310,9 @@ namespace py = pybind11;
           py::arg("Y"),                                  \
           py::arg("x_scale"),                            \
           py::arg("w_scale"));
-#define OPUS_BMM_A8W8_MXSCALE_MMAJOR_PYBIND             \
-    m.def("opus_bmm_a8w8_mxscale_mmajor",               \
-          &opus_bmm_a8w8_mxscale_mmajor,                \
+#define OPUS_BMM_A8W8_MXSCALE_PYBIND             \
+    m.def("opus_bmm_a8w8_mxscale",               \
+          &opus_bmm_a8w8_mxscale,                \
           "mmajor fp8 block-scale BMM with native e8m0 " \
           "scaled MFMA: O/Y [M, batch, *], wo_a/w_scale " \
           "batch-major, x_scale [M, batch, K/GROUP_K]", \
@@ -322,9 +322,9 @@ namespace py = pybind11;
           py::arg("x_scale"),                            \
           py::arg("w_scale"),                            \
           py::arg("kernelId") = 710);
-#define OPUS_BMM_A8W8_MXSCALE_SPLITK_MMAJOR_PYBIND      \
-    m.def("opus_bmm_a8w8_mxscale_splitk_mmajor",        \
-          &opus_bmm_a8w8_mxscale_splitk_mmajor,         \
+#define OPUS_BMM_A8W8_MXSCALE_SPLITK_PYBIND      \
+    m.def("opus_bmm_a8w8_mxscale_splitk",        \
+          &opus_bmm_a8w8_mxscale_splitk,         \
           "mmajor fp8 block-scale BMM with native e8m0 " \
           "scaled MFMA and split-K workspace/reduce",   \
           py::arg("O"),                                  \
@@ -333,9 +333,9 @@ namespace py = pybind11;
           py::arg("x_scale"),                            \
           py::arg("w_scale"),                            \
           py::arg("splitK") = 8);
-#define OPUS_BMM_A8W8_MXSCALE_FLATMM_SPLITK_MMAJOR_PYBIND \
-    m.def("opus_bmm_a8w8_mxscale_flatmm_splitk_mmajor",   \
-          &opus_bmm_a8w8_mxscale_flatmm_splitk_mmajor,    \
+#define OPUS_BMM_A8W8_MXSCALE_FLATMM_SPLITK_PYBIND \
+    m.def("opus_bmm_a8w8_mxscale_flatmm_splitk",   \
+          &opus_bmm_a8w8_mxscale_flatmm_splitk,    \
           "mmajor fp8 block-scale BMM with native e8m0 "  \
           "scaled MFMA, 4-wave flatmm split-K workspace/reduce", \
           py::arg("O"),                                  \
@@ -345,35 +345,6 @@ namespace py = pybind11;
           py::arg("w_scale"),                            \
           py::arg("splitK") = 2,                         \
           py::arg("kernelId") = 0);
-#define OPUS_BMM_A8W8_UNIFORM_SCALE_PYBIND                   \
-    m.def("opus_bmm_a8w8_uniform_scale",                     \
-          &opus_bmm_a8w8_uniform_scale,                      \
-          "batch-major fp8 block-scale UNIFORM BMM "     \
-          "(Route B fp8, 4-wave full-tile, direct "      \
-          "store): O/wo_a/Y = [batch,M,K]/[batch,N,K]/" \
-          "[batch,M,N]; Y fp32 or bf16; kernelId "      \
-          "700=128x128, 701=256x128",                   \
-          py::arg("O"),                                  \
-          py::arg("wo_a"),                               \
-          py::arg("Y"),                                  \
-          py::arg("x_scale"),                            \
-          py::arg("w_scale"),                            \
-          py::arg("kernelId") = 700);
-#define OPUS_BMM_A8W8_UNIFORM_SCALE_MMAJOR_PYBIND            \
-    m.def("opus_bmm_a8w8_uniform_scale_mmajor",              \
-          &opus_bmm_a8w8_uniform_scale_mmajor,               \
-          "mmajor fp8 block-scale UNIFORM BMM "          \
-          "(Route B fp8, 4-wave full-tile, direct "     \
-          "store): O/Y [M, batch, *], wo_a/w_scale "    \
-          "batch-major, x_scale [M, batch, K/GROUP_K]; " \
-          "Y fp32 or bf16; kernelId 700=128x128, "      \
-          "701=256x128",                                \
-          py::arg("O"),                                  \
-          py::arg("wo_a"),                               \
-          py::arg("Y"),                                  \
-          py::arg("x_scale"),                            \
-          py::arg("w_scale"),                            \
-          py::arg("kernelId") = 700);
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
           &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \

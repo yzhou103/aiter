@@ -21,7 +21,7 @@ import torch
 from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_flatmm_splitk_mmajor_raw
+from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_flatmm_splitk_raw
 
 torch.set_default_device("cuda")
 
@@ -34,6 +34,9 @@ _DT = {"fp32": dtypes.fp32, "bf16": dtypes.bf16}
 FLATMM_KIDS = {
     "m64n64k128": (650, 64, 64),
     "m64n64k128_scale_prefetch": (653, 64, 64),
+    # M-tile interleaved 128x128 (MI=2 tiles/WG share B). Needs M % 256 == 0;
+    # wins on large-M shapes where the 64x64 tiles are memory/pipeline bound.
+    "m128n128k128_minterleave": (163, 256, 128),
 }
 
 
@@ -97,9 +100,7 @@ def test_mxscale_bmm(g, m, n, k, dtype):
 
     def _call(kid):
         Y = torch.empty(y_shape, dtype=ydt)
-        _opus_bmm_a8w8_mxscale_flatmm_splitk_mmajor_raw(
-            O_in, W_mx, Y, xs_in, ws_mx, 1, kid
-        )
+        _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
         return Y
 
     candidates = {}
@@ -107,6 +108,16 @@ def test_mxscale_bmm(g, m, n, k, dtype):
         # Skip a tile whose block shape does not divide this (m, n).
         if m % bm == 0 and n % bn == 0 and k % GROUP == 0:
             candidates[name] = (lambda kid=kid: _call(kid), ref)
+
+    # Public backend-neutral entry: no kernelId -> per-(g,m,n,k) tuned-CSV
+    # lookup + heuristic fallback + libtype backend routing. Exercises the
+    # whole aiter.batched_gemm_a8w8_mxscale -> bmm_a8w8_mxscale_opus path end
+    # to end (not the raw binding). Always runnable: on a CSV/heuristic miss it
+    # falls back to kid 0 (k32 fused), which has no tile-alignment requirement.
+    candidates["auto (batched_gemm_a8w8_mxscale)"] = (
+        lambda: aiter.batched_gemm_a8w8_mxscale(O_in, W_mx, xs_in, ws_mx, dtype=ydt),
+        ref,
+    )
 
     flops = 2.0 * g * m * n * k
     # fp8 A + fp8 W + e8m0 scales (uint8) + output.
@@ -131,6 +142,71 @@ def test_mxscale_bmm(g, m, n, k, dtype):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
+    """Batch-leading (batch-major) round trip.
+
+    The caller's natural DSV4 buffers are batch-major: batch is the *first*
+    (outermost-in-memory) dimension -- activation/output are [G, M, *], weight
+    is [G, N, K]. They are handed to the kernel as zero-copy [M, G, *]
+    transposed views (dim0=M, dim1=batch), and the result is written straight
+    back into a batch-major [G, M, N] buffer through its [M, G, N] view.
+
+    This is the stride path the dropped ``_mmajor`` suffix used to over-claim:
+    the batch axis sits at an arbitrary (here outermost) memory position while
+    only K (inputs) and N (output) stay contiguous. Same tuned CSV / heuristic
+    entries must serve it. Correctness is checked in the caller's native
+    [G, M, N] order.
+    """
+    ydt = _DT[dtype]
+    O_bf16 = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
+    W_bf16 = (torch.rand((g, n, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
+
+    O_in = O_mx.transpose(0, 1)  # [m, g, k] view (K contiguous)
+    xs_in = xs_mx.transpose(0, 1)  # [m, g, k/128] view
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32)  # [g, m, n] batch-major
+
+    def _call_raw(kid):
+        # Batch-major output buffer; hand the kernel its [m, g, n] view so the
+        # store lands at Y.stride(1) (batch) = m*n (outermost), N contiguous.
+        Yb = torch.empty((g, m, n), dtype=ydt)
+        _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+            O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, 1, kid
+        )
+        return Yb  # [g, m, n]
+
+    def _call_auto():
+        Yb = torch.empty((g, m, n), dtype=ydt)
+        aiter.batched_gemm_a8w8_mxscale(
+            O_in, W_mx, xs_in, ws_mx, out=Yb.transpose(0, 1), dtype=ydt
+        )
+        return Yb
+
+    # kid 0 (k32 fused) has no tile-alignment requirement -> always runnable.
+    candidates = {"kid0_k32_fused": (lambda: _call_raw(0), ref)}
+    for name, (kid, bm, bn) in FLATMM_KIDS.items():
+        if m % bm == 0 and n % bn == 0 and k % GROUP == 0:
+            candidates[name] = (lambda kid=kid: _call_raw(kid), ref)
+    # Public dispatch path, writing into the batch-major buffer via out=.
+    candidates["auto (batched_gemm_a8w8_mxscale)"] = (_call_auto, ref)
+
+    ret = {"gfx": get_gfx()}
+    for name, (fn, fn_ref) in candidates.items():
+        out, us = run_perftest(fn)
+        err = checkAllclose(
+            fn_ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=0.1,
+            atol=0.5,
+            msg=f"mxscale_bmm_batch_first {name} g={g} m={m} n={n} k={k}",
+        )
+        ret[f"{name} us"] = us
         ret[f"{name} err"] = err
     return ret
 
@@ -168,20 +244,35 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[(512, 1024, 4096), (256, 1024, 4096), (128, 1024, 4096)],
+        default=[
+            (1, 1024, 4096),
+            (16, 1024, 4096),
+            (128, 1024, 4096),
+            (256, 1024, 4096),
+            (512, 1024, 4096),
+            (8192, 1024, 4096),
+            (16384, 1024, 4096),
+        ],
         help="(m,n,k) shapes to sweep",
     )
     args = parser.parse_args()
 
     for dtype in args.dtype:
         df = []
+        df_bf = []
         for g, (m, n, k) in itertools.product(args.groups, args.mnk):
             df.append(test_mxscale_bmm(g, m, n, k, dtype))
-        df = pd.DataFrame(df)
+            df_bf.append(test_mxscale_bmm_batch_first(g, m, n, k, dtype))
         aiter.logger.info(
             "opus mxscale flatmm BMM summary (dtype=%s):\n%s",
             dtype,
-            df.to_markdown(index=False),
+            pd.DataFrame(df).to_markdown(index=False),
+        )
+        aiter.logger.info(
+            "opus mxscale flatmm BMM batch-first (batch-major) summary "
+            "(dtype=%s):\n%s",
+            dtype,
+            pd.DataFrame(df_bf).to_markdown(index=False),
         )
 
 

@@ -22,13 +22,13 @@ from codegen.common import (
 PIPELINE_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
-    "a8w8_uniform_scale": "gfx950/opus_gemm_pipeline_a8w8_uniform_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
+    "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
 }
 
 # 4g_safe sibling pipelines: only defined for the a16w16-family tags that have
@@ -43,25 +43,25 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 TRAITS_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
-    "a8w8_uniform_scale": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
 }
 
 KERNEL_FUNC_MAP = {
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale": "gemm_a8w8_scale_kernel",
-    "a8w8_uniform_scale": "gemm_a8w8_uniform_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
     "a16w16": "gemm_a16w16_kernel",
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
+    "a8w8_mxscale_bmm_flatmm_splitk": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
 }
 
 KERNEL_FUNC_MAP_4G_SAFE = {
@@ -73,25 +73,25 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 TRAITS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8_mxscale": "opus_gemm_a8w8_scale_traits_gfx950",
-    "a8w8_uniform_scale": "opus_a8w8_uniform_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
     "a16w16": "opus_gemm_a16w16_traits_gfx950",
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
     "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
+    "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
 }
 
 KARGS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
-    "a8w8_uniform_scale": "opus_gemm_a8w8_uniform_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
     "a16w16": "opus_gemm_noscale_kargs_gfx950",
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
     "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
+    "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_scale_splitk_kargs_gfx950",
 }
 
 register_arch_map("gfx950", "pipeline_header", PIPELINE_HEADER_MAP)
@@ -874,187 +874,6 @@ void
         )
 
 
-def gen_uniform_scale_instance(
-    cg,
-    k,
-    pipeline_header,
-    traits_header,
-    kernel_func,
-    da,
-    db,
-    traits_name,
-    kargs_name,
-    kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
-    record_one_instantiation,
-    A8W8_SCALE_HOST_EXTRA,
-    **_unused,
-):
-    """gfx950 fp8 block-scale uniform launcher emit (4-wave full-tile, direct
-    store, no split-K). Same 5-arg (x_scale/w_scale) surface as a8w8_scale;
-    only the traits alias differs (9-param uniform_scale traits)."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
-        kargs_template_vars(k.kernel_tag, kargs_name)
-    )
-    has_oob_str = "true" if k.has_oob else "false"
-    traits_aliases = f"""
-template <typename D_C>
-using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t, fp32_t>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-    opus::seq<{k.T_M}, {k.T_N}, 1>,
-    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
-    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
-    {k.WG_PER_CU},
-    {has_oob_str}>;
-"""
-
-    preamble = instance_impl_preamble()
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
-    INSTANCE_IMPL = f"""{preamble}
-{host_tu_split}
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
-{{{{
-    int batch = XQ.size(0);
-    int M = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-
-    using Traits = {k.name}_Traits<D_C>;
-
-    int GROUP_M = {k.GROUP_M};
-    int GROUP_N = {k.GROUP_N};
-    int GROUP_K = {k.GROUP_K};
-    int num_groups_m = M / GROUP_M;
-    int num_groups_n = N / GROUP_N;
-    int num_groups_k = K / GROUP_K;
-
-    {kargs_name} kargs{{}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
-    kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
-    kargs.stride_c_batch = M * N;
-
-    kargs.ptr_sfa = x_scale.value().data_ptr();
-    kargs.ptr_sfb = w_scale.value().data_ptr();
-    kargs.stride_sfa = num_groups_k;
-    kargs.stride_sfb = num_groups_k;
-    kargs.stride_sfa_batch = num_groups_m * num_groups_k;
-    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({k.BLOCK_SIZE});
-
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
-
-}}}}
-#endif // launcher only on regular host pass
-"""
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_SCALE_HOST_EXTRA)
-
-    # "_mmajor" sibling: A(XQ)/Y are [M, batch, *] and x_scale is
-    # [M, batch, K/GROUP_K] (per-token M); weight WQ + w_scale stay batch-major.
-    # DSV4 wo_a o=[num_tokens, n_groups, K] feeds with NO caller-side transpose.
-    INSTANCE_IMPL_MMAJOR = f"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}_mmajor(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
-{{{{
-    int M = XQ.size(0);
-    int batch = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-
-    int GROUP_N = {k.GROUP_N};
-    int GROUP_K = {k.GROUP_K};
-    int num_groups_n = N / GROUP_N;
-    int num_groups_k = K / GROUP_K;
-
-    {kargs_name} kargs{{}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = (int)XQ.stride(0);
-    kargs.stride_b = (int)WQ.stride(1);
-    kargs.stride_c = (int)Y.stride(0);
-    kargs.stride_a_batch = (int)XQ.stride(1);
-    kargs.stride_b_batch = (int)WQ.stride(0);
-    kargs.stride_c_batch = (int)Y.stride(1);
-
-    kargs.ptr_sfa = x_scale.value().data_ptr();
-    kargs.ptr_sfb = w_scale.value().data_ptr();
-    kargs.stride_sfa = (int)x_scale.value().stride(0);
-    kargs.stride_sfa_batch = (int)x_scale.value().stride(1);
-    kargs.stride_sfb = num_groups_k;
-    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({k.BLOCK_SIZE});
-
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
-
-}}}}
-#endif // launcher only on regular host pass
-"""
-    with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
-        _f.write(INSTANCE_IMPL_MMAJOR)
-
-    for CDtype in k.output_dtypes:
-        host_decl_mmajor = (
-            f"template void\n"
-            f"{k.name}_mmajor<{CDtype}>(\n"
-            f"    aiter_tensor_t &XQ,\n"
-            f"    aiter_tensor_t &WQ,\n"
-            f"    aiter_tensor_t &Y{A8W8_SCALE_HOST_EXTRA});\n"
-        )
-        cg._host_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
-        )
-
-
 def gen_noscale_instance_gfx950(
     cg,
     k,
@@ -1695,13 +1514,312 @@ void
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
 
 
+# Body of the a8w8_mxscale BMM flatmm split-K launcher (mmajor layout), a
+# faithful port of opus_bmm_a8w8_mxscale_flatmm_splitk_impl() in
+# opus_bmm.cu. Written with @@TOKEN@@ placeholders + .replace() (NOT an
+# f-string) so the C++ body keeps plain single braces and stays trivially
+# reviewable against the hand-written original.
+#
+# Templated on D_C only to satisfy the codegen host-decl machinery
+# (one <fp32_t> instantiation); the body ignores D_C and branches on Y.dtype()
+# at runtime with native __bf16/float, exactly like the original. The fused
+# reduce path (splitK==2 counter variant) is intentionally NOT ported -- the
+# fused-reduce kid stays monolithic in opus_bmm.cu.
+_BMM_MXSCALE_SPLITK_LAUNCHER_BODY = r"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+// mmajor: O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major
+// [batch, N, K]. Caller (opus_bmm.cu switch) does dtype/arch/common checks.
+template <typename D_C>
+void
+@@NAME@@(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    int splitK)
+{
+  using Traits = @@NAME@@_Traits;
+  constexpr bool DIRECT_ONLY = @@DIRECT@@;
+  constexpr bool PREFETCH_SCALE = @@PREFETCH@@;
+  constexpr bool PRELOAD_SF_LDS = @@PRELOAD@@;
+
+  AITER_CHECK(splitK >= 1, "splitK must be >= 1");
+  if constexpr (DIRECT_ONLY) {
+    AITER_CHECK(splitK == 1, "@@NAME@@ consumer-self-load kernel requires splitK == 1");
+  }
+
+  const int M = O.size(0);
+  const int batch = O.size(1);
+  const int N = wo_a.size(1);
+  const int K = O.size(2);
+  // Partial M tiles handled in-kernel via buffer OOB masking, so B_M<128 tiles
+  // need not have M % B_M == 0. Keep the divisibility requirement for big
+  // (B_M>=128) tiles (never the right pick for tiny M anyway).
+  if constexpr (Traits::B_M >= 128) {
+    AITER_CHECK(M % Traits::B_M == 0,
+                "@@NAME@@ (B_M>=128 tile) requires M % ", Traits::B_M,
+                " == 0, got ", M, " (use a B_M<=64 tile for small M)");
+  }
+  AITER_CHECK(N % Traits::B_N == 0,
+              "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
+  AITER_CHECK(K % Traits::B_K == 0,
+              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
+
+  const int split_k = splitK;
+  const bool no_split_k = (split_k == 1);
+  const int total_iters = K / Traits::B_K;
+  const int iters_full = (total_iters + split_k - 1) / split_k;
+  const int last_loops = total_iters - (split_k - 1) * iters_full;
+  AITER_CHECK(last_loops >= Traits::prefetch_k_iter,
+              "@@NAME@@ requires every split to have at least ",
+              Traits::prefetch_k_iter, " K-tiles; K=", K,
+              " gives total_iters=", total_iters, ", splitK=", split_k,
+              ", last split loops=", last_loops);
+
+  const int num_tiles_m = (M + Traits::B_M - 1) / Traits::B_M;
+  const int num_tiles_n = (N + Traits::B_N - 1) / Traits::B_N;
+  const int padded_M = num_tiles_m * Traits::B_M;
+  const int padded_N = num_tiles_n * Traits::B_N;
+  const size_t partial_bytes = (size_t)split_k * (size_t)batch
+                             * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+
+  auto stream = aiter::getCurrentHIPStream();
+
+  opus_gemm_scale_splitk_kargs_gfx950 kargs{};
+  kargs.ptr_a = O.data_ptr();
+  kargs.ptr_b = wo_a.data_ptr();
+  kargs.ws_handle = nullptr;
+  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+  kargs.split_k = split_k;
+  kargs.stride_a = (int)O.stride(0);
+  kargs.stride_b = (int)wo_a.stride(1);
+  kargs.stride_ws = padded_N;
+  kargs.stride_a_batch = (int)O.stride(1);
+  kargs.stride_b_batch = (int)wo_a.stride(0);
+  kargs.stride_ws_batch = padded_M * padded_N;
+  kargs.ptr_sfa = x_scale.data_ptr();
+  kargs.ptr_sfb = w_scale.data_ptr();
+  kargs.stride_sfa = (int)x_scale.stride(0);
+  kargs.stride_sfa_batch = (int)x_scale.stride(1);
+  kargs.stride_sfb = (int)w_scale.stride(1);
+  kargs.stride_sfb_batch = (int)w_scale.stride(0);
+
+  dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
+  dim3 block_main(Traits::BLOCK_SIZE);
+  if (no_split_k) {
+    kargs.ptr_c = Y.data_ptr();
+    kargs.stride_c = (int)Y.stride(0);
+    kargs.stride_c_batch = (int)Y.stride(1);
+    if (Y.dtype() == AITER_DTYPE_bf16) {
+      @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+          <<<grid_main, block_main, 0, stream>>>(kargs);
+    } else {
+      @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+          <<<grid_main, block_main, 0, stream>>>(kargs);
+    }
+    return;
+  }
+
+  if constexpr (!DIRECT_ONLY) {
+    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
+    auto* ws_handle = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
+
+    const size_t ws_bytes = partial_bytes;
+    if (ws_handle->ptr == nullptr || ws_bytes > ws_handle->bytes) {
+      AITER_CHECK(!capturing,
+                  "splitk workspace grow inside HIP graph capture is not supported");
+      void* new_ptr = nullptr;
+      const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
+      size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+      HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
+      if (ws_handle->ptr != nullptr) {
+        HIP_CALL(hipDeviceSynchronize());
+        HIP_CALL(hipFree(ws_handle->ptr));
+      }
+      ws_handle->ptr = new_ptr;
+      ws_handle->bytes = grow_bytes;
+    }
+    kargs.ws_handle = ws_handle;
+
+    // Pass all 4 template args explicitly (D_OUT=void: the split-K main kernel
+    // writes an fp32 workspace, so its output dtype is irrelevant; the reduce
+    // kernel casts to the runtime Y dtype). The fused host TU only sees a
+    // no-default forward decl of @@KERNEL@@, so relying on the template's
+    // default args here would fail overload resolution ("no matching function").
+    @@KERNEL@@<Traits, void, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+        <<<grid_main, block_main, 0, stream>>>(kargs);
+
+    constexpr int REDUCE_VEC = 8;
+    constexpr int REDUCE_BS = 128;
+    dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),
+                     batch * M, 1);
+    dim3 block_reduce(REDUCE_BS);
+    const int y_stride_c = (int)Y.stride(0);
+    const int y_stride_c_batch = (int)Y.stride(1);
+    if (Y.dtype() == AITER_DTYPE_bf16) {
+      opus_bmm_splitk_reduce_kernel<__bf16, REDUCE_VEC, REDUCE_BS>
+          <<<grid_reduce, block_reduce, 0, stream>>>(
+              ws_handle, reinterpret_cast<__bf16*>(Y.data_ptr()),
+              split_k, M, N, batch, padded_M, padded_N,
+              y_stride_c, y_stride_c_batch);
+    } else {
+      opus_bmm_splitk_reduce_kernel<float, REDUCE_VEC, REDUCE_BS>
+          <<<grid_reduce, block_reduce, 0, stream>>>(
+              ws_handle, reinterpret_cast<float*>(Y.data_ptr()),
+              split_k, M, N, batch, padded_M, padded_N,
+              y_stride_c, y_stride_c_batch);
+    }
+  }
+}
+#endif // launcher only on regular host pass
+"""
+
+
+def gen_bmm_mxscale_flatmm_splitk_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    record_one_instantiation,
+    **_unused,
+):
+    """gfx950 a8w8_mxscale BMM flatmm split-K launcher emit.
+
+    Differs from the GEMM emitters:
+      * traits alias is NOT templated on D_C (fp32 workspace is fixed); the
+        launcher is templated on D_C only for the host-decl machinery.
+      * launcher signature is (O, wo_a, Y, x_scale, w_scale, int splitK) with
+        the mmajor layout, matching opus_bmm.cu's _impl.
+      * custom device-instantiation matrix over the kernel's (D_OUT, DIRECT_ONLY,
+        PREFETCH_SCALE) template params (the standard record_one_instantiation
+        assumes a single-template-arg <Traits<dtype>> kernel).
+      * the split-K reduce kernel (opus_bmm_splitk_reduce_kernel) is declared in
+        the a8w8_scale traits header and instantiated once in opus_bmm.cu, so it
+        is NOT re-instantiated here.
+    """
+    _, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = kargs_template_vars(
+        k.kernel_tag, kargs_name
+    )
+
+    # Non-templated traits alias: fp32 split-K workspace is fixed; the workspace
+    # tuple slot 4 (scale) is `unsigned char` for the e8m0 mxscale path.
+    traits_aliases = f"""
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
+    {k.WG_PER_CU}>;
+"""
+
+    preamble = instance_impl_preamble()
+    host_tu_split = instance_impl_host_tu_split(
+        traits_header,
+        pipeline_header,
+        fwd_decl_kargs_tpl,
+        kernel_func,
+        fwd_decl_kargs_fnarg,
+    )
+
+    # Forward-declare the split-K reduce kernel. On the fused host TU pass
+    # host_tu_split only pulls in the (light) traits header -- not the pipeline
+    # header that defines this kernel -- so the launcher body's <<<...>>> call
+    # needs a visible declaration. On the non-fused device pass the pipeline
+    # header (via splitk_reduce_gfx950.cuh) provides a compatible definition, so
+    # this is just a harmless redeclaration there. opus_splitk_ws_handle is a
+    # complete type in both passes via the included traits/pipeline header.
+    reduce_fwd_decl = """
+template <typename D_OUT, int VEC, int BLOCK>
+__global__ void opus_bmm_splitk_reduce_kernel(
+    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    D_OUT* __restrict__ out,
+    int split_k, int M, int N, int batch,
+    int padded_M, int padded_N,
+    int stride_c, int stride_c_batch);
+"""
+
+    launcher = (
+        _BMM_MXSCALE_SPLITK_LAUNCHER_BODY.replace("@@NAME@@", k.name)
+        .replace("@@KERNEL@@", kernel_func)
+        .replace("@@DIRECT@@", "true" if k.direct_only else "false")
+        .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
+        .replace("@@PRELOAD@@", "true" if k.preload_sf else "false")
+    )
+
+    INSTANCE_IMPL = (
+        f"{preamble}\n{host_tu_split}\n{reduce_fwd_decl}\n{traits_aliases}\n{launcher}"
+    )
+    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+    # Host instantiation(s): launcher templated on D_C; a single <fp32_t> stub.
+    # (XQ/WQ/Y positional names in _make_host_decl map to O/wo_a/Y by type.)
+    host_extra = (
+        ",\n    aiter_tensor_t &x_scale,"
+        "\n    aiter_tensor_t &w_scale,"
+        "\n    int splitK"
+    )
+    for dtype in k.output_dtypes:
+        host_decl = (
+            f"template void\n"
+            f"{k.name}<{dtype}>(\n"
+            f"    aiter_tensor_t &O,\n"
+            f"    aiter_tensor_t &wo_a,\n"
+            f"    aiter_tensor_t &Y{host_extra});\n"
+        )
+        cg._host_instantiations.append(
+            {"kid_name": k.name, "dtype": dtype, "host_decl": host_decl}
+        )
+
+    # Device instantiation matrix: split-1 direct-store variants for both Y
+    # dtypes, plus (non-direct kids only) the fp32-workspace variant used by the
+    # split-K > 1 path (kernel default D_OUT=void).
+    direct = "true" if k.direct_only else "false"
+    prefetch = "true" if k.prefetch_scale else "false"
+    preload = "true" if k.preload_sf else "false"
+
+    def _dev(dtype_tag, d_out, dir_flag, pfk_flag):
+        decl = (
+            f"template __global__ void {kernel_func}<\n"
+            f"    {k.name}_Traits, {d_out}, {dir_flag}, {pfk_flag}, {preload}>({kargs_name});\n"
+        )
+        cg._device_instantiations.append(
+            {"kid_name": k.name, "dtype": dtype_tag, "device_decl": decl}
+        )
+
+    _dev("bf16", "__bf16", direct, prefetch)
+    _dev("fp32", "float", direct, prefetch)
+    if not k.direct_only:
+        # Split-K > 1 workspace path: host launches <Traits, void, DIRECT_ONLY,
+        # PREFETCH_SCALE, PRELOAD_SF_LDS>. DIRECT_ONLY is false here (direct kids
+        # never take the workspace path), but PREFETCH_SCALE / PRELOAD_SF_LDS must
+        # match the kid, else the <void, false, ...> instantiation is missing for
+        # prefetch/preload kids -> undefined symbol at load.
+        _dev("void", "void", "false", prefetch)
+
+
 # ---------- Self-register at import time ----------
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
 register_emit("gfx950", "a8w8_mxscale", gen_scale_instance)
-register_emit("gfx950", "a8w8_uniform_scale", gen_uniform_scale_instance)
 register_emit("gfx950", "a16w16", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)
 register_emit("gfx950", "a16w16_flatmm_splitk", gen_flatmm_splitk_instance)
+register_emit(
+    "gfx950",
+    "a8w8_mxscale_bmm_flatmm_splitk",
+    gen_bmm_mxscale_flatmm_splitk_instance,
+)

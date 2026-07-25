@@ -9,6 +9,10 @@
 #pragma once
 
 #include "opus_gemm_traits_a8w8_scale_gfx950.cuh"
+// opus_bmm_splitk_reduce_kernel: the split-K > 1 path's fp32->Y reduce. Lives
+// in the shared reduce header so the codegen'd BMM launcher (which #includes
+// this pipeline header on the non-fused device pass) can launch it.
+#include "splitk_reduce_gfx950.cuh"
 
 #ifdef __HIP_DEVICE_COMPILE__
 
@@ -304,7 +308,8 @@ OPUS_D void mma_mxscale_flatmm_accum_on_demand(Mma& mma, const VA& v_a, const VB
 // Main kernel: 4-wave flatmm splitK, fp32 workspace output.
 // ============================================================================
 
-template<typename Traits, typename D_OUT = void, bool DIRECT_ONLY = false, bool PREFETCH_SCALE = false>
+template<typename Traits, typename D_OUT = void, bool DIRECT_ONLY = false, bool PREFETCH_SCALE = false,
+         bool PRELOAD_SF_LDS = false>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
 void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs)
 {
@@ -321,6 +326,17 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     static_assert(std::is_same_v<D_C, fp32_t>, "flatmm splitK main writes fp32 workspace");
     static_assert(!DIRECT_ONLY || !std::is_void_v<D_OUT>,
                   "DIRECT_ONLY requires an output dtype for direct Y stores");
+    // tileN (T_M=1, T_N=2 consumer N-split) is only wired through the non-DIRECT
+    // producer/consumer path (barrier-synced; split_k==1 still stores Y directly
+    // via the branch below). The persistent DIRECT_ONLY schedule keeps its
+    // original tileM-only consumer mapping, so do not instantiate it for tileN.
+    static_assert(!(DIRECT_ONLY && T::IS_TILE_N),
+                  "tileN is not supported by the DIRECT_ONLY persistent kernel");
+    // PRELOAD_SF_LDS stages the scale panels for the barrier-synced
+    // producer/consumer schedule; it is not wired into the DIRECT_ONLY
+    // consumer-self-load path.
+    static_assert(!(PRELOAD_SF_LDS && DIRECT_ONLY),
+                  "PRELOAD_SF_LDS is only supported by the non-DIRECT_ONLY schedule");
 
     int wgid_full = opus::block_id_x();
     int split_id  = 0;
@@ -350,15 +366,27 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     }
     if (my_loops < T::prefetch_k_iter) return;
 
+    // OOB masking for partial M tiles: bound the A / sfa / C buffers to the
+    // valid row window [row, M) so lanes mapping to rows >= M read 0 and their
+    // stores are dropped by the buffer's num_records bound. This lets any M run
+    // on a B_M tile without requiring M % B_M == 0 (N/K stay divisible so B and
+    // the K axis need no bound). rows_avail >= 1 always (row < M by construction).
+    const int rows_avail = kargs.m - row;
+    const unsigned int a_bytes =
+        (unsigned int)rows_avail * (unsigned int)kargs.stride_a * sizeof(D_A);
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
-                         + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start);
+                         + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start,
+                         a_bytes);
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + batch_id * kargs.stride_b_batch + col * kargs.stride_b + k_start);
     const bool direct_store = DIRECT_ONLY || (!std::is_void_v<D_OUT> && kargs.split_k == 1);
     const int stride_c_main = direct_store ? kargs.stride_c : kargs.stride_ws;
+    const unsigned int sfa_bytes =
+        (unsigned int)rows_avail * (unsigned int)kargs.stride_sfa * sizeof(D_SF);
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
                            + batch_id * kargs.stride_sfa_batch
-                           + row * kargs.stride_sfa + sf_start);
+                           + row * kargs.stride_sfa + sf_start,
+                           sfa_bytes);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                            + batch_id * kargs.stride_sfb_batch
                            + (col / T::GROUP_N) * kargs.stride_sfb + sf_start);
@@ -370,6 +398,24 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                            * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
     __shared__ char smem_b[smem_slot_factor * T::prefetch_k_iter * T::NUM_LOAD_GROUPS_PER_BN
                            * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
+
+    // PRELOAD_SF_LDS (kid324): stage the A per-token scale (SFA) and B block
+    // scale (SFB) panels for this split's whole K range into LDS once, then read
+    // them from LDS (ds_read/lgkmcnt) in the consumer's per-K-tile scale fetch
+    // instead of a per-tile global buffer_load (vmcnt) that gates every MMA. The
+    // panels are compact byte tiles: SFA is [B_M/GROUP_M rows][loops*SCALES_PER_BK]
+    // and SFB is [N_SCALE_GROUPS rows][loops*SCALES_PER_BK], both row-major with a
+    // runtime per-row stride == the packed K-scale count. The LDS buffer is sized
+    // for a compile-time K upper bound (SFA_K_MAX); the actual packed count is a
+    // runtime value so any K<=SFA_K_MAX (K%B_K==0) works. SFA_K_MAX=8192 keeps the
+    // combined panel <=~4.2 KiB, well inside the WG_PER_CU=2 LDS headroom.
+    constexpr int SFA_K_MAX        = 8192;
+    constexpr int SFA_K_TILES_MAX  = PRELOAD_SF_LDS ? (SFA_K_MAX / T::B_K) : 1;
+    constexpr int SF_SCALES_MAX    = SFA_K_TILES_MAX * T::SCALES_PER_BK;
+    constexpr int SFA_ROWS         = T::B_M / T::GROUP_M;
+    constexpr int SF_LDS_ELEMS     =
+        PRELOAD_SF_LDS ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX) : 1;
+    __shared__ D_SF smem_sf[SF_LDS_ELEMS];
 
     auto smem_a_at = [&](int slot_k, int m_block, int k_group) -> D_A* {
         return reinterpret_cast<D_A*>(smem_a
@@ -392,6 +438,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     };
 
     const int loops = my_loops;
+    // Runtime packed K-scale count per SFA/SFB row (== loops * SCALES_PER_BK) and
+    // the two LDS panel base pointers. SFB is packed immediately after SFA using
+    // the runtime SFA size so both stay compact regardless of K.
+    const int sf_k_scales = loops * T::SCALES_PER_BK;
+    D_SF* s_sfa_ptr = smem_sf;
+    D_SF* s_sfb_ptr = smem_sf + SFA_ROWS * sf_k_scales;
     constexpr int mb_a = T::a_buffer_load_insts;
     constexpr int mb_b = T::b_buffer_load_insts;
     constexpr int mb = mb_a + mb_b;
@@ -513,9 +565,38 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                        + (size_t)batch_id * kargs.stride_c_batch
                        + (size_t)row * kargs.stride_c
                        + (size_t)col;
-        auto g_out = make_gmem(out_ptr);
+        auto g_out = make_gmem(out_ptr,
+            (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
         store<T::VEC_C>(g_out, v_c, u_gc, 0);
         return;
+    }
+
+    // PRELOAD_SF_LDS: cooperative one-shot fill of the SFA + SFB panels into LDS.
+    // Executed by all BLOCK_SIZE threads (both producer and consumer waves) before
+    // the producer/consumer role split, with a barrier publishing the panels for
+    // the consumer reads below. Grid-stride over the compact scalar byte counts.
+    // OOB rows (partial-M tail) read 0 via g_sfa's num_records bound and are
+    // never consumed. Bail if this split's K exceeds the compile-time LDS bound
+    // (the dispatch never selects kid324 for such K, so this only guards misuse).
+    if constexpr (PRELOAD_SF_LDS) {
+        if (loops > SFA_K_TILES_MAX) return;
+        const int tid = opus::thread_id_x();
+        auto sm_sfa = make_smem(s_sfa_ptr);
+        const int sfa_total = SFA_ROWS * sf_k_scales;
+        for (int idx = tid; idx < sfa_total; idx += T::BLOCK_SIZE) {
+            const int m  = idx / sf_k_scales;
+            const int kt = idx % sf_k_scales;
+            sm_sfa.template store<1>(load<1>(g_sfa, m * kargs.stride_sfa + kt), idx);
+        }
+        auto sm_sfb = make_smem(s_sfb_ptr);
+        const int sfb_total = T::N_SCALE_GROUPS * sf_k_scales;
+        for (int idx = tid; idx < sfb_total; idx += T::BLOCK_SIZE) {
+            const int ng = idx / sf_k_scales;
+            const int kt = idx % sf_k_scales;
+            sm_sfb.template store<1>(load<1>(g_sfb, ng * kargs.stride_sfb + kt), idx);
+        }
+        s_waitcnt_vmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
     }
 
     if (role == 0) {
@@ -592,11 +673,24 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             __builtin_amdgcn_s_barrier();
         }
     } else {
-        int wave_id_m = wave_id / 2;
-        int wave_id_n_cons = 0;
+        // Consumer waves. tileM: two waves split M (wave_id_m in {0,1}, single
+        // N column-block). tileN: two waves split N (single M-wave, wave_id_n
+        // in {0,1}); each consumer reads its own 16-col B group from smem, and
+        // the C partition / rb layout follow via T_N=2. wave_id_n_cons is 0 for
+        // tileM, so the shared `n_block = wave_id_n_cons` smem-B base below is
+        // bit-identical for the existing tileM kids.
+        int wave_id_m = T::IS_TILE_N ? 0 : (wave_id / 2);
+        int wave_id_n_cons = T::IS_TILE_N ? (wave_id / 2) : 0;
+        // Consumer B smem N-group base. Each consumer N-wave owns COM_REP_N
+        // contiguous 16-col load groups (rb reads num_blocks_n=COM_REP_N from
+        // this base). tileM: wave_id_n_cons=0 -> nbc=0 (bit-identical).
+        const int nbc = wave_id_n_cons * T::COM_REP_N;
         auto u_ra = make_layout_ra_mxsk<T>(lane_id, wave_id_m);
         auto u_rb = make_layout_rb_mxsk<T>(lane_id);
         auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
+        // LDS read layout for the preloaded SFA panel: same lane/wave mapping as
+        // u_sfa but with the compact per-row K-scale count as the row stride.
+        auto u_sfa_lds = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, sf_k_scales);
 
         auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
             seq<T::COM_REP_M, T::COM_REP_N, T::COM_REP_K>{},
@@ -615,20 +709,45 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
 
         auto load_scale_regs = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
             const int scale_base = loop_k * T::SCALES_PER_BK;
-            v_sfa = load(g_sfa, u_sfa, scale_base);
-            opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
-                constexpr int ng = decltype(ng_c)::value;
-                auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
-                opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
-                    constexpr int kg = decltype(kg_c)::value;
-                    v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+            if constexpr (PRELOAD_SF_LDS) {
+                // Read this K-tile's scales from the preloaded LDS panels
+                // (ds_read / lgkmcnt) instead of a per-tile global buffer_load.
+                auto sm_a = make_smem(s_sfa_ptr + scale_base);
+                v_sfa = load(sm_a, u_sfa_lds);
+                opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+                    constexpr int ng = decltype(ng_c)::value;
+                    auto sm_b = make_smem(s_sfb_ptr + ng * sf_k_scales + scale_base);
+                    auto sfb = load<T::SCALES_PER_BK>(sm_b, 0);
+                    opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
+                        constexpr int kg = decltype(kg_c)::value;
+                        v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+                    });
                 });
-            });
+            } else {
+                v_sfa = load(g_sfa, u_sfa, scale_base);
+                opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+                    constexpr int ng = decltype(ng_c)::value;
+                    auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
+                    opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
+                        constexpr int kg = decltype(kg_c)::value;
+                        v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+                    });
+                });
+            }
         };
 
         auto do_scaled_mma = [&](const auto& va, const auto& vb,
                                  const vtype_sfa& v_sfa, const vtype_sfb& v_sfb) {
-            s_waitcnt_vmcnt(0_I);
+            if constexpr (PRELOAD_SF_LDS) {
+                // SFA/SFB now come from LDS; wait on the ds_read (lgkmcnt) rather
+                // than a global vmcnt. lgkmcnt(0) also drains the just-issued
+                // next-buffer A/B ds_reads -- acceptable for this prototype since
+                // it trades the (much longer) global scale-load stall for the
+                // short LDS-read latency.
+                s_waitcnt_lgkmcnt(0_I);
+            } else {
+                s_waitcnt_vmcnt(0_I);
+            }
             __builtin_amdgcn_s_setprio(1);
             mma_mxscale_flatmm_accum<T>(mma, va, vb, v_sfa, v_sfb, v_c);
             __builtin_amdgcn_s_setprio(0);
@@ -658,7 +777,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         __builtin_amdgcn_s_barrier();
         {
             auto sa0 = make_smem(smem_a_at(0, 0, 0));
-            auto sb0 = make_smem(smem_b_at(0, 0, 0));
+            auto sb0 = make_smem(smem_b_at(0, nbc, 0));
             v_a0 = load<T::VEC_A>(sa0, u_ra);
             v_b0 = load<T::VEC_B>(sb0, u_rb);
         }
@@ -669,7 +788,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             constexpr int nxt = p & 1;
             __builtin_amdgcn_s_barrier();
             auto sa_p = make_smem(smem_a_at(p, 0, 0));
-            auto sb_p = make_smem(smem_b_at(p, 0, 0));
+            auto sb_p = make_smem(smem_b_at(p, nbc, 0));
             if constexpr (nxt == 0) {
                 v_a0 = load<T::VEC_A>(sa_p, u_ra);
                 v_b0 = load<T::VEC_B>(sb_p, u_rb);
@@ -691,7 +810,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             {
                 int slot = k % T::prefetch_k_iter;
                 auto sa_k = make_smem(smem_a_at(slot, 0, 0));
-                auto sb_k = make_smem(smem_b_at(slot, 0, 0));
+                auto sb_k = make_smem(smem_b_at(slot, nbc, 0));
                 if constexpr (L == 0) {
                     v_a1 = load<T::VEC_A>(sa_k, u_ra);
                     v_b1 = load<T::VEC_B>(sb_k, u_rb);
@@ -710,7 +829,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             {
                 int slot = (k + 1) % T::prefetch_k_iter;
                 auto sa_k = make_smem(smem_a_at(slot, 0, 0));
-                auto sb_k = make_smem(smem_b_at(slot, 0, 0));
+                auto sb_k = make_smem(smem_b_at(slot, nbc, 0));
                 if constexpr (L == 0) {
                     v_a0 = load<T::VEC_A>(sa_k, u_ra);
                     v_b0 = load<T::VEC_B>(sb_k, u_rb);
@@ -732,7 +851,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             {
                 int slot = k % T::prefetch_k_iter;
                 auto sa_k = make_smem(smem_a_at(slot, 0, 0));
-                auto sb_k = make_smem(smem_b_at(slot, 0, 0));
+                auto sb_k = make_smem(smem_b_at(slot, nbc, 0));
                 if constexpr (L == 0) {
                     v_a1 = load<T::VEC_A>(sa_k, u_ra);
                     v_b1 = load<T::VEC_B>(sb_k, u_rb);
@@ -753,7 +872,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         __builtin_amdgcn_s_barrier();
         int last_slot = (loops - 1) % T::prefetch_k_iter;
         auto sa_last = make_smem(smem_a_at(last_slot, 0, 0));
-        auto sb_last = make_smem(smem_b_at(last_slot, 0, 0));
+        auto sb_last = make_smem(smem_b_at(last_slot, nbc, 0));
         if (last_in_buf1) {
             v_a0 = load<T::VEC_A>(sa_last, u_ra);
             v_b0 = load<T::VEC_B>(sb_last, u_rb);
@@ -776,7 +895,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                                + (size_t)batch_id * kargs.stride_c_batch
                                + (size_t)row * kargs.stride_c
                                + (size_t)col;
-                auto g_out = make_gmem(out_ptr);
+                auto g_out = make_gmem(out_ptr,
+                    (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
                 store<T::VEC_C>(g_out, v_c, u_gc, 0);
             } else {
                 D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
@@ -826,6 +946,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             for (int i = int(opus::thread_id_x()); i < T::B_M * T::B_N; i += T::BLOCK_SIZE) {
                 const int mi = i / T::B_N;
                 const int ni = i - mi * T::B_N;
+                if (row + mi >= kargs.m) continue;  // skip OOB rows of a partial M tile
                 float acc = 0.0f;
                 const size_t base = (size_t)batch_id * (size_t)kargs.stride_ws_batch
                                   + (size_t)(row + mi) * (size_t)kargs.stride_ws
@@ -1373,6 +1494,210 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
             store<T::VEC_C>(g_out, v_c, u_gc, 0);
             __builtin_amdgcn_s_barrier();
         }
+    }
+#endif // __gfx950__
+#endif // __HIP_DEVICE_COMPILE__
+}
+
+// -- M-tile interleaved direct-store kernel (correctness-first v1) ------------
+//
+// Each WG owns one N tile and MI=2 consecutive M tiles that share the SAME B
+// tile stream. Both M tiles' A operands are resident in LDS simultaneously
+// (smem_a0 / smem_a1) while B is loaded once (smem_b). Per K iteration the
+// consumer issues MFMA for tile0 then tile1 back-to-back into two independent
+// accumulators, so the MFMA instruction stream is ~MIx longer across a single
+// prologue/epilogue, and B global traffic is halved.
+//
+// v1 is single-buffered (load-then-compute, barrier-bracketed) for provable
+// deadlock-freedom and correctness; the software-pipelined perf version is a
+// follow-up. Producer waves (role 0) load; consumer waves (role 1) MFMA.
+template<typename Traits, typename D_OUT, bool SKIP_SCALE_WAIT = false>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
+void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs)
+{
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    using namespace opus;
+
+    using T = opus::remove_cvref_t<Traits>;
+    using D_A = typename T::D_A;
+    using D_B = typename T::D_B;
+    using D_ACC = typename T::D_ACC;
+    using D_SF = typename T::D_SF;
+
+    constexpr int MI = 2;                 // M tiles interleaved per WG
+    constexpr int SB = 2;                 // double LDS buffer per operand (prefetch k+1)
+
+    const int num_tiles_m = ceil_div(kargs.m, T::B_M);
+    const int num_tiles_n = ceil_div(kargs.n, T::B_N);
+    int bid = opus::block_id_x();
+    constexpr int NUM_XCD = 8;
+    int xcd_id = __builtin_amdgcn_readfirstlane(bid % NUM_XCD);
+    int pos_xcd = __builtin_amdgcn_readfirstlane(bid / NUM_XCD);
+    int tile_n_id = __builtin_amdgcn_readfirstlane(pos_xcd % num_tiles_n);
+    int m_grp_local = __builtin_amdgcn_readfirstlane(pos_xcd / num_tiles_n);
+    int m_grp = __builtin_amdgcn_readfirstlane(xcd_id * kargs.stride_ws_batch + m_grp_local);
+    if (m_grp >= kargs.stride_ws) return;
+    int tile_m0 = m_grp * MI;
+    if (tile_m0 + MI > num_tiles_m) return;  // host guarantees M % (MI*B_M) == 0
+    int col = tile_n_id * T::B_N;
+    int batch_id = opus::block_id_z();
+    int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
+    int lane_id = opus::thread_id_x() % get_warp_size();
+    int role = (wave_id & 1);
+
+    const int loops = kargs.k / T::B_K;
+    if (loops < T::prefetch_k_iter) return;
+
+    auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
+                         + batch_id * kargs.stride_b_batch + col * kargs.stride_b);
+    auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
+                           + batch_id * kargs.stride_sfb_batch
+                           + (col / T::GROUP_N) * kargs.stride_sfb);
+
+    __shared__ char smem_a[MI * SB * T::NUM_LOAD_GROUPS_PER_BM
+                           * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
+    __shared__ char smem_b[SB * T::NUM_LOAD_GROUPS_PER_BN
+                           * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
+
+    auto smem_a_at = [&](int mi, int slot_k, int m_block, int k_group) -> D_A* {
+        return reinterpret_cast<D_A*>(smem_a
+            + (((mi * SB + slot_k) * T::NUM_LOAD_GROUPS_PER_BM + m_block) * T::NUM_LOAD_GROUPS_PER_BK + k_group)
+              * T::smem_per_group_load_size);
+    };
+    auto smem_b_at = [&](int slot_k, int n_block, int k_group) -> D_B* {
+        return reinterpret_cast<D_B*>(smem_b
+            + ((slot_k * T::NUM_LOAD_GROUPS_PER_BN + n_block) * T::NUM_LOAD_GROUPS_PER_BK + k_group)
+              * T::smem_per_group_load_size);
+    };
+
+    auto b_offset = [&](int loop_k_idx, int group_load_idx, int k_group) {
+        return group_load_idx * T::LOAD_GROUP_N * kargs.stride_b
+             + (loop_k_idx * T::NUM_LOAD_GROUPS_PER_BK + k_group) * T::LOAD_GROUP_K;
+    };
+
+    if (role == 0) {
+        int wave_id_prod = wave_id / 2;
+        auto u_ga = make_layout_gmem_group_load_mxsk<T, 2>(lane_id, wave_id_prod, kargs.stride_a);
+        auto u_sa = make_layout_smem_group_load_mxsk<T, 2>(lane_id, wave_id_prod);
+        auto u_gb = make_layout_gmem_group_load_mxsk<T, 2>(lane_id, wave_id_prod, kargs.stride_b);
+        auto u_sb = make_layout_smem_group_load_mxsk<T, 2>(lane_id, wave_id_prod);
+
+        auto a_offset = [&](int loop_k_idx, int group_load_idx, int k_group) {
+            return group_load_idx * T::LOAD_GROUP_M * kargs.stride_a
+                 + (loop_k_idx * T::NUM_LOAD_GROUPS_PER_BK + k_group) * T::LOAD_GROUP_K;
+        };
+
+        const D_A* base_a = reinterpret_cast<const D_A*>(kargs.ptr_a)
+                            + batch_id * kargs.stride_a_batch;
+
+        auto issue_loads = [&](int k, int slot) {
+            opus::static_for<T::NUM_LOAD_GROUPS_PER_BK>([&](auto kg_c) {
+                constexpr int kg = decltype(kg_c)::value;
+                opus::static_for<MI>([&](auto mi_c) {
+                    constexpr int mi = decltype(mi_c)::value;
+                    auto g_a = make_gmem(base_a + (size_t)(tile_m0 + mi) * T::B_M * kargs.stride_a);
+                    opus::static_for<T::NUM_LOAD_GROUPS_PER_BM>([&](auto m_c) {
+                        constexpr int m = decltype(m_c)::value;
+                        async_load<T::VEC_A>(g_a, smem_a_at(mi, slot, m, kg), u_ga, u_sa, a_offset(k, m, kg));
+                    });
+                });
+                opus::static_for<T::NUM_LOAD_GROUPS_PER_BN>([&](auto n_c) {
+                    constexpr int n = decltype(n_c)::value;
+                    async_load<T::VEC_B>(g_b, smem_b_at(slot, n, kg), u_gb, u_sb, b_offset(k, n, kg));
+                });
+            });
+        };
+
+        // Prologue: preload slot 0 (K-tile 0), then stream while consumers MFMA.
+        issue_loads(0, 0);
+        s_waitcnt_vmcnt(0_I);
+        for (int k = 0; k < loops; ++k) {
+            __builtin_amdgcn_s_barrier();   // R(k): slot k ready
+            if (k + 1 < loops) {
+                issue_loads(k + 1, (k + 1) % SB);
+                s_waitcnt_vmcnt(0_I);       // slot k+1 fully loaded before releasing slot k
+            }
+            __builtin_amdgcn_s_barrier();   // F(k): consumer done reading slot k
+        }
+    } else {
+        int wave_id_m = wave_id / 2;
+        int wave_id_n_cons = 0;
+        auto u_ra = make_layout_ra_mxsk<T>(lane_id, wave_id_m);
+        auto u_rb = make_layout_rb_mxsk<T>(lane_id);
+
+        auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
+            seq<T::COM_REP_M, T::COM_REP_N, T::COM_REP_K>{},
+            seq<T::T_M, T::T_N, T::T_K>{},
+            seq<T::W_M, T::W_N, T::W_K>{},
+            mfma_adaptor_swap_ab{});
+
+        typename decltype(mma)::vtype_a v_a[MI];
+        typename decltype(mma)::vtype_b v_b;
+        typename decltype(mma)::vtype_c v_c[MI];
+
+        using vtype_sfa = vector_t<D_SF, T::COM_REP_M * T::SCALES_PER_BK>;
+        using vtype_sfb = vector_t<D_SF, T::N_SCALE_GROUPS * T::SCALES_PER_BK>;
+
+        auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
+                                          wave_id_n_cons, lane_id / mma.grpn_c);
+        auto u_gc = partition_layout_c<T::VEC_C>(mma,
+            opus::make_tuple(kargs.stride_c, 1_I), p_coord_c);
+
+        // Per-tile A-scale gmem + layout.
+        auto g_sfa = [&](int mi) {
+            return make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
+                             + batch_id * kargs.stride_sfa_batch
+                             + (size_t)(tile_m0 + mi) * T::B_M * kargs.stride_sfa);
+        };
+        auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
+
+        opus::static_for<MI>([&](auto mi_c) { clear(v_c[decltype(mi_c)::value]); });
+
+        for (int k = 0; k < loops; ++k) {
+            __builtin_amdgcn_s_barrier();   // R(k): wait producer data ready
+            const int slot = k % SB;
+            auto sb0 = make_smem(smem_b_at(slot, 0, 0));
+            v_b = load<T::VEC_B>(sb0, u_rb);
+            opus::static_for<MI>([&](auto mi_c) {
+                constexpr int mi = decltype(mi_c)::value;
+                auto sa = make_smem(smem_a_at(mi, slot, 0, 0));
+                v_a[mi] = load<T::VEC_A>(sa, u_ra);
+            });
+            s_waitcnt_lgkmcnt(0_I);
+
+            const int scale_base = k * T::SCALES_PER_BK;
+            vtype_sfb v_sfb;
+            opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
+                opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
+                    constexpr int kg = decltype(kg_c)::value;
+                    v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+                });
+            });
+            opus::static_for<MI>([&](auto mi_c) {
+                constexpr int mi = decltype(mi_c)::value;
+                auto gsfa = g_sfa(mi);
+                vtype_sfa v_sfa = load(gsfa, u_sfa, scale_base);
+                if constexpr (!SKIP_SCALE_WAIT) s_waitcnt_vmcnt(0_I);
+                __builtin_amdgcn_s_setprio(1);
+                mma_mxscale_flatmm_accum<T>(mma, v_a[mi], v_b, v_sfa, v_sfb, v_c[mi]);
+                __builtin_amdgcn_s_setprio(0);
+            });
+            __builtin_amdgcn_s_barrier();   // (C2) done reading slot
+        }
+
+        opus::static_for<MI>([&](auto mi_c) {
+            constexpr int mi = decltype(mi_c)::value;
+            int row = (tile_m0 + mi) * T::B_M;
+            D_OUT* out_ptr = reinterpret_cast<D_OUT*>(kargs.ptr_c)
+                           + (size_t)batch_id * kargs.stride_c_batch
+                           + (size_t)row * kargs.stride_c
+                           + (size_t)col;
+            auto g_out = make_gmem(out_ptr);
+            store<T::VEC_C>(g_out, v_c[mi], u_gc, 0);
+        });
     }
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
