@@ -34,7 +34,6 @@ PIPELINE_HEADER_MAP = {
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter_tunable": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
-    "a8w8_mxscale_bmm_nphase": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_wave8n2": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_wave4m2_selfload": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
 }
@@ -63,7 +62,6 @@ TRAITS_HEADER_MAP = {
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter_tunable": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
-    "a8w8_mxscale_bmm_nphase": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_wave8n2": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_wave4m2_selfload": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
 }
@@ -84,7 +82,6 @@ KERNEL_FUNC_MAP = {
     "a8w8_mxscale_bmm_pipeline": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale_bmm_mouter": "gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel",
     "a8w8_mxscale_bmm_mouter_tunable": "gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel",
-    "a8w8_mxscale_bmm_nphase": "gemm_a8w8_mxscale_flatmm_splitk_nphase_kernel",
     "a8w8_mxscale_bmm_wave8n2": "gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel",
     "a8w8_mxscale_bmm_wave4m2_selfload": "gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel",
 }
@@ -110,7 +107,6 @@ TRAITS_NAME_MAP = {
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8_mxscale_bmm_mouter": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_mouter_tunable": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
-    "a8w8_mxscale_bmm_nphase": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_wave8n2": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_wave4m2_selfload": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
 }
@@ -130,7 +126,6 @@ KARGS_NAME_MAP = {
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale_bmm_mouter": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_mouter_tunable": "opus_gemm_scale_splitk_kargs_gfx950",
-    "a8w8_mxscale_bmm_nphase": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_wave8n2": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_wave4m2_selfload": "opus_gemm_scale_splitk_kargs_gfx950",
 }
@@ -2053,8 +2048,8 @@ def _emit_bmm_specialized(
     one <fp32_t> host stub and the (bf16, fp32) device instantiation pair.
 
     dev_flag_suffix is the comma-prefixed template-arg tail after D_OUT in the
-    kernel instantiation (e.g. ", 2" for nphase, ", true, false, ..." for the
-    wave families, "" for wave8n2).
+    kernel instantiation (e.g. ", true, false, ..." for the wave families,
+    "" for wave8n2).
 
     emit_device=False emits only the host launcher (used by mouter_tunable,
     which reuses the identical gemm_..._mouter_kernel<wg1, D_OUT, SKIP>
@@ -2136,87 +2131,6 @@ _BMM_SPEC_KARGS = r"""
   kargs.stride_c = (int)Y.stride(0);
   kargs.stride_c_batch = (int)Y.stride(1);
 """
-
-# ---- nphase (kid 129) ----
-_BMM_NPHASE_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
-    + r"""  constexpr int N_PHASES = @@NPHASES@@;
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  constexpr int LOGICAL_B_N = Traits::B_N * N_PHASES;
-  AITER_CHECK(M % Traits::B_M == 0,
-              "@@NAME@@ requires M % ", Traits::B_M, " == 0, got ", M);
-  AITER_CHECK(N % LOGICAL_B_N == 0,
-              "@@NAME@@ requires N % ", LOGICAL_B_N, " == 0, got ", N);
-  AITER_CHECK(K % Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Traits::B_K, " == 0, got ", K);
-  const int total_iters = K / Traits::B_K;
-  AITER_CHECK(total_iters >= Traits::prefetch_k_iter,
-              "@@NAME@@ requires at least ", Traits::prefetch_k_iter,
-              " K-tiles, got ", total_iters);
-"""
-    + _BMM_SPEC_KARGS.replace(
-        "kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;",
-        "kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;\n  kargs.split_k = 1;",
-    )
-    + r"""
-  const int num_tiles_m = M / Traits::B_M;
-  const int num_tiles_n = N / LOGICAL_B_N;
-  dim3 grid_main(num_tiles_m * num_tiles_n, 1, batch);
-  dim3 block_main(Traits::BLOCK_SIZE);
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<Traits, __bf16, N_PHASES>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    @@KERNEL@@<Traits, float, N_PHASES>
-        <<<grid_main, block_main, 0, stream>>>(kargs);
-  }
-}
-#endif // launcher only on regular host pass
-"""
-)
-
-
-def gen_bmm_mxscale_nphase_instance(
-    cg,
-    k,
-    pipeline_header,
-    traits_header,
-    kernel_func,
-    da,
-    db,
-    traits_name,
-    kargs_name,
-    kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
-    record_one_instantiation,
-    **_unused,
-):
-    _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    launcher = (
-        _BMM_NPHASE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", kernel_func)
-        .replace("@@NPHASES@@", str(k.n_phases))
-    )
-    _emit_bmm_specialized(
-        cg,
-        k,
-        kernel_func,
-        traits_name,
-        kargs_name,
-        da,
-        db,
-        instance_impl_preamble(),
-        instance_impl_host_tu_split(
-            traits_header, pipeline_header, tpl, kernel_func, fn
-        ),
-        launcher,
-        f", {k.n_phases}",
-    )
-
 
 # ---- wave8n2 (kid 132) ----
 _BMM_WAVE8N2_LAUNCHER_BODY = (
@@ -2897,7 +2811,6 @@ register_emit(
     "a8w8_mxscale_bmm_mouter_tunable",
     gen_bmm_mxscale_mouter_tunable_instance,
 )
-register_emit("gfx950", "a8w8_mxscale_bmm_nphase", gen_bmm_mxscale_nphase_instance)
 register_emit("gfx950", "a8w8_mxscale_bmm_wave8n2", gen_bmm_mxscale_wave8n2_instance)
 register_emit(
     "gfx950",

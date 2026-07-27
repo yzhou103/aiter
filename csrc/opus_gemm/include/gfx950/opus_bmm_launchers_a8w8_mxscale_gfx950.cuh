@@ -21,8 +21,6 @@
 #ifdef OPUS_BUILD_HAS_GFX950
 template<typename Traits, typename D_OUT, bool DIRECT_ONLY>
 __global__ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
-template<typename Traits, typename D_OUT, int N_PHASES>
-__global__ void gemm_a8w8_mxscale_flatmm_splitk_nphase_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
 template<typename Traits, typename D_OUT>
 __global__ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
 template<typename Traits, typename D_OUT>

@@ -145,7 +145,6 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_minterleave": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter_tunable": ("fp8_t", "fp8_t"),
-    "a8w8_mxscale_bmm_nphase": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_pipeline": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave8n2": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
@@ -214,8 +213,6 @@ def _kargs_template_vars(kernel_tag, kargs_name):
         "a8w8_mxscale_bmm_mouter_tunable",
     ):
         return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
-    if kernel_tag == "a8w8_mxscale_bmm_nphase":
-        return "", ", typename D_OUT, int N_PHASES", kargs_name
     if kernel_tag == "a8w8_mxscale_bmm_wave8n2":
         return "", ", typename D_OUT", kargs_name
     if kernel_tag == "a8w8_mxscale_bmm_wave4m2_selfload":
@@ -705,7 +702,7 @@ class opus_gemm_codegen:
         the reduce kernel from an fp32 workspace), so only the fp32_t
         specialization is instantiated -> emit a single fp32 macro. The dispatch
         wrapper in opus_bmm.cu combines this with the hand-written specialized
-        pipelines (mouter / wave*n* / nphase / minterleave / pipeline / fused).
+        pipelines (mouter / wave*n* / minterleave / pipeline / fused).
         """
         header = """#pragma once
 // SPDX-License-Identifier: MIT
@@ -808,7 +805,6 @@ void
                     "a8w8_mxscale_bmm_minterleave",
                     "a8w8_mxscale_bmm_mouter",
                     "a8w8_mxscale_bmm_mouter_tunable",
-                    "a8w8_mxscale_bmm_nphase",
                     "a8w8_mxscale_bmm_pipeline",
                     "a8w8_mxscale_bmm_wave8n2",
                     "a8w8_mxscale_bmm_wave4m2_selfload",

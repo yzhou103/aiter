@@ -108,9 +108,6 @@ class OpusGemmInstance:
     # for pipeline overlap. Drives both the launcher body and the device
     # instantiation set for the kid.
     skip_scale_wait: bool = False
-    # a8w8_mxscale BMM nphase family: N_PHASES int template param (consumers
-    # sweep N_PHASES * B_N logical columns per WG). 1 = N/A.
-    n_phases: int = 1
     # a8w8_mxscale BMM wave4m2_selfload family extra bool axis (kernel template
     # order: <Traits, D_OUT, SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND>).
     pack_scale_on_demand: bool = False
@@ -173,10 +170,6 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.skip_scale_wait:
                 parts.append("ssw")
-        elif self.kernel_tag == "a8w8_mxscale_bmm_nphase":
-            parts.insert(tag_at, "a8w8_mxscale_flatmm_nphase")
-            parts.append(f"wgpcu{self.WG_PER_CU}")
-            parts.append(f"nph{self.n_phases}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_wave8n2":
             parts.insert(tag_at, "a8w8_mxscale_flatmm_wave8n2")
             parts.append(f"wgpcu{self.WG_PER_CU}")
@@ -386,8 +379,8 @@ def _a8w8_mxscale_bmm_flatmm_splitk(
 # fp8 e8m0 mxscale BMM flatmm split-K tiles. kid numbers preserved from the
 # hand-written opus_bmm.cu switch so existing tuned CSVs / heuristics keep
 # working. Each kid = (B_M, B_N, B_K, WG_PER_CU, direct_only, prefetch_scale).
-# The specialized big-tile pipelines (mouter / minterleave / wave*n* / nphase /
-# pipeline, kids 129/131/132/133/134/140-163/149/150-152) stay monolithic in
+# The specialized big-tile pipelines (mouter / minterleave / wave*n* /
+# pipeline, kids 131/132/134/140-163/149/150-152) stay monolithic in
 # opus_bmm.cu for now and are NOT migrated here.
 _BMM_MXSCALE_SPLITK_TILES = {
     # tileN (B_M=16): consumers split N (T_M=1, T_N=2). A single 16-row MFMA
@@ -523,8 +516,8 @@ def _a8w8_mxscale_bmm_spec(tag, bm, bn, bk, wg_per_cu, **flags):
 
     Same locked geometry/traits family as the flatmm split-K kids (BLOCK_SIZE
     256, MFMA 16x16x128, VEC=(16,16,4), GROUP=(1,128,128), fp32 workspace tuple
-    slot). `tag` selects the kernel family (nphase / wave8n2 /
-    wave4m2_selfload); `flags` sets the family's compile-time axes.
+    slot). `tag` selects the kernel family (wave8n2 / wave4m2_selfload);
+    `flags` sets the family's compile-time axes.
     """
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
@@ -585,11 +578,6 @@ a8w8_mxscale_bmm_mouter_tunable_kernels_list = {
     161: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1, skip_scale_wait=True),
 }
 
-# nphase (kid 129): m64n128k128 wg2, N_PHASES=2 (logical B_N = 128*2 = 256).
-a8w8_mxscale_bmm_nphase_kernels_list = {
-    129: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_nphase", 64, 128, 128, 2, n_phases=2),
-}
-
 # wave8n2 (kid 132): wg1 m128n128k128, no compile-time flags (logical B_N = 256).
 a8w8_mxscale_bmm_wave8n2_kernels_list = {
     132: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_wave8n2", 128, 128, 128, 1),
@@ -622,7 +610,6 @@ a8w8_mxscale_bmm_kernel_lists = (
     a8w8_mxscale_bmm_minterleave_kernels_list,
     a8w8_mxscale_bmm_mouter_kernels_list,
     a8w8_mxscale_bmm_mouter_tunable_kernels_list,
-    a8w8_mxscale_bmm_nphase_kernels_list,
     a8w8_mxscale_bmm_pipeline_kernels_list,
     a8w8_mxscale_bmm_wave8n2_kernels_list,
     a8w8_mxscale_bmm_wave4m2_selfload_kernels_list,
