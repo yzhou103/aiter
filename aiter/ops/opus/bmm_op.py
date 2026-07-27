@@ -7,6 +7,7 @@ batch-in-the-middle or grouped layouts (for example DSV4 `wo_a`) while the
 underlying kernels still live in the shared opus GEMM backend.
 """
 
+import bisect
 import functools
 import logging
 
@@ -66,8 +67,7 @@ def _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
 def _load_mxscale_bmm_config() -> dict:
     """Load the opus mxscale BMM tuned CSV into a {(gfx,g,m,n,k): row} dict.
 
-    Guards: ``scale`` must be uniformly ``mxscale`` (this is the e8m0 table),
-    and rows are filtered to ``libtype == 'opus'`` (backend-selection seam).
+    Rows are filtered to ``libtype == 'opus'`` (backend-selection seam).
     Returns {} if the file is missing so callers fall back to the heuristic.
     """
     import pandas as pd
@@ -78,13 +78,6 @@ def _load_mxscale_bmm_config() -> dict:
     except FileNotFoundError:
         logger.warning("opus mxscale BMM tuned CSV not found at %s", path)
         return {}
-    if "scale" in df.columns:
-        bad = set(df["scale"].unique()) - {"mxscale"}
-        assert not bad, (
-            f"{path}: expected all rows to have scale=='mxscale' (this file is "
-            f"the e8m0 block-scale table); found unexpected scale values {bad}. "
-            f"fp32 rowwise-scale configs belong in a separate CSV."
-        )
     if "libtype" in df.columns:
         # Backend-selection seam (see docstring): only consume opus rows.
         df = df[df["libtype"] == "opus"]
@@ -93,22 +86,65 @@ def _load_mxscale_bmm_config() -> dict:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _mxscale_bmm_buckets() -> dict:
+    """Per-(gfx,g,n,k) sorted list of tuned M buckets, for padded-M lookup.
+
+    Mirrors the GEMM ``get_padded_m`` idea but keyed on the BMM batch dim ``g``
+    (the tuned table is per-g), so the nearest tuned M is chosen within the same
+    (g,n,k) family instead of a g-agnostic global rule.
+    """
+    buckets: dict = {}
+    for gfx, g, m, n, k in _load_mxscale_bmm_config().keys():
+        buckets.setdefault((gfx, g, n, k), []).append(m)
+    for key in buckets:
+        buckets[key].sort()
+    return buckets
+
+
+# OOB-masked sub-tiles (B_M=32/64): partial-M is predicated via buffer OOB, so
+# these run any M. The strong pipeline/minterleave tiles (137/139/150/157/163)
+# instead grid on M/B_M with a hard ``M % B_M == 0`` assert -> aligned M only.
+ARBITRARY_M_KIDS = frozenset({311, 313, 320, 321, 324, 640, 650, 653})
+
+
 def _lookup_mxscale_bmm(g: int, m: int, n: int, k: int):
+    """Exact CSV lookup, then GEMM-style padded-M (round M up to nearest tuned
+    bucket in the same (g,n,k) family). Returns ``(cfg, padded_m)``; ``cfg`` is
+    ``None`` only when neither exact nor any padded bucket exists.
+    """
     gfx = _get_gfx()
-    cfg = _load_mxscale_bmm_config().get((gfx, g, m, n, k))
+    cfgmap = _load_mxscale_bmm_config()
     tuned_file = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+
+    cfg = cfgmap.get((gfx, g, m, n, k))
     if cfg is not None:
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
                 f"shape is G:{g}, M:{m}, N:{n}, K:{k}, is tuned on gfx = {gfx} in "
                 f"{tuned_file}, kernelId is {cfg['kernelId']}, splitK is {cfg['splitK']}!"
             )
-    else:
-        logger.info(
-            f"shape is G:{g}, M:{m}, N:{n}, K:{k}, not found tuned config in "
-            f"{tuned_file}, will use heuristic/M-split fallback!"
-        )
-    return cfg  # None on miss
+        return cfg, m
+
+    ms = _mxscale_bmm_buckets().get((gfx, g, n, k))
+    if ms:
+        i = bisect.bisect_left(ms, m)
+        if i < len(ms):
+            padded_m = ms[i]
+            pcfg = cfgmap[(gfx, g, padded_m, n, k)]
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"shape is G:{g}, M:{m}, N:{n}, K:{k}, exact miss; using "
+                    f"padded_M: {padded_m} kernelId {pcfg['kernelId']} "
+                    f"(splitK {pcfg['splitK']}) from {tuned_file}!"
+                )
+            return pcfg, padded_m
+
+    logger.info(
+        f"shape is G:{g}, M:{m}, N:{n}, K:{k}, not found tuned/padded config in "
+        f"{tuned_file}, will use heuristic/M-split fallback!"
+    )
+    return None, m
 
 
 def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
@@ -128,12 +164,13 @@ def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
         return 150
-    # Sub-tile M: B_M=32/64 tiles mask partial M via buffer OOB, so run any M.
+    # Sub-tile M: B_M=32/64 tiles mask partial M via buffer OOB, so run any M
+    # (no m-alignment needed -- verified 653/321/... run arbitrary unaligned M).
     if m < 64:
         return 640 if (div(n, 64) and div(k, 256)) else 653
-    if m <= 256 and k <= 1024 and div(m, 64) and div(n, 32) and div(k, 256):
+    if m <= 256 and k <= 1024 and div(n, 32) and div(k, 256):
         return 320
-    if div(m, 64) and div(n, 64) and div(k, 128):
+    if div(n, 64) and div(k, 128):
         return 653
     return 0  # nothing tile-aligned: k32 fused runs arbitrary shapes
 
@@ -166,22 +203,30 @@ def bmm_a8w8_mxscale_opus(
         Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
 
     if kernelId is None:
-        cfg = _lookup_mxscale_bmm(g, m, n, k)
-        if cfg is not None:
+        cfg, padded_m = _lookup_mxscale_bmm(g, m, n, k)
+        # Accept the tuned config when it is either an exact hit, or a padded-M
+        # hit whose kernel is an OOB-masked sub-tile (runs the real, smaller M
+        # with zero pad/copy). A padded-M hit on a strong tile is rejected here:
+        # that kernel asserts M % B_M == 0 and would fault on the real M.
+        if cfg is not None and (
+            padded_m == m or int(cfg["kernelId"]) in ARBITRARY_M_KIDS
+        ):
             kernelId = int(cfg["kernelId"])
             if splitK is None:
                 splitK = int(cfg["splitK"])
         elif (
             splitK is None
+            and g >= 8
             and n % 256 == 0
             and k % 128 == 0
-            and m >= 512
+            and m >= 1024
             and m % 256 != 0
         ):
-            # Large tile-unaligned M: the strong large-M tiles (157/150) need
-            # M % 256 == 0, so split into an aligned bulk (strong tile) + a
-            # <256-row OOB-safe remainder instead of dropping to k32 fused
-            # (~0.35x -> ~1.15x bf16). Zero-copy dim0 views; splitK=1 each.
+            # High-g large tile-unaligned M: strong large-M tiles (157/150) win
+            # here but need M % 256 == 0, so split into an aligned bulk (strong
+            # tile) + a <256-row OOB-safe remainder. Zero-copy dim0 views. For
+            # low g the strong tiles never win, so we fall through to the
+            # sub-tile heuristic (653) on the full real M instead.
             m_bulk = (m // 256) * 256
             bulk_kid = 157 if k >= 4096 else 150
             tail_kid = _heuristic_mxscale_kid(g, m - m_bulk, n, k)
