@@ -37,10 +37,7 @@ def _make_unsupported_arch_stub(name: str):
 
 
 if _arch_ok:
-    from .bmm_op import (
-        _opus_bmm_a8w8_mxscale_flatmm_splitk_raw,
-        bmm_a8w8_mxscale_opus,
-    )
+    from .bmm_op import bmm_a8w8_mxscale_opus
     from .gemm_op_a16w16 import (
         gemm_a16w16_opus,
         opus_gemm_a16w16_tune,
@@ -59,9 +56,6 @@ else:
     # it and silently disable the 30+ subsequent op imports.
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
-    _opus_bmm_a8w8_mxscale_flatmm_splitk_raw = _make_unsupported_arch_stub(
-        "_opus_bmm_a8w8_mxscale_flatmm_splitk_raw"
-    )
     bmm_a8w8_mxscale_opus = _make_unsupported_arch_stub("bmm_a8w8_mxscale_opus")
     opus_gemm_a8w8_blockscale_bpreshuffle_tune = _make_unsupported_arch_stub(
         "opus_gemm_a8w8_blockscale_bpreshuffle_tune"
@@ -70,7 +64,6 @@ else:
 
 
 __all__ = [
-    "_opus_bmm_a8w8_mxscale_flatmm_splitk_raw",
     "bmm_a8w8_mxscale_opus",
     "gemm_a16w16_opus",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
