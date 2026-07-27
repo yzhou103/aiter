@@ -298,41 +298,6 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
-#define OPUS_BMM_A8W8_SCALE_PYBIND               \
-    m.def("opus_bmm_a8w8_scale",                 \
-          &opus_bmm_a8w8_scale,                  \
-          "mmajor fp8 block-scale BMM: O/Y "             \
-          "[M, batch, *], wo_a/w_scale batch-major, "    \
-          "x_scale [M, batch, K/GROUP_K] (zero-copy "    \
-          "DSV4 wo_a fp8)",                              \
-          py::arg("O"),                                  \
-          py::arg("wo_a"),                               \
-          py::arg("Y"),                                  \
-          py::arg("x_scale"),                            \
-          py::arg("w_scale"));
-#define OPUS_BMM_A8W8_MXSCALE_PYBIND             \
-    m.def("opus_bmm_a8w8_mxscale",               \
-          &opus_bmm_a8w8_mxscale,                \
-          "mmajor fp8 block-scale BMM with native e8m0 " \
-          "scaled MFMA: O/Y [M, batch, *], wo_a/w_scale " \
-          "batch-major, x_scale [M, batch, K/GROUP_K]", \
-          py::arg("O"),                                  \
-          py::arg("wo_a"),                               \
-          py::arg("Y"),                                  \
-          py::arg("x_scale"),                            \
-          py::arg("w_scale"),                            \
-          py::arg("kernelId") = 710);
-#define OPUS_BMM_A8W8_MXSCALE_SPLITK_PYBIND      \
-    m.def("opus_bmm_a8w8_mxscale_splitk",        \
-          &opus_bmm_a8w8_mxscale_splitk,         \
-          "mmajor fp8 block-scale BMM with native e8m0 " \
-          "scaled MFMA and split-K workspace/reduce",   \
-          py::arg("O"),                                  \
-          py::arg("wo_a"),                               \
-          py::arg("Y"),                                  \
-          py::arg("x_scale"),                            \
-          py::arg("w_scale"),                            \
-          py::arg("splitK") = 8);
 #define OPUS_BMM_A8W8_MXSCALE_FLATMM_SPLITK_PYBIND \
     m.def("opus_bmm_a8w8_mxscale_flatmm_splitk",   \
           &opus_bmm_a8w8_mxscale_flatmm_splitk,    \

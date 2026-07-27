@@ -12,7 +12,7 @@ import logging
 
 import torch
 
-from ...jit.core import AITER_CONFIGS, compile_ops
+from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ...jit.utils.chip_info import get_gfx_runtime as _get_gfx
 
 logger = logging.getLogger("aiter")
@@ -28,56 +28,11 @@ def _gen_bmm_a8w8_scale_fake_tensors(
     return Y
 
 
-# mmajor fp8 block-scale BMM: x/Y are [M, batch, *] (dim0=M, dim1=batch),
-# x_scale [M, batch, K/GROUP_K] (per-token M); wo_a + w_scale stay batch-major.
-# Zero-copy DSV4 wo_a fp8 (no caller-side transpose). Y is fp32 today.
-@compile_ops(
-    "module_deepgemm_opus",
-    fc_name="opus_bmm_a8w8_scale",
-    gen_fake=_gen_bmm_a8w8_scale_fake_tensors,
-    develop=True,
-)
-def _opus_bmm_a8w8_scale_raw(
-    x: torch.Tensor,
-    wo_a: torch.Tensor,
-    Y: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-) -> torch.Tensor: ...
-
-
-@compile_ops(
-    "module_deepgemm_opus",
-    fc_name="opus_bmm_a8w8_mxscale",
-    gen_fake=_gen_bmm_a8w8_scale_fake_tensors,
-    develop=True,
-)
-def _opus_bmm_a8w8_mxscale_raw(
-    x: torch.Tensor,
-    wo_a: torch.Tensor,
-    Y: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    kernelId: int = 710,
-) -> torch.Tensor: ...
-
-
-@compile_ops(
-    "module_deepgemm_opus",
-    fc_name="opus_bmm_a8w8_mxscale_splitk",
-    gen_fake=_gen_bmm_a8w8_scale_fake_tensors,
-    develop=True,
-)
-def _opus_bmm_a8w8_mxscale_splitk_raw(
-    x: torch.Tensor,
-    wo_a: torch.Tensor,
-    Y: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    splitK: int = 8,
-) -> torch.Tensor: ...
-
-
+# mmajor fp8 e8m0 mxscale (block-scale) BMM: x/Y are [M, batch, *] (dim0=M,
+# dim1=batch), x_scale [M, batch, K/GROUP_K] (per-token M); wo_a + w_scale stay
+# batch-major. Zero-copy DSV4 wo_a fp8 (no caller-side transpose). kid-dispatched
+# 4-wave flatmm split-K; this is the only live BMM raw binding (driven by
+# bmm_a8w8_mxscale_opus below).
 @compile_ops(
     "module_deepgemm_opus",
     fc_name="opus_bmm_a8w8_mxscale_flatmm_splitk",
@@ -164,7 +119,20 @@ def _load_mxscale_bmm_config() -> dict:
 
 
 def _lookup_mxscale_bmm(g: int, m: int, n: int, k: int):
-    cfg = _load_mxscale_bmm_config().get((_get_gfx(), g, m, n, k))
+    gfx = _get_gfx()
+    cfg = _load_mxscale_bmm_config().get((gfx, g, m, n, k))
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    if cfg is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"shape is G:{g}, M:{m}, N:{n}, K:{k}, is tuned on gfx = {gfx} in "
+                f"{tuned_file}, kernelId is {cfg['kernelId']}, splitK is {cfg['splitK']}!"
+            )
+    else:
+        logger.info(
+            f"shape is G:{g}, M:{m}, N:{n}, K:{k}, not found tuned config in "
+            f"{tuned_file}, will use heuristic/M-split fallback!"
+        )
     return cfg  # None on miss
 
 
@@ -294,8 +262,5 @@ def bmm_a8w8_mxscale_opus(
 
 __all__ = [
     "_opus_bmm_a8w8_mxscale_flatmm_splitk_raw",
-    "_opus_bmm_a8w8_mxscale_raw",
-    "_opus_bmm_a8w8_mxscale_splitk_raw",
-    "_opus_bmm_a8w8_scale_raw",
     "bmm_a8w8_mxscale_opus",
 ]

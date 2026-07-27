@@ -135,7 +135,7 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
 # fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
 # (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
 # future fp32 rowwise-scale variant lands in a separate CSV and never collides
-# on key. Each row also carries a `scale` column for self-description. The
+# on key. The scale type is identified by the filename alone. The
 # per-model tuned data currently lives under model_configs/ (e.g.
 # dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
 # get_config_file; this canonical path may not exist on disk.

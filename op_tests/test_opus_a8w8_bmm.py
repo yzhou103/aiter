@@ -237,7 +237,7 @@ def main():
         "--groups",
         type=int,
         nargs="*",
-        default=[2],
+        default=[2, 8],
         help="batch group counts to sweep (DSV4 wo_a G; default: 2)",
     )
     parser.add_argument(

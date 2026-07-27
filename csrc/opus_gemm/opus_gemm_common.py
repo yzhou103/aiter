@@ -101,6 +101,25 @@ class OpusGemmInstance:
     # consumer instead of a per-K-tile global buffer_load. Maps to the kernel's
     # 5th template bool PRELOAD_SF_LDS.
     preload_sf: bool = False
+    # a8w8_mxscale BMM specialized-pipeline axis (minterleave / mouter /
+    # mouter_tunable / wave4m2_selfload families). Maps to the kernel's trailing
+    # `bool SKIP_SCALE_WAIT` template param: skip the s_waitcnt on the per-K-tile
+    # scale load (the scale is issued a tile ahead), trading a correctness margin
+    # for pipeline overlap. Drives both the launcher body and the device
+    # instantiation set for the kid.
+    skip_scale_wait: bool = False
+    # a8w8_mxscale BMM nphase family: N_PHASES int template param (consumers
+    # sweep N_PHASES * B_N logical columns per WG). 1 = N/A.
+    n_phases: int = 1
+    # a8w8_mxscale BMM wave4m2_selfload family extra bool axis (kernel template
+    # order: <Traits, D_OUT, SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND>).
+    pack_scale_on_demand: bool = False
+    # a8w8_mxscale BMM pipeline family (kids 150/151/152/157): dual bf16/fp32
+    # traits + one of four gemm_a8w8_scale_* kernels selected by these flags
+    # (all-false = plain scale kernel).
+    k1024_only: bool = False
+    k1024_lb1: bool = False
+    preload_sfa_lds: bool = False
     # Symbol root ("opus_gemm" for GEMM, "opus_bmm" for the batched frontends).
     name_root: str = "opus_gemm"
 
@@ -127,6 +146,47 @@ class OpusGemmInstance:
                 parts.append("scaleprefetch")
             if self.preload_sf:
                 parts.append("sfpreload")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_minterleave":
+            # opus_bmm_a8w8_mxscale_flatmm_minterleave_<geom>_wgpcu{N}[_skip_scale_wait]
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_minterleave")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.skip_scale_wait:
+                parts.append("skip_scale_wait")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_fused":
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_fused")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline":
+            parts.insert(tag_at, "a8w8_mxscale_pipeline")
+            if self.k1024_only:
+                parts.append("k1024")
+            elif self.k1024_lb1:
+                parts.append("k1024lb1")
+            elif self.preload_sfa_lds:
+                parts.append("preload_sfa")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_mouter":
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_mouter")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.skip_scale_wait:
+                parts.append("ssw")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_mouter_tunable":
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_mouter_tunable")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.skip_scale_wait:
+                parts.append("ssw")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_nphase":
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_nphase")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            parts.append(f"nph{self.n_phases}")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_wave8n2":
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_wave8n2")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_wave4m2_selfload":
+            parts.insert(tag_at, "a8w8_mxscale_flatmm_wave4m2_selfload")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.skip_scale_wait:
+                parts.append("ssw")
+            if self.pack_scale_on_demand:
+                parts.append("psod")
         elif self.kernel_tag == "a16w16_flatmm":
             parts.insert(tag_at, "flatmm")
             parts.append(f"wgpcu{self.WG_PER_CU}")
@@ -267,19 +327,20 @@ def _a16w16_flatmm(bm, bn, bk, wg_per_cu):
 # fmt: off
 # --- per-pipeline kernel instance lists ---
 a8w8_scale_kernels_list = {
+    # kid 1 (256x256) is the launcher hardcoded by opus_gemm.cu's
+    # opus_dispatch_scale (the only a8w8_scale GEMM path). The 128x256 sibling
+    # kid 720 was removed below.
     1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
-    # 128x256 variant used by the fp8 block-scale BMM mmajor path
-    # (opus_bmm_a8w8_scale). 128 B_M -> 2x the output tiles -> fills more
-    # CUs on the batched wo_a shape; B_N stays 256 (GROUP_N=128 requires
-    # HALF_B_N>=128). bf16 + fp32 outputs (direct-store BMM writes bf16 Y).
-    720: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["bf16_t", "fp32_t"]),
 }
 
-a8w8_mxscale_kernels_list = {
-    710: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_mxscale", ["bf16_t", "fp32_t"]),
-}
-for _inst in a8w8_mxscale_kernels_list.values():
-    _inst.name_tag = "a8w8_mxscale"
+# Dead 128x256 scale GEMM tiles removed (no CSV/dispatch caller):
+#   - kid 720 (a8w8_scale, fp32 block-scale): only consumer was the removed
+#     opus_bmm_a8w8_scale mmajor path.
+#   - kid 710 (a8w8_mxscale, e8m0 block-scale): only consumer was the opus_bmm
+#     kid 149 hand-written adapter (via the _mmajor sibling), now replaced by
+#     the BMM-native a8w8_mxscale_bmm_pipeline 128x256 instance.
+# Both were the same gemm_a8w8_scale_kernel specialization, differing only in
+# scale dtype; opus_dispatch_scale still uses the 256x256 kid 1 above.
 
 
 def _a8w8_mxscale_bmm_flatmm_splitk(
@@ -415,6 +476,157 @@ a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
     kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
+
+
+def _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg_per_cu, skip_scale_wait=False):
+    """fp8 e8m0 mxscale BATCHED matmul M-tile-interleaved tile.
+
+    Backs opus_bmm_a8w8_mxscale_flatmm_splitk() kids 162/163. The main kernel
+    (gemm_a8w8_mxscale_flatmm_minterleave_kernel<Traits, D_OUT, SKIP_SCALE_WAIT>)
+    processes MI=2 consecutive M tiles per WG (baked in the launcher, requires
+    M % (MI*B_M) == 0); splitK is unused (must be 1). Same locked geometry /
+    traits as the flatmm split-K family (BLOCK_SIZE=256, T_M=2/T_N=1, MFMA
+    16x16x128, VEC=(16,16,4), GROUP=(1,128,128), fp32 workspace tuple slot).
+    """
+    t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE
+        bm, bn, bk,     # BLOCK tile
+        t_m, t_n,       # T_M, T_N (name only)
+        16, 16, 128,    # W_M, W_N, W_K (name only)
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        "a8w8_mxscale_bmm_minterleave",
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.skip_scale_wait = skip_scale_wait
+    return inst
+
+
+# fp8 e8m0 mxscale BMM M-tile-interleaved tiles (kids 162/163). Fixed geometry
+# m128n128k128 wg1; the only axis is SKIP_SCALE_WAIT.
+_BMM_MXSCALE_MINTERLEAVE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, skip_scale_wait)
+    162: (128, 128, 128, 1, False),
+    163: (128, 128, 128, 1, True),   # skip per-K-tile scale s_waitcnt
+}
+a8w8_mxscale_bmm_minterleave_kernels_list = {
+    kid: _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg, skip)
+    for kid, (bm, bn, bk, wg, skip) in _BMM_MXSCALE_MINTERLEAVE_TILES.items()
+}
+
+
+def _a8w8_mxscale_bmm_spec(tag, bm, bn, bk, wg_per_cu, **flags):
+    """Generic fp8 e8m0 mxscale BMM specialized-pipeline tile builder.
+
+    Same locked geometry/traits family as the flatmm split-K kids (BLOCK_SIZE
+    256, MFMA 16x16x128, VEC=(16,16,4), GROUP=(1,128,128), fp32 workspace tuple
+    slot). `tag` selects the kernel family (nphase / wave8n2 /
+    wave4m2_selfload); `flags` sets the family's compile-time axes.
+    """
+    t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    inst = OpusGemmInstance(
+        256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4, 1, 128, 128,
+        tag, ["fp32_t"], wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    for key, val in flags.items():
+        setattr(inst, key, val)
+    return inst
+
+
+# fused (kid 100): the only fused-reduce path (splitK counter variant). Same
+# 256x32x128x128 wg2 traits as standard kid 0/32, so its device symbols resolve
+# to the standard family's TUs -> host-only launcher emit.
+a8w8_mxscale_bmm_fused_kernels_list = {
+    100: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_fused", 32, 128, 128, 2),
+}
+
+# pipeline (kids 149/150/151/152/157): BLOCK_SIZE 512, m{128,256}n256k128, dual
+# bf16/fp32 traits (output dtype baked into the traits tuple), non-splitk scale
+# kargs. One of four gemm_a8w8_scale_* kernels selected by flags. The wave
+# layout (T_M/T_N/W_*) is derived inside opus_gemm_a8w8_scale_traits_gfx950 from
+# BLOCK + <B_M,B_N,B_K>, so only B_M/B_N/B_K matter here (the T_M/T_N passed to
+# OpusGemmInstance are cosmetic for this tag).
+def _a8w8_mxscale_bmm_pipeline(**flags):
+    inst = OpusGemmInstance(
+        512, 256, 256, 128, 2, 1, 16, 16, 128, 16, 16, 4, 1, 128, 128,
+        "a8w8_mxscale_bmm_pipeline", ["fp32_t"], 1,
+    )
+    inst.name_root = "opus_bmm"
+    for key, val in flags.items():
+        setattr(inst, key, val)
+    return inst
+
+
+a8w8_mxscale_bmm_pipeline_kernels_list = {
+    # kid 149: B_M=128 plain scale pipeline (m128n256k128). Same gemm_a8w8_scale_
+    # kernel as kid 150, just half the M tile -> 2x output tiles -> fills more CUs
+    # on batched wo_a shapes. Was a hand-written cross-module adapter delegating
+    # to opus_gemm's a8w8_mxscale GEMM launcher; now BMM-native codegen.
+    149: _a8w8_mxscale_bmm_pipeline(B_M=128),
+    150: _a8w8_mxscale_bmm_pipeline(),
+    151: _a8w8_mxscale_bmm_pipeline(k1024_only=True),
+    152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
+    157: _a8w8_mxscale_bmm_pipeline(preload_sfa_lds=True),
+}
+
+# mouter (kids 131/144) + mouter_tunable (kids 160/161): wg1 m128n128k128,
+# 1 bool axis <SKIP_SCALE_WAIT>. Both share gemm_..._mouter_kernel, so the
+# tunable variant reuses the mouter device instantiations (host-only emit).
+a8w8_mxscale_bmm_mouter_kernels_list = {
+    131: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
+    144: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1, skip_scale_wait=True),
+}
+a8w8_mxscale_bmm_mouter_tunable_kernels_list = {
+    160: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1),
+    161: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1, skip_scale_wait=True),
+}
+
+# nphase (kid 129): m64n128k128 wg2, N_PHASES=2 (logical B_N = 128*2 = 256).
+a8w8_mxscale_bmm_nphase_kernels_list = {
+    129: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_nphase", 64, 128, 128, 2, n_phases=2),
+}
+
+# wave8n2 (kid 132): wg1 m128n128k128, no compile-time flags (logical B_N = 256).
+a8w8_mxscale_bmm_wave8n2_kernels_list = {
+    132: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_wave8n2", 128, 128, 128, 1),
+}
+
+# wave4m2_selfload (kids 134/142/148): wg1 m128n128k128, 2 bool axes
+# <SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND> (logical B_M = 128*2 = 256).
+_BMM_WAVE4M2_TILES = {
+    #   (ssw,   psod)
+    134: (False, False),
+    142: (True,  False),
+    148: (True,  True),
+}
+a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = {
+    kid: _a8w8_mxscale_bmm_spec(
+        "a8w8_mxscale_bmm_wave4m2_selfload", 128, 128, 128, 1,
+        skip_scale_wait=ssw, pack_scale_on_demand=psod,
+    )
+    for kid, (ssw, psod) in _BMM_WAVE4M2_TILES.items()
+}
+
+# All name-keyed a8w8_mxscale BMM kernel families (gfx950-only). Kept as a tuple
+# of the per-family kid-keyed dicts -- NOT merged into one dict, because int kids
+# repeat across families and are deduped downstream by launcher NAME (see
+# gen_instances.py). Single source of truth for both consumers there: the codegen
+# kdict merge and the BMM int-kid tune-lookup emitter.
+a8w8_mxscale_bmm_kernel_lists = (
+    a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
+    a8w8_mxscale_bmm_fused_kernels_list,
+    a8w8_mxscale_bmm_minterleave_kernels_list,
+    a8w8_mxscale_bmm_mouter_kernels_list,
+    a8w8_mxscale_bmm_mouter_tunable_kernels_list,
+    a8w8_mxscale_bmm_nphase_kernels_list,
+    a8w8_mxscale_bmm_pipeline_kernels_list,
+    a8w8_mxscale_bmm_wave8n2_kernels_list,
+    a8w8_mxscale_bmm_wave4m2_selfload_kernels_list,
+)
 
 
 a8w8_kernels_list = {
@@ -1193,7 +1405,6 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
-    **a8w8_mxscale_kernels_list,
     **a8w8_kernels_list,
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,

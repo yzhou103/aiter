@@ -29,8 +29,7 @@ from opus_gemm_common import (
     HEURISTIC_DEFAULT_KIDS,
     OpusGemmInstance,
     a8w8_kernels_list,
-    a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
-    a8w8_mxscale_kernels_list,
+    a8w8_mxscale_bmm_kernel_lists,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
@@ -142,6 +141,14 @@ INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_flatmm_splitk": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_fused": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_minterleave": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_mouter": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_mouter_tunable": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_nphase": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_pipeline": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_wave8n2": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
@@ -181,10 +188,40 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     # host TU must forward-declare all four template params so the launcher body
     # (which launches gemm_a8w8_mxscale_flatmm_splitk_kernel<Traits, D_OUT, dir,
     # pfk>) compiles without pulling in the device pipeline header.
-    if kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk":
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+    ):
         return (
             "",
             ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE, bool PRELOAD_SF_LDS",
+            kargs_name,
+        )
+    # BMM M-tile-interleaved kernel: <Traits, D_OUT, bool SKIP_SCALE_WAIT>. The
+    # fused host TU must forward-declare all three template params so the launcher
+    # body's gemm_a8w8_mxscale_flatmm_minterleave_kernel<Traits, D_OUT, skip>
+    # <<<...>>> call compiles without the device pipeline header.
+    if kernel_tag == "a8w8_mxscale_bmm_minterleave":
+        return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
+    # BMM specialized pipelines: forward-declare the exact kernel template params
+    # so the fused host TU's <<<...>>> call compiles against only the traits header.
+    if kernel_tag == "a8w8_mxscale_bmm_pipeline":
+        # scale-pipeline kernels are templated on a single Traits (output dtype is
+        # baked into the traits tuple) -> no extra template params.
+        return "", "", kargs_name
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_mouter",
+        "a8w8_mxscale_bmm_mouter_tunable",
+    ):
+        return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
+    if kernel_tag == "a8w8_mxscale_bmm_nphase":
+        return "", ", typename D_OUT, int N_PHASES", kargs_name
+    if kernel_tag == "a8w8_mxscale_bmm_wave8n2":
+        return "", ", typename D_OUT", kargs_name
+    if kernel_tag == "a8w8_mxscale_bmm_wave4m2_selfload":
+        return (
+            "",
+            ", typename D_OUT, bool SKIP_SCALE_WAIT, bool PACK_SCALE_ON_DEMAND",
             kargs_name,
         )
     # Paired W3 kernels: fn arg 'Kargs' so deduction keeps host/device mangling.
@@ -683,11 +720,15 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
+        # The specialized-pipeline families (minterleave, ...) share the same
+        # int-kid -> launcher map and uniform launcher signature; concatenate
+        # their kid-keyed source lists so every kid keeps its historical number.
         def _emit_map(f, macro_name, ctype):
             f.write(f"#define {macro_name}(CTYPE) \\\n")
             rows = [
                 (kid, k.name)
-                for kid, k in a8w8_mxscale_bmm_flatmm_splitk_kernels_list.items()
+                for kernels in a8w8_mxscale_bmm_kernel_lists
+                for kid, k in kernels.items()
                 if ctype in k.output_dtypes
             ]
             rows.sort(key=lambda row: row[0])
@@ -761,7 +802,17 @@ void
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
             for k in kernels_dict.values():
-                if k.kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk":
+                if k.kernel_tag in (
+                    "a8w8_mxscale_bmm_flatmm_splitk",
+                    "a8w8_mxscale_bmm_fused",
+                    "a8w8_mxscale_bmm_minterleave",
+                    "a8w8_mxscale_bmm_mouter",
+                    "a8w8_mxscale_bmm_mouter_tunable",
+                    "a8w8_mxscale_bmm_nphase",
+                    "a8w8_mxscale_bmm_pipeline",
+                    "a8w8_mxscale_bmm_wave8n2",
+                    "a8w8_mxscale_bmm_wave4m2_selfload",
+                ):
                     f.write(MANIFEST_BMM_MXSCALE_SPLITK.format(kernel_name=k.name))
                 elif k.kernel_tag in A16W16_TUNE_TAGS:
                     f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
@@ -1120,7 +1171,6 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
     TAG_TO_LIST = {
         "a8w8_scale": a8w8_scale_kernels_list,
-        "a8w8_mxscale": a8w8_mxscale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
@@ -1238,7 +1288,6 @@ if __name__ == "__main__":
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.
     if target_arches is None or "gfx950" in target_arches:
         S |= set(a8w8_scale_kernels_list.keys())
-        S |= set(a8w8_mxscale_kernels_list.keys())
         S |= set(a8w8_kernels_list.keys())
 
     # Honor --kernel_tag as a developer override that *further restricts* the set (within the a16w16
@@ -1250,7 +1299,6 @@ if __name__ == "__main__":
             S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
             if target_arches is None or "gfx950" in target_arches:
                 S |= set(a8w8_scale_kernels_list.keys())
-                S |= set(a8w8_mxscale_kernels_list.keys())
                 S |= set(a8w8_kernels_list.keys())
 
     # Heuristic-fallback invariant (single source of truth: opus_gemm_common.py).
@@ -1277,8 +1325,9 @@ if __name__ == "__main__":
     # (e.g. switch kids 0 and 32 -> one launcher symbol). Always emitted (like
     # a8w8_mxscale) so the opus_bmm dispatch never hits a missing symbol.
     if target_arches is None or "gfx950" in target_arches:
-        for _bmm_k in a8w8_mxscale_bmm_flatmm_splitk_kernels_list.values():
-            kdict[_bmm_k.name] = _bmm_k
+        for _bmm_list in a8w8_mxscale_bmm_kernel_lists:
+            for _bmm_k in _bmm_list.values():
+                kdict[_bmm_k.name] = _bmm_k
 
     print(
         f"[opus gen_instances] subset compile: |S|={len(S)} kids "
