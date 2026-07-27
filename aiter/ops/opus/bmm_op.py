@@ -24,8 +24,18 @@ def _gen_bmm_a8w8_scale_fake_tensors(
     Y: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-) -> torch.Tensor:
-    return Y
+    splitK: int = 2,
+    kernelId: int = 0,
+) -> None:
+    # This op writes its result into ``Y`` in place and returns nothing (the
+    # C++ ``opus_bmm_a8w8_mxscale_flatmm_splitk`` is void). The fake must mirror
+    # that exactly -- full arg list (incl. the splitK/kernelId ints) and a None
+    # return -- so the op is registered as an in-place mutation of ``Y`` and is
+    # traceable under torch.compile. Returning a Tensor here (or omitting the
+    # int args) makes inductor expect a tensor output and it fails at runtime
+    # with "expected Tensor()" when the DSV4 wo_a path calls it in a compiled
+    # region.
+    return None
 
 
 # mmajor fp8 e8m0 mxscale (block-scale) BMM: x/Y are [M, batch, *] (dim0=M,
@@ -47,7 +57,12 @@ def _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
     w_scale: torch.Tensor,
     splitK: int = 2,
     kernelId: int = 0,
-) -> torch.Tensor: ...
+) -> None:
+    # In-place: result is written into ``Y``; no return value (the C++ kernel is
+    # void). Declared ``-> None`` so torch.library registers it as a mutating op
+    # (not a tensor-producing one), which keeps it torch.compile-safe. Callers
+    # (bmm_a8w8_mxscale_opus, op tests) read ``Y`` and ignore the return.
+    ...
 
 
 # ---- Shape-driven mxscale flatmm BMM (CSV lookup + heuristic fallback) -----
