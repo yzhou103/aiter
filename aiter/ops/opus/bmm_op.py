@@ -214,30 +214,34 @@ def bmm_a8w8_mxscale_opus(
             kernelId = int(cfg["kernelId"])
             if splitK is None:
                 splitK = int(cfg["splitK"])
-        elif (
-            splitK is None
-            and g >= 8
-            and n % 256 == 0
-            and k % 128 == 0
-            and m >= 1024
-            and m % 256 != 0
-        ):
-            # High-g large tile-unaligned M: strong large-M tiles (157/150) win
-            # here but need M % 256 == 0, so split into an aligned bulk (strong
-            # tile) + a <256-row OOB-safe remainder. Zero-copy dim0 views. For
-            # low g the strong tiles never win, so we fall through to the
-            # sub-tile heuristic (653) on the full real M instead.
-            m_bulk = (m // 256) * 256
-            bulk_kid = 157 if k >= 4096 else 150
-            tail_kid = _heuristic_mxscale_kid(g, m - m_bulk, n, k)
-            _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
-                x[:m_bulk], wo_a, Y[:m_bulk], x_scale[:m_bulk], w_scale, 1, bulk_kid
-            )
-            _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
-                x[m_bulk:], wo_a, Y[m_bulk:], x_scale[m_bulk:], w_scale, 1, tail_kid
-            )
-            return Y
         else:
+            # No usable tuned config -> heuristic fallback path. For large tile-
+            # unaligned M, the strong large-M tiles (157/150) win big but need
+            # M % 256 == 0, so split into an aligned bulk (strong tile) + a
+            # <256-row OOB-safe remainder (zero-copy dim0 views). The win is
+            # gated on total bulk work g*m, not g alone: measured break-even is
+            # g*m ~= 8192 (below it the extra kernel launch + tiny tail make the
+            # full-M sub-tile faster; e.g. g=1 m=4100 is 0.76x, but g=1 m=16100
+            # is 1.87x and g>=2 wins from ~m=4k). Below the gate we use a single
+            # sub-tile heuristic kid (653) on the full real M instead.
+            if (
+                splitK is None
+                and n % 256 == 0
+                and k % 128 == 0
+                and m >= 512
+                and m % 256 != 0
+                and g * m >= 8192
+            ):
+                m_bulk = (m // 256) * 256
+                bulk_kid = 157 if k >= 4096 else 150
+                tail_kid = _heuristic_mxscale_kid(g, m - m_bulk, n, k)
+                _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+                    x[:m_bulk], wo_a, Y[:m_bulk], x_scale[:m_bulk], w_scale, 1, bulk_kid
+                )
+                _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+                    x[m_bulk:], wo_a, Y[m_bulk:], x_scale[m_bulk:], w_scale, 1, tail_kid
+                )
+                return Y
             kernelId = _heuristic_mxscale_kid(g, m, n, k)
     if splitK is None:
         splitK = 1
