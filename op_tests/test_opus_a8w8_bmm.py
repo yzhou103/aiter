@@ -21,7 +21,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_flatmm_splitk_raw
+from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -101,7 +101,7 @@ def test_mxscale_bmm(g, m, n, k, dtype):
 
     def _call(kid):
         Y = torch.empty(y_shape, dtype=ydt)
-        _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
+        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
         return Y
 
     candidates = {}
@@ -177,9 +177,7 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
         # Batch-major output buffer; hand the kernel its [m, g, n] view so the
         # store lands at Y.stride(1) (batch) = m*n (outermost), N contiguous.
         Yb = torch.empty((g, m, n), dtype=ydt)
-        _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
-            O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, 1, kid
-        )
+        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, 1, kid)
         return Yb  # [g, m, n]
 
     def _call_auto():

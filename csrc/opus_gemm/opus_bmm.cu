@@ -56,7 +56,7 @@ using OpusBmmMxscaleFlatmmSplitkKernel = void (*)(
 // GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32 macro; unknown / untuned kids
 // fall back to the 32x128x128 wg2 baseline.
 static opus_bmm_detail::OpusBmmMxscaleFlatmmSplitkKernel
-opus_bmm_a8w8_mxscale_flatmm_splitk_tune_dispatch(int id)
+opus_bmm_a8w8_mxscale_tune_dispatch(int id)
 {
   using namespace opus_bmm_detail;
   static const std::unordered_map<int, OpusBmmMxscaleFlatmmSplitkKernel> kTune = {
@@ -69,7 +69,7 @@ opus_bmm_a8w8_mxscale_flatmm_splitk_tune_dispatch(int id)
 }
 #endif  // OPUS_BUILD_HAS_GFX950
 
-void opus_bmm_a8w8_mxscale_flatmm_splitk(
+void opus_bmm_a8w8_mxscale(
     aiter_tensor_t &O,
     aiter_tensor_t &wo_a,
     aiter_tensor_t &Y,
@@ -82,21 +82,21 @@ void opus_bmm_a8w8_mxscale_flatmm_splitk(
   // launchers (which omit these to stay lean) and the fused kid 100 wrapper share
   // one check. The _impl still re-checks internally (idempotent).
   opus_bmm_a8w8_common_checks(O, wo_a, Y,
-                              "opus_bmm_a8w8_mxscale_flatmm_splitk");
+                              "opus_bmm_a8w8_mxscale");
 #ifndef OPUS_BUILD_HAS_GFX950
   AITER_CHECK(false,
-              "opus_bmm_a8w8_mxscale_flatmm_splitk requires "
+              "opus_bmm_a8w8_mxscale requires "
               "OPUS_BUILD_HAS_GFX950");
 #else
   {
     const auto &arch_info = opus_get_arch_info();
     AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
-                "opus_bmm_a8w8_mxscale_flatmm_splitk is gfx950-only; "
+                "opus_bmm_a8w8_mxscale is gfx950-only; "
                 "current device ", arch_info.dev, " has gcnArchName='",
                 arch_info.name, "'");
   }
   // Single table lookup instead of a ~40-case switch (see opus_gemm.cu).
-  opus_bmm_a8w8_mxscale_flatmm_splitk_tune_dispatch(kernelId)(
+  opus_bmm_a8w8_mxscale_tune_dispatch(kernelId)(
       O, wo_a, Y, x_scale, w_scale, splitK);
 #endif  // OPUS_BUILD_HAS_GFX950
 }

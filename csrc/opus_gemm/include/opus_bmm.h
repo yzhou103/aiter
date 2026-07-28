@@ -11,10 +11,10 @@
 // *], wo_a/w_scale batch-major. Y dtype in {fp32, bf16}. dim0=M, dim1=batch (K
 // contiguous); the batch axis memory position is otherwise free (see host
 // stride checks). kid-dispatched; driven by bmm_a8w8_mxscale_opus (Python).
-void opus_bmm_a8w8_mxscale_flatmm_splitk(aiter_tensor_t& O,
-                                         aiter_tensor_t& wo_a,
-                                         aiter_tensor_t& Y,
-                                         aiter_tensor_t& x_scale,
-                                         aiter_tensor_t& w_scale,
-                                         int splitK,
-                                         int kernelId);
+void opus_bmm_a8w8_mxscale(aiter_tensor_t& O,
+                           aiter_tensor_t& wo_a,
+                           aiter_tensor_t& Y,
+                           aiter_tensor_t& x_scale,
+                           aiter_tensor_t& w_scale,
+                           int splitK,
+                           int kernelId);

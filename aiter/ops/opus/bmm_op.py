@@ -39,11 +39,11 @@ def _gen_bmm_a8w8_scale_fake_tensors(
 # bmm_a8w8_mxscale_opus below.
 @compile_ops(
     "module_deepgemm_opus",
-    fc_name="opus_bmm_a8w8_mxscale_flatmm_splitk",
+    fc_name="opus_bmm_a8w8_mxscale",
     gen_fake=_gen_bmm_a8w8_scale_fake_tensors,
     develop=True,
 )
-def _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+def _opus_bmm_a8w8_mxscale_raw(
     x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
@@ -235,10 +235,10 @@ def bmm_a8w8_mxscale_opus(
                 m_bulk = (m // 256) * 256
                 bulk_kid = 157 if k >= 4096 else 150
                 tail_kid = _heuristic_mxscale_kid(g, m - m_bulk, n, k)
-                _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+                _opus_bmm_a8w8_mxscale_raw(
                     x[:m_bulk], wo_a, Y[:m_bulk], x_scale[:m_bulk], w_scale, 1, bulk_kid
                 )
-                _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
+                _opus_bmm_a8w8_mxscale_raw(
                     x[m_bulk:], wo_a, Y[m_bulk:], x_scale[m_bulk:], w_scale, 1, tail_kid
                 )
                 return Y
@@ -246,13 +246,11 @@ def bmm_a8w8_mxscale_opus(
     if splitK is None:
         splitK = 1
 
-    _opus_bmm_a8w8_mxscale_flatmm_splitk_raw(
-        x, wo_a, Y, x_scale, w_scale, int(splitK), int(kernelId)
-    )
+    _opus_bmm_a8w8_mxscale_raw(x, wo_a, Y, x_scale, w_scale, int(splitK), int(kernelId))
     return Y
 
 
 __all__ = [
-    "_opus_bmm_a8w8_mxscale_flatmm_splitk_raw",
+    "_opus_bmm_a8w8_mxscale_raw",
     "bmm_a8w8_mxscale_opus",
 ]

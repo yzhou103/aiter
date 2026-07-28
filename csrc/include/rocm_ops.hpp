@@ -298,11 +298,11 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
-#define OPUS_BMM_A8W8_MXSCALE_FLATMM_SPLITK_PYBIND \
-    m.def("opus_bmm_a8w8_mxscale_flatmm_splitk",   \
-          &opus_bmm_a8w8_mxscale_flatmm_splitk,    \
-          "mmajor fp8 block-scale BMM with native e8m0 "  \
-          "scaled MFMA, 4-wave flatmm split-K workspace/reduce", \
+#define OPUS_BMM_A8W8_MXSCALE_PYBIND \
+    m.def("opus_bmm_a8w8_mxscale",   \
+          &opus_bmm_a8w8_mxscale,    \
+          "mmajor fp8 e8m0 mxscale (block-scale) BMM with native "  \
+          "scaled MFMA; kid-dispatched flatmm split-K backend", \
           py::arg("O"),                                  \
           py::arg("wo_a"),                               \
           py::arg("Y"),                                  \

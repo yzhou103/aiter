@@ -711,7 +711,7 @@ class opus_gemm_codegen:
 // Auto-generated. Do not edit. See gen_instances.py:gen_bmm_mxscale_tune_lookup.
 //
 // fp32-workspace flat map for a8w8_mxscale BMM flatmm split-K tuning (gfx950).
-// See opus_bmm.cu opus_bmm_a8w8_mxscale_flatmm_splitk_tune_dispatch().
+// See opus_bmm.cu opus_bmm_a8w8_mxscale_tune_dispatch().
 """
         entry = """\
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\

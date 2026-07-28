@@ -341,7 +341,7 @@ def _a8w8_mxscale_bmm_flatmm_splitk(
 ):
     """fp8 e8m0 mxscale BATCHED matmul flatmm split-K tile.
 
-    Backs opus_bmm_a8w8_mxscale_flatmm_splitk(); the main kernel
+    Backs opus_bmm_a8w8_mxscale(); the main kernel
     (gemm_a8w8_mxscale_flatmm_splitk_kernel) writes an fp32 workspace and a
     shared reduce kernel casts to the Y dtype (bf16/fp32), so output_dtypes is
     fp32 workspace here. Locked geometry (matches the hand-written traits in
@@ -474,7 +474,7 @@ a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
 def _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg_per_cu, skip_scale_wait=False):
     """fp8 e8m0 mxscale BATCHED matmul M-tile-interleaved tile.
 
-    Backs opus_bmm_a8w8_mxscale_flatmm_splitk() kids 162/163. The main kernel
+    Backs opus_bmm_a8w8_mxscale() kids 162/163. The main kernel
     (gemm_a8w8_mxscale_flatmm_minterleave_kernel<Traits, D_OUT, SKIP_SCALE_WAIT>)
     processes MI=2 consecutive M tiles per WG (baked in the launcher, requires
     M % (MI*B_M) == 0); splitK is unused (must be 1). Same locked geometry /
