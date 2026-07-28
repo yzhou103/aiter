@@ -95,10 +95,10 @@ def _mxscale_bmm_buckets() -> dict:
     (g,n,k) family instead of a g-agnostic global rule.
     """
     buckets: dict = {}
-    for gfx, g, m, n, k in _load_mxscale_bmm_config().keys():
+    for gfx, g, m, n, k in _load_mxscale_bmm_config():
         buckets.setdefault((gfx, g, n, k), []).append(m)
-    for key in buckets:
-        buckets[key].sort()
+    for ms in buckets.values():
+        ms.sort()
     return buckets
 
 

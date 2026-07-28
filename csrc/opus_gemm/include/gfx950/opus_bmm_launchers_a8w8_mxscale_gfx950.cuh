@@ -6,8 +6,10 @@
 // per-kid host launchers are now fully codegen'd (impl/*.cuh, compiled in
 // all_instances_host_gfx950.cu) as inlined template functions, mirroring the
 // opus_gemm module. The old hand-written `*_impl` launcher templates that used
-// to live here have been removed; only the common shape/dtype check and the
-// device-kernel forward declarations remain. Host pass only.
+// to live here have been removed; only the common shape/dtype check remains.
+// The device-kernel definitions are provided by the flatmm split-K pipeline
+// header (included ahead of this one in opus_bmm.cu), so no forward
+// declarations are needed here. Host pass only.
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "opus_bmm.h"
@@ -17,18 +19,6 @@
 #include "aiter_stream.h"
 
 #include <optional>
-
-#ifdef OPUS_BUILD_HAS_GFX950
-template<typename Traits, typename D_OUT, bool DIRECT_ONLY>
-__global__ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
-template<typename Traits, typename D_OUT>
-__global__ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
-template<typename Traits, typename D_OUT>
-__global__ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
-template<typename Traits, typename D_OUT, bool SKIP_SCALE_WAIT,
-         bool PACK_SCALE_ON_DEMAND>
-__global__ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs);
-#endif
 
 static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
                                         aiter_tensor_t &Y, const char *who)
