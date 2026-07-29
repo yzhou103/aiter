@@ -111,12 +111,15 @@ class OpusGemmInstance:
     # a8w8_mxscale BMM wave4m2_selfload family extra bool axis (kernel template
     # order: <Traits, D_OUT, SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND>).
     pack_scale_on_demand: bool = False
-    # a8w8_mxscale BMM pipeline family (kids 150/151/152/157): dual bf16/fp32
-    # traits + one of four gemm_a8w8_scale_* kernels selected by these flags
+    # a8w8_mxscale BMM pipeline family (kids 150/151/152): dual bf16/fp32
+    # traits + one of the gemm_a8w8_scale_* kernels selected by these flags
     # (all-false = plain scale kernel).
     k1024_only: bool = False
     k1024_lb1: bool = False
-    preload_sfa_lds: bool = False
+    # a8w8_mxscale BMM pipeline family (kid158): preload BOTH SFA (per-token) and
+    # SFB (block) scale panels into LDS. Maps to the pipeline kernel
+    # gemm_a8w8_scale_preload_sf_kernel.
+    preload_sf_lds: bool = False
     # Symbol root ("opus_gemm" for GEMM, "opus_bmm" for the batched frontends).
     name_root: str = "opus_gemm"
 
@@ -158,8 +161,8 @@ class OpusGemmInstance:
                 parts.append("k1024")
             elif self.k1024_lb1:
                 parts.append("k1024lb1")
-            elif self.preload_sfa_lds:
-                parts.append("preload_sfa")
+            elif self.preload_sf_lds:
+                parts.append("preload_sf")
         elif self.kernel_tag == "a8w8_mxscale_bmm_mouter":
             parts.insert(tag_at, "a8w8_mxscale_flatmm_mouter")
             parts.append(f"wgpcu{self.WG_PER_CU}")
@@ -376,74 +379,48 @@ def _a8w8_mxscale_bmm_flatmm_splitk(
     return inst
 
 
-# fp8 e8m0 mxscale BMM flatmm split-K tiles. kid numbers preserved from the
-# hand-written opus_bmm.cu switch so existing tuned CSVs / heuristics keep
-# working. Each kid = (B_M, B_N, B_K, WG_PER_CU, direct_only, prefetch_scale).
-# The specialized big-tile pipelines (mouter / minterleave / wave*n* /
-# pipeline, kids 131/132/134/140-163/149/150-152) stay monolithic in
-# opus_bmm.cu for now and are NOT migrated here.
+# fp8 e8m0 mxscale BMM flatmm split-K tiles. kid numbers preserved from the old
+# opus_bmm.cu switch so existing tuned CSVs / heuristics keep working. Each kid =
+# (B_M, B_N, B_K, WG_PER_CU, direct_only, prefetch_scale). Big-tile pipelines
+# (mouter / minterleave / wave*n* / pipeline, kids 131/132/134/140-163/149-152)
+# stay monolithic in opus_bmm.cu and are NOT migrated here.
 _BMM_MXSCALE_SPLITK_TILES = {
-    # tileN (B_M=16): consumers split N (T_M=1, T_N=2). A single 16-row MFMA
-    # M-wave, so small-M / decode BMM shapes (M<=32) stop over-computing a fat
-    # B_M tile. Targets the G=2, K=4096, M<=32 gap vs hipBLASLt bf16 (which uses
-    # 16x16 macro-tiles there). B_N=32 -> two 16-col consumer N-waves.
+    # tileN (B_M=16): single 16-row MFMA M-wave so small-M/decode shapes (M<=32)
+    # don't over-compute a fat B_M tile. Targets the G=2 K=4096 M<=32 gap vs bf16.
     316: (16,  32,  256, 2, False, False),
     317: (16,  32,  256, 2, False, True),    # scale prefetch
     318: (16,  32,  128, 2, False, False),
-    # tileN prefetch-depth sweep: the tiny 16x32 tile has small LDS, so at
-    # WG_PER_CU=2 prefetch_k_iter balloons to ~12 (vs 3 for kid320), making the
-    # pipeline prologue dominate a 16-iter K loop. Higher WG_PER_CU shrinks the
-    # per-WG LDS budget -> shallower prefetch (WG=8 -> ~3, WG=4 -> ~6) and lifts
-    # occupancy, which the small-M/few-tile shapes want.
+    # prefetch-depth sweep: higher WG_PER_CU shrinks per-WG LDS -> shallower
+    # prefetch_k_iter + more occupancy (small-M/few-tile shapes want this).
     319: (16,  32,  256, 4, False, False),
     314: (16,  32,  512, 2, False, False),   # fewer K-iters (8) per WG
-    # wider-N tileN: B_M=16 keeps M-compute minimal but larger B_N raises
-    # COM_REP_N (more MFMA/iter) to hide ds_read+scale latency in the K loop.
-    # WG_PER_CU chosen to keep prefetch_k_iter >= 3.
+    # wider-N tileN: larger B_N raises COM_REP_N (more MFMA/iter) to hide
+    # ds_read+scale latency; WG_PER_CU keeps prefetch_k_iter >= 3.
     313: (16,  64,  256, 2, False, False),   # COM_REP_N=2
     312: (16, 128,  256, 1, False, False),   # COM_REP_N=4
-    # M=16/32 refinement candidates (G=2 N=1024 K=4096 last-mile vs bf16):
-    #   311 = tileN wide-K (8 K-iters, half the producer/consumer barriers) +
-    #         scale prefetch.
-    #   321/323 = 32x32 tileM: exact fit for M=32 (no OOB waste) with COM_REP_N=2
-    #         (2 MFMA/iter) to hide K-loop latency better than the 16x32 tileN.
+    # M=16/32 last-mile (G=2 N=1024 K=4096): 311 = wide-K tileN + scale prefetch;
+    # 321/323 = 32x32 tileM (exact M=32 fit, no OOB waste, COM_REP_N=2).
     311: (16,  32,  512, 2, False, True),
     321: (32,  32,  256, 2, False, True),
     323: (32,  32,  128, 2, False, True),
     # fine tiles (small / mid M)
     320: (64,  32,  256, 2, False, False),
     322: (64,  32,  256, 1, False, False),
-    # kid324 = kid320 tile (64x32x256, wg2) with SFA+SFB scale panels preloaded
-    # into LDS (PRELOAD_SF_LDS). Targets the mid-M valley (M~192-320) where ATT
-    # shows ~20% of consumer cycles stalled on the per-K-tile global scale load
-    # (s_waitcnt vmcnt gating do_scaled_mma). Preloading converts that vmcnt
-    # stall into a short LDS ds_read (lgkmcnt). Handled via the preload-tiles
-    # dict below (needs the preload_sf flag, not expressible in the 6-tuple).
-    # NOTE: the mid-M valley (M~192-320, G4 K4096: fp8 only 0.87-1.00x vs bf16) was
-    # attacked on this 64x32 tile with (a) scaleprefetch, (b) B_K=128/512, (c) wg4,
-    # and on the 64x64 tile with splitK=2/4. ALL measured at or below kid320
-    # (64x32x256, B_K=256): scaleprefetch = within noise; B_K=128 = worse (K-loop
-    # overhead, M256 0.90 vs 0.95); B_K=512 = LDS overflow (won't compile); splitK
-    # on 64x64 = reduce-pass overhead dominates (M256 kid653 sK2=434 < kid320=485).
-    # UPDATE: kid324 (== this tile + PRELOAD_SF_LDS, below) DID break the ceiling.
-    # ATT on kid320 showed ~20% of consumer cycles stalled on s_waitcnt vmcnt
-    # gating do_scaled_mma (the per-K-tile global SFA/SFB scale load). Staging both
-    # scale panels into LDS once (read via ds_read/lgkmcnt in the loop) lifts G4
-    # K4096: M256 0.934->1.000x, M512 0.939->1.011x, M192 0.911->0.980x vs bf16
-    # (+8-26% TFLOPS over kid320 across M=128..1024). The residual valley at
-    # M~320/384/768 is the odd/low tile-count (stream-K) gap, not scale loads.
+    # kid324 = kid320 tile + SFA+SFB scale panels preloaded into LDS
+    # (PRELOAD_SF_LDS; wired via the preload-tiles dict below, not the 6-tuple).
+    # ATT on kid320 showed ~20% of consumer cycles stalled on vmcnt for the
+    # per-K-tile global scale load; staging both panels into LDS once (ds_read /
+    # lgkmcnt) breaks the mid-M valley: G4 K4096 M256 0.93->1.00x, M512
+    # 0.94->1.01x, M192 0.91->0.98x vs bf16 (+8-26% TFLOPS over kid320, M128-1024).
+    # Other attempts (scaleprefetch, B_K=128/512, wg4, 64x64 splitK) all <= kid320.
     640: (32,  64,  256, 2, False, False),
     642: (32,  64,  256, 1, False, False),
     646: (32,  64,  256, 2, True,  False),   # consumer self-load (splitK==1)
     650: (64,  64,  128, 2, False, False),
     653: (64,  64,  128, 2, False, True),    # scale prefetch
-    # NOTE: a 64x64x256 tile mirroring bf16 hipBLASLt's MT64x64x256 Tensile kernel
-    # was tried on the mid-M valley (G4 K4096). B_K=256 -> P=3 LDS ~198KB forces
-    # wg_per_cu=1, so at M=256 it runs only 256 WG @ 1/CU (half of kid320's 512 WG
-    # @ 2/CU) and lands at 0.77x vs bf16 (kid320 = 0.96x). It only wins at M=192
-    # (off the power-of-2 grid). bf16 gets away with this tile ONLY via stream-K
-    # (SK3) refilling the low tile count -- which the flatmm pipeline lacks. So the
-    # missing ingredient is stream-K, not the tile shape; no 64x64x256 kid kept.
+    # No 64x64x256 kid: mirroring bf16's MT64x64x256 forces wg_per_cu=1 (LDS
+    # ~198KB), so at M=256 it runs half the WGs and lands 0.77x vs bf16. bf16 only
+    # wins it via stream-K (refills low tile count), which the flatmm pipeline lacks.
     128: (128, 128, 128, 1, False, False),
     137: (128, 128, 128, 1, False, True),    # scale prefetch
     138: (64,  128, 256, 1, False, False),
@@ -464,6 +441,15 @@ a8w8_mxscale_bmm_flatmm_splitk_kernels_list = {
 # always sets preload_sf=True (non-direct, non-prefetch).
 _BMM_MXSCALE_SPLITK_PRELOAD_TILES = {
     324: (64, 32, 256, 2),  # = kid320 + SFA/SFB scale panels preloaded to LDS
+    # mid-M wg1 tiles + SFA/SFB preload (same mechanism as kid324/kid158): staging
+    # both scale panels into LDS removes the per-K-tile global scale vmcnt load that
+    # gated the plain/scaleprefetch tiles. On K=4096 M256-2048 this wins +13-17%
+    # over the old kid137/653/139 picks (kid325 ships G2/M2048, G4/M1024, G8/M512,
+    # G16/M256; kid326 ships G8/M256). K=1024 gains are ~noise (few K-tiles). kid327
+    # kept as a candidate but wins nothing robustly (clock-fragile at cold sclk).
+    325: (128, 128, 128, 1),  # = kid128/137 tile + preload
+    326: (128, 64,  256, 1),  # = kid139 tile + preload
+    327: (64,  128, 256, 1),  # = kid138 tile + preload
 }
 a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
     kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
@@ -537,9 +523,9 @@ a8w8_mxscale_bmm_fused_kernels_list = {
     100: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_fused", 32, 128, 128, 2),
 }
 
-# pipeline (kids 149/150/151/152/157): BLOCK_SIZE 512, m{128,256}n256k128, dual
+# pipeline (kids 149/150/151/152/158): BLOCK_SIZE 512, m{128,256}n256k128, dual
 # bf16/fp32 traits (output dtype baked into the traits tuple), non-splitk scale
-# kargs. One of four gemm_a8w8_scale_* kernels selected by flags. The wave
+# kargs. One of the gemm_a8w8_scale_* kernels selected by flags. The wave
 # layout (T_M/T_N/W_*) is derived inside opus_gemm_a8w8_scale_traits_gfx950 from
 # BLOCK + <B_M,B_N,B_K>, so only B_M/B_N/B_K matter here (the T_M/T_N passed to
 # OpusGemmInstance are cosmetic for this tag).
@@ -563,7 +549,8 @@ a8w8_mxscale_bmm_pipeline_kernels_list = {
     150: _a8w8_mxscale_bmm_pipeline(),
     151: _a8w8_mxscale_bmm_pipeline(k1024_only=True),
     152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
-    157: _a8w8_mxscale_bmm_pipeline(preload_sfa_lds=True),
+    # kid158: preload BOTH SFA (per-token) and SFB (block) scale panels into LDS.
+    158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
 }
 
 # mouter (kids 131/144) + mouter_tunable (kids 160/161): wg1 m128n128k128,

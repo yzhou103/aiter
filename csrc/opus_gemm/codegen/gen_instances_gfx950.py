@@ -2459,7 +2459,7 @@ def gen_bmm_mxscale_mouter_tunable_instance(
     )
 
 
-# ---- pipeline (kids 150/157/151/152) ----
+# ---- pipeline (kids 150/158/151/152) ----
 # Dual bf16/fp32 traits (output dtype baked into the traits tuple slot 3),
 # non-splitk scale kargs, BLOCK_SIZE 512. Flags pick one of four scale kernels.
 _BMM_PIPELINE_LAUNCHER_BODY = r"""
@@ -2554,8 +2554,8 @@ def gen_bmm_mxscale_pipeline_instance(
     record_one_instantiation,
     **_unused,
 ):
-    if k.preload_sfa_lds:
-        real_kernel = "gemm_a8w8_scale_preload_sfa_kernel"
+    if k.preload_sf_lds:
+        real_kernel = "gemm_a8w8_scale_preload_sf_kernel"
     elif k.k1024_lb1:
         real_kernel = "gemm_a8w8_scale_k1024_lb1_kernel"
     elif k.k1024_only:

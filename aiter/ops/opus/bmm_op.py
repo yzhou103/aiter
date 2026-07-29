@@ -103,7 +103,7 @@ def _mxscale_bmm_buckets() -> dict:
 
 
 # OOB-masked sub-tiles (B_M=32/64): partial-M is predicated via buffer OOB, so
-# these run any M. The strong pipeline/minterleave tiles (137/139/150/157/163)
+# these run any M. The strong pipeline/minterleave tiles (137/139/150/158/163)
 # instead grid on M/B_M with a hard ``M % B_M == 0`` assert -> aligned M only.
 ARBITRARY_M_KIDS = frozenset({311, 313, 320, 321, 324, 640, 650, 653})
 
@@ -216,7 +216,7 @@ def bmm_a8w8_mxscale_opus(
                 splitK = int(cfg["splitK"])
         else:
             # No usable tuned config -> heuristic fallback path. For large tile-
-            # unaligned M, the strong large-M tiles (157/150) win big but need
+            # unaligned M, the strong large-M tiles (158/150) win big but need
             # M % 256 == 0, so split into an aligned bulk (strong tile) + a
             # <256-row OOB-safe remainder (zero-copy dim0 views). The win is
             # gated on total bulk work g*m, not g alone: measured break-even is
@@ -233,7 +233,10 @@ def bmm_a8w8_mxscale_opus(
                 and g * m >= 8192
             ):
                 m_bulk = (m // 256) * 256
-                bulk_kid = 157 if k >= 4096 else 150
+                # kid158 preloads the SFA panel into LDS and early-returns for
+                # K>8192 (SFA_K_MAX); kid150 (plain, no preload) runs any K. Cap
+                # the preload pick at K<=8192 so K>8192 stays correct on kid150.
+                bulk_kid = 158 if 4096 <= k <= 8192 else 150
                 tail_kid = _heuristic_mxscale_kid(g, m - m_bulk, n, k)
                 _opus_bmm_a8w8_mxscale_raw(
                     x[:m_bulk], wo_a, Y[:m_bulk], x_scale[:m_bulk], w_scale, 1, bulk_kid

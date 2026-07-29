@@ -180,30 +180,126 @@ inline __device__ auto make_layout_sfa_mxsk(int lane_id, int wave_id_m, int stri
             opus::tuple{wave_id_m, lane_id % T::W_M}));
 }
 
-template<typename S>
-OPUS_D int pack_e8m0x4_mxsk(S scale) {
-    const int e = static_cast<int>(scale);
-    return e * 0x01010101;
+// pack_e8m0x4 (broadcast e8m0 -> x4 word) is shared via opus_gemm_utils.cuh.
+
+// Per-subtile scaled-MFMA loop -- the shared "else" body used whenever the
+// register tile spans more than one MX scale group. The MMA issue pattern is
+// identical for every scale layout; only where each subtile's packed scale comes
+// from differs, so that is injected via scale_a_of(im, ik) / scale_b_of(in, ik).
+// Providers receive compile-time (opus::number<>) subtile indices and return the
+// packed-int32 e8m0x4 scale. This lets plain block-scale and shuffled/preloaded
+// block-scale reuse one implementation.
+// OPSEL == false (default): scale_a_of/scale_b_of return a broadcast-packed x4
+//   e8m0 word (all 4 bytes equal) and every MFMA selects byte 0 -- legacy
+//   scalar behavior.
+// OPSEL == true: scale_a_of/scale_b_of return a K-packed word holding the
+//   COM_REP_K distinct K-group e8m0 bytes (byte ik == the ik-th K group) and are
+//   K-independent; each MFMA selects its own byte through the compile-time
+//   scale_op_sel == ik. This drops the per-subtile broadcast pack and shrinks the
+//   K-direction scale register footprint to one word per M / N-scale group.
+template<typename T, typename Mma, bool OPSEL = false,
+         typename VA, typename VB, typename VC,
+         typename ScaleAOf, typename ScaleBOf>
+OPUS_D void mma_mxscale_subtile_loop(const VA& v_a, const VB& v_b, VC& v_c,
+                                     ScaleAOf&& scale_a_of, ScaleBOf&& scale_b_of) {
+    using MMA = typename Mma::MMA;
+    constexpr int a_len = Mma::mma_a_len;
+    constexpr int b_len = Mma::mma_b_len;
+    constexpr int c_len = Mma::mma_c_len;
+    opus::static_for<T::COM_REP_M>([&](auto im_c) {
+        constexpr int im = decltype(im_c)::value;
+        opus::static_for<T::COM_REP_N>([&](auto in_c) {
+            constexpr int in = decltype(in_c)::value;
+            opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                constexpr int ik = decltype(ik_c)::value;
+                const int scale_a = scale_a_of(im_c, ik_c);
+                const int scale_b = scale_b_of(in_c, ik_c);
+                constexpr int i_tile_a = (im * T::COM_REP_K + ik);
+                constexpr int i_tile_b = (in * T::COM_REP_K + ik);
+                constexpr int i_tile_c = im * T::COM_REP_N + in;
+                auto s_a = opus::slice(v_a,
+                    opus::number<i_tile_a * a_len>{},
+                    opus::number<i_tile_a * a_len + a_len>{});
+                auto s_b = opus::slice(v_b,
+                    opus::number<i_tile_b * b_len>{},
+                    opus::number<i_tile_b * b_len + b_len>{});
+                auto s_c = opus::slice(v_c,
+                    opus::number<i_tile_c * c_len>{},
+                    opus::number<i_tile_c * c_len + c_len>{});
+                if constexpr (OPSEL)
+                    s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, ik_c, ik_c);
+                else
+                    s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, 0_I, 0_I);
+                opus::set_slice(v_c, s_c,
+                    opus::number<i_tile_c * c_len>{},
+                    opus::number<i_tile_c * c_len + c_len>{});
+            });
+        });
+    });
 }
 
-template<typename T, typename Mma, typename VA, typename VB, typename VSFA, typename VSFB, typename VC>
-OPUS_D void mma_mxscale_flatmm_accum(Mma& mma, const VA& v_a, const VB& v_b,
-                                     const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c) {
+// How the per-subtile scales are materialized in the multi-scale-group path:
+//   preload   -- pack every distinct scale once up front, then index the packed
+//                registers in the loop (fewer pack ops when a scale is reused
+//                across COM_REP_N / COM_REP_M).
+//   on_demand -- pack each subtile's scale inline (lower register pressure).
+//   opsel     -- pack the COM_REP_K K-group scales into one word per M / N-scale
+//                group (native e8m0x4, no broadcast) and select the K byte per
+//                MFMA via the hardware scale_op_sel immediate. Fewest scale ALU
+//                ops + smallest K-direction scale register footprint.
+enum class mxscale_pack { preload, on_demand, opsel };
+
+template<typename T, mxscale_pack MODE = mxscale_pack::preload,
+         typename Mma, typename VA, typename VB, typename VSFA, typename VSFB, typename VC>
+OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
+                              const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c) {
     static_assert(std::is_same_v<typename T::D_SF, unsigned char>);
     static_assert((T::COM_REP_M == 1 || T::COM_REP_M == 2 || T::COM_REP_M == 4)
                   && (T::COM_REP_K == 1 || T::COM_REP_K == 2 || T::COM_REP_K == 4));
     static_assert(T::B_K % T::GROUP_K == 0);
     constexpr int rep_n_per_scale = T::GROUP_N / (T::W_N * T::T_N);
     static_assert(rep_n_per_scale > 0 && T::GROUP_N % (T::W_N * T::T_N) == 0);
+    // Whole register tile in a single scale group -> one (scale_a, scale_b) pair
+    // -> a single tiled-mma call covers the tile.
     if constexpr (T::COM_REP_M == 1 && T::COM_REP_N <= rep_n_per_scale && T::COM_REP_K == 1) {
-        const int scale_a = pack_e8m0x4_mxsk(v_sfa[0]);
-        const int scale_b = pack_e8m0x4_mxsk(v_sfb[0]);
+        const int scale_a = pack_e8m0x4(v_sfa[0]);
+        const int scale_b = pack_e8m0x4(v_sfb[0]);
         v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
-    } else {
-        using MMA = typename Mma::MMA;
-        constexpr int a_len = Mma::mma_a_len;
-        constexpr int b_len = Mma::mma_b_len;
-        constexpr int c_len = Mma::mma_c_len;
+    } else if constexpr (MODE == mxscale_pack::opsel) {
+        // One word per M-subtile / N-scale-group holding the COM_REP_K K-group
+        // e8m0 bytes; the subtile loop picks byte ik via scale_op_sel == ik.
+        // NOTE: reference path only. With the vec-wide (dword) scale load below,
+        // the shift/or here folds away, but op_sel packing still measures on par
+        // with or slightly slower than preload's broadcast pack across the tuned
+        // shapes, so preload stays the default. Kept for experimentation.
+        opus::vector_t<int, T::COM_REP_M> packed_sfa;
+        opus::vector_t<int, T::N_SCALE_GROUPS> packed_sfb;
+        opus::static_for<T::COM_REP_M>([&](auto im_c) {
+            constexpr int im = decltype(im_c)::value;
+            int w = 0;
+            opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                constexpr int ik = decltype(ik_c)::value;
+                w |= (static_cast<int>(v_sfa[im * T::SCALES_PER_BK + ik]) & 0xFF) << (8 * ik);
+            });
+            packed_sfa[im] = w;
+        });
+        opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
+            constexpr int ng = decltype(ng_c)::value;
+            int w = 0;
+            opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                constexpr int ik = decltype(ik_c)::value;
+                w |= (static_cast<int>(v_sfb[ng * T::SCALES_PER_BK + ik]) & 0xFF) << (8 * ik);
+            });
+            packed_sfb[ng] = w;
+        });
+        mma_mxscale_subtile_loop<T, Mma, /*OPSEL=*/true>(v_a, v_b, v_c,
+            [&](auto im_c, auto) {
+                return packed_sfa[decltype(im_c)::value];
+            },
+            [&](auto in_c, auto) {
+                return packed_sfb[decltype(in_c)::value / rep_n_per_scale];
+            });
+    } else if constexpr (MODE == mxscale_pack::preload) {
         opus::vector_t<int, T::COM_REP_M * T::COM_REP_K> packed_sfa;
         opus::vector_t<int, T::N_SCALE_GROUPS * T::COM_REP_K> packed_sfb;
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
@@ -211,7 +307,7 @@ OPUS_D void mma_mxscale_flatmm_accum(Mma& mma, const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfa[im * T::COM_REP_K + ik] =
-                    pack_e8m0x4_mxsk(v_sfa[im * T::SCALES_PER_BK + ik]);
+                    pack_e8m0x4(v_sfa[im * T::SCALES_PER_BK + ik]);
             });
         });
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
@@ -219,87 +315,46 @@ OPUS_D void mma_mxscale_flatmm_accum(Mma& mma, const VA& v_a, const VB& v_b,
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 packed_sfb[ng * T::COM_REP_K + ik] =
-                    pack_e8m0x4_mxsk(v_sfb[ng * T::SCALES_PER_BK + ik]);
+                    pack_e8m0x4(v_sfb[ng * T::SCALES_PER_BK + ik]);
             });
         });
-        opus::static_for<T::COM_REP_M>([&](auto im_c) {
-            constexpr int im = decltype(im_c)::value;
-            opus::static_for<T::COM_REP_N>([&](auto in_c) {
-                constexpr int in = decltype(in_c)::value;
-                opus::static_for<T::COM_REP_K>([&](auto ik_c) {
-                    constexpr int ik = decltype(ik_c)::value;
-                    const int scale_a = packed_sfa[im * T::COM_REP_K + ik];
-                    const int scale_b = packed_sfb[(in / rep_n_per_scale) * T::COM_REP_K + ik];
-                    constexpr int i_tile_a = (im * T::COM_REP_K + ik);
-                    constexpr int i_tile_b = (in * T::COM_REP_K + ik);
-                    constexpr int i_tile_c = im * T::COM_REP_N + in;
-                    auto s_a = opus::slice(v_a,
-                        opus::number<i_tile_a * a_len>{},
-                        opus::number<i_tile_a * a_len + a_len>{});
-                    auto s_b = opus::slice(v_b,
-                        opus::number<i_tile_b * b_len>{},
-                        opus::number<i_tile_b * b_len + b_len>{});
-                    auto s_c = opus::slice(v_c,
-                        opus::number<i_tile_c * c_len>{},
-                        opus::number<i_tile_c * c_len + c_len>{});
-                    s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, 0_I, 0_I);
-                    opus::set_slice(v_c, s_c,
-                        opus::number<i_tile_c * c_len>{},
-                        opus::number<i_tile_c * c_len + c_len>{});
-                });
+        mma_mxscale_subtile_loop<T, Mma>(v_a, v_b, v_c,
+            [&](auto im_c, auto ik_c) {
+                return packed_sfa[decltype(im_c)::value * T::COM_REP_K + decltype(ik_c)::value];
+            },
+            [&](auto in_c, auto ik_c) {
+                return packed_sfb[(decltype(in_c)::value / rep_n_per_scale) * T::COM_REP_K
+                                  + decltype(ik_c)::value];
             });
-        });
+    } else {
+        mma_mxscale_subtile_loop<T, Mma>(v_a, v_b, v_c,
+            [&](auto im_c, auto ik_c) {
+                return pack_e8m0x4(
+                    v_sfa[decltype(im_c)::value * T::SCALES_PER_BK + decltype(ik_c)::value]);
+            },
+            [&](auto in_c, auto ik_c) {
+                return pack_e8m0x4(
+                    v_sfb[(decltype(in_c)::value / rep_n_per_scale) * T::SCALES_PER_BK
+                          + decltype(ik_c)::value]);
+            });
     }
+}
+
+// Scale-packing strategy for the default multi-scale-group accum path. Flip
+// between preload and opsel here to A/B the hardware scale_op_sel byte-select.
+inline constexpr mxscale_pack MXSCALE_ACCUM_MODE = mxscale_pack::preload;
+
+// Thin wrappers preserving the original entry points / call sites.
+template<typename T, typename Mma, typename VA, typename VB, typename VSFA, typename VSFB, typename VC>
+OPUS_D void mma_mxscale_flatmm_accum(Mma& mma, const VA& v_a, const VB& v_b,
+                                     const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c) {
+    mma_mxscale_tiled<T, MXSCALE_ACCUM_MODE>(mma, v_a, v_b, v_sfa, v_sfb, v_c);
 }
 
 template<typename T, typename Mma, typename VA, typename VB, typename VSFA, typename VSFB, typename VC>
 OPUS_D void mma_mxscale_flatmm_accum_on_demand(Mma& mma, const VA& v_a, const VB& v_b,
                                                const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c) {
-    static_assert(std::is_same_v<typename T::D_SF, unsigned char>);
-    static_assert((T::COM_REP_M == 1 || T::COM_REP_M == 2 || T::COM_REP_M == 4)
-                  && (T::COM_REP_K == 1 || T::COM_REP_K == 2 || T::COM_REP_K == 4));
-    static_assert(T::B_K % T::GROUP_K == 0);
-    constexpr int rep_n_per_scale = T::GROUP_N / (T::W_N * T::T_N);
-    static_assert(rep_n_per_scale > 0 && T::GROUP_N % (T::W_N * T::T_N) == 0);
-    if constexpr (T::COM_REP_M == 1 && T::COM_REP_N <= rep_n_per_scale && T::COM_REP_K == 1) {
-        const int scale_a = pack_e8m0x4_mxsk(v_sfa[0]);
-        const int scale_b = pack_e8m0x4_mxsk(v_sfb[0]);
-        v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
-    } else {
-        using MMA = typename Mma::MMA;
-        constexpr int a_len = Mma::mma_a_len;
-        constexpr int b_len = Mma::mma_b_len;
-        constexpr int c_len = Mma::mma_c_len;
-        opus::static_for<T::COM_REP_M>([&](auto im_c) {
-            constexpr int im = decltype(im_c)::value;
-            opus::static_for<T::COM_REP_N>([&](auto in_c) {
-                constexpr int in = decltype(in_c)::value;
-                opus::static_for<T::COM_REP_K>([&](auto ik_c) {
-                    constexpr int ik = decltype(ik_c)::value;
-                    const int scale_a =
-                        pack_e8m0x4_mxsk(v_sfa[im * T::SCALES_PER_BK + ik]);
-                    const int scale_b =
-                        pack_e8m0x4_mxsk(v_sfb[(in / rep_n_per_scale) * T::SCALES_PER_BK + ik]);
-                    constexpr int i_tile_a = (im * T::COM_REP_K + ik);
-                    constexpr int i_tile_b = (in * T::COM_REP_K + ik);
-                    constexpr int i_tile_c = im * T::COM_REP_N + in;
-                    auto s_a = opus::slice(v_a,
-                        opus::number<i_tile_a * a_len>{},
-                        opus::number<i_tile_a * a_len + a_len>{});
-                    auto s_b = opus::slice(v_b,
-                        opus::number<i_tile_b * b_len>{},
-                        opus::number<i_tile_b * b_len + b_len>{});
-                    auto s_c = opus::slice(v_c,
-                        opus::number<i_tile_c * c_len>{},
-                        opus::number<i_tile_c * c_len + c_len>{});
-                    s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, 0_I, 0_I);
-                    opus::set_slice(v_c, s_c,
-                        opus::number<i_tile_c * c_len>{},
-                        opus::number<i_tile_c * c_len + c_len>{});
-                });
-            });
-        });
-    }
+    mma_mxscale_tiled<T, mxscale_pack::on_demand>(mma, v_a, v_b, v_sfa, v_sfb, v_c);
 }
 
 #endif // __HIP_DEVICE_COMPILE__
@@ -367,29 +422,42 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     if (my_loops < T::prefetch_k_iter) return;
 
     // OOB masking for partial M tiles: bound the A / sfa / C buffers to the
-    // valid row window [row, M) so lanes mapping to rows >= M read 0 and their
-    // stores are dropped by the buffer's num_records bound. This lets any M run
-    // on a B_M tile without requiring M % B_M == 0 (N/K stay divisible so B and
-    // the K axis need no bound). rows_avail >= 1 always (row < M by construction).
-    const int rows_avail = kargs.m - row;
+    // valid row window so lanes mapping to rows >= M read 0 and their stores are
+    // dropped by the buffer's num_records bound. This lets any M run on a B_M
+    // tile without requiring M % B_M == 0 (N/K stay divisible so B and the K
+    // axis need no bound).
+    //
+    // Each WG owns exactly one B_M row tile and the buffer base is already at
+    // `row`, so the bound only needs to cover this tile's own rows -- clamp to
+    // B_M. Using the full (M - row) span would set num_records to
+    // rows_avail*stride_a, and with batch-in-the-middle stride_a = batch*K, so a
+    // large-M / high-batch shape would overflow the 32-bit buffer-descriptor
+    // num_records (4 GiB) field and silently wrap, corrupting the OOB bound.
+    // min(rows_avail, B_M) still masks the partial-M tail correctly.
+    // rows_avail >= 1 always (row < M by construction).
+    const int rows_left = kargs.m - row;
+    const int rows_avail = rows_left < T::B_M ? rows_left : T::B_M;
     const unsigned int a_bytes =
         (unsigned int)rows_avail * (unsigned int)kargs.stride_a * sizeof(D_A);
+    // 64-bit base offsets: batch_id*stride_*_batch (= M*K for a batch-in-the-
+    // middle A layout) overflows int32 for large M well before the 4 GiB buffer
+    // limit, so cast the batch/row products to size_t to keep the base exact.
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
-                         + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start,
+                         + (size_t)batch_id * kargs.stride_a_batch + (size_t)row * kargs.stride_a + k_start,
                          a_bytes);
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
-                         + batch_id * kargs.stride_b_batch + col * kargs.stride_b + k_start);
+                         + (size_t)batch_id * kargs.stride_b_batch + (size_t)col * kargs.stride_b + k_start);
     const bool direct_store = DIRECT_ONLY || (!std::is_void_v<D_OUT> && kargs.split_k == 1);
     const int stride_c_main = direct_store ? kargs.stride_c : kargs.stride_ws;
     const unsigned int sfa_bytes =
         (unsigned int)rows_avail * (unsigned int)kargs.stride_sfa * sizeof(D_SF);
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
-                           + batch_id * kargs.stride_sfa_batch
-                           + row * kargs.stride_sfa + sf_start,
+                           + (size_t)batch_id * kargs.stride_sfa_batch
+                           + (size_t)row * kargs.stride_sfa + sf_start,
                            sfa_bytes);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
-                           + batch_id * kargs.stride_sfb_batch
-                           + (col / T::GROUP_N) * kargs.stride_sfb + sf_start);
+                           + (size_t)batch_id * kargs.stride_sfb_batch
+                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start);
 
     int role = ((wave_id & 1) ^ ((wgid >> 8) & 1));
 
@@ -504,7 +572,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
 
         auto load_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
             const int scale_base = loop_k * T::SCALES_PER_BK;
-            v_sfa = load(g_sfa, u_sfa, scale_base);
+            v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
             opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
                 auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
@@ -712,8 +780,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             if constexpr (PRELOAD_SF_LDS) {
                 // Read this K-tile's scales from the preloaded LDS panels
                 // (ds_read / lgkmcnt) instead of a per-tile global buffer_load.
+                // Vec = SCALES_PER_BK so the contiguous per-M-row K bytes come in
+                // as one dword (ds_read_b32) instead of SCALES_PER_BK byte reads.
                 auto sm_a = make_smem(s_sfa_ptr + scale_base);
-                v_sfa = load(sm_a, u_sfa_lds);
+                v_sfa = load<T::SCALES_PER_BK>(sm_a, u_sfa_lds);
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr + ng * sf_k_scales + scale_base);
@@ -724,7 +794,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     });
                 });
             } else {
-                v_sfa = load(g_sfa, u_sfa, scale_base);
+                // Vec = SCALES_PER_BK: the contiguous per-M-row K-scale bytes are
+                // read as one dword (buffer_load_b32) rather than SCALES_PER_BK
+                // separate buffer_load_ubyte. SFB already loads b32 the same way.
+                v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
@@ -1009,10 +1082,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
     if (loops < T::prefetch_k_iter) return;
 
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
-                         + batch_id * kargs.stride_b_batch + col * kargs.stride_b);
+                         + (size_t)batch_id * kargs.stride_b_batch + (size_t)col * kargs.stride_b);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
-                           + batch_id * kargs.stride_sfb_batch
-                           + (col / T::GROUP_N) * kargs.stride_sfb);
+                           + (size_t)batch_id * kargs.stride_sfb_batch
+                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
 
     __shared__ char smem_a[T::prefetch_k_iter * T::NUM_LOAD_GROUPS_PER_BM
                            * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
@@ -1049,8 +1122,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
         for (int tile_m = tile_m_lo; tile_m < tile_m_hi && tile_m < num_tiles_m; ++tile_m) {
             int row = tile_m * T::B_M;
             auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
-                                 + batch_id * kargs.stride_a_batch
-                                 + row * kargs.stride_a);
+                                 + (size_t)batch_id * kargs.stride_a_batch
+                                 + (size_t)row * kargs.stride_a);
             auto a_offset = [&](int loop_k_idx, int group_load_idx, int k_group) {
                 return group_load_idx * T::LOAD_GROUP_M * kargs.stride_a
                      + (loop_k_idx * T::NUM_LOAD_GROUPS_PER_BK + k_group) * T::LOAD_GROUP_K;
@@ -1152,14 +1225,14 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
         for (int tile_m = tile_m_lo; tile_m < tile_m_hi && tile_m < num_tiles_m; ++tile_m) {
             int row = tile_m * T::B_M;
             auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
-                                   + batch_id * kargs.stride_sfa_batch
-                                   + row * kargs.stride_sfa);
+                                   + (size_t)batch_id * kargs.stride_sfa_batch
+                                   + (size_t)row * kargs.stride_sfa);
             clear(v_c);
 
             auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
             auto scaled_mma = [&](const auto& va, const auto& vb, int loop_k) {
                 const int scale_base = loop_k * T::SCALES_PER_BK;
-                vtype_sfa v_sfa = load(g_sfa, u_sfa, scale_base);
+                vtype_sfa v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
                 vtype_sfb v_sfb;
                 opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
@@ -1348,10 +1421,10 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
     if (loops < T::prefetch_k_iter) return;
 
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
-                         + batch_id * kargs.stride_b_batch + col * kargs.stride_b);
+                         + (size_t)batch_id * kargs.stride_b_batch + (size_t)col * kargs.stride_b);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
-                           + batch_id * kargs.stride_sfb_batch
-                           + (col / T::GROUP_N) * kargs.stride_sfb);
+                           + (size_t)batch_id * kargs.stride_sfb_batch
+                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
 
     __shared__ char smem_a[MI * SB * T::NUM_LOAD_GROUPS_PER_BM
                            * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
@@ -1387,7 +1460,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
         };
 
         const D_A* base_a = reinterpret_cast<const D_A*>(kargs.ptr_a)
-                            + batch_id * kargs.stride_a_batch;
+                            + (size_t)batch_id * kargs.stride_a_batch;
 
         auto issue_loads = [&](int k, int slot) {
             opus::static_for<T::NUM_LOAD_GROUPS_PER_BK>([&](auto kg_c) {
@@ -1445,7 +1518,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
         // Per-tile A-scale gmem + layout.
         auto g_sfa = [&](int mi) {
             return make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
-                             + batch_id * kargs.stride_sfa_batch
+                             + (size_t)batch_id * kargs.stride_sfa_batch
                              + (size_t)(tile_m0 + mi) * T::B_M * kargs.stride_sfa);
         };
         auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
@@ -1477,7 +1550,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
             opus::static_for<MI>([&](auto mi_c) {
                 constexpr int mi = decltype(mi_c)::value;
                 auto gsfa = g_sfa(mi);
-                vtype_sfa v_sfa = load(gsfa, u_sfa, scale_base);
+                vtype_sfa v_sfa = load<T::SCALES_PER_BK>(gsfa, u_sfa, scale_base);
                 if constexpr (!SKIP_SCALE_WAIT) s_waitcnt_vmcnt(0_I);
                 __builtin_amdgcn_s_setprio(1);
                 mma_mxscale_flatmm_accum<T>(mma, v_a[mi], v_b, v_sfa, v_sfb, v_c[mi]);
@@ -1557,11 +1630,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
         const int phase = wave_id / 2;
         const int prod_wave = wave_id & 1;
         auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
-                             + batch_id * kargs.stride_a_batch
-                             + row * kargs.stride_a);
+                             + (size_t)batch_id * kargs.stride_a_batch
+                             + (size_t)row * kargs.stride_a);
         auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
-                             + batch_id * kargs.stride_b_batch
-                             + (col_base + phase * T::B_N) * kargs.stride_b);
+                             + (size_t)batch_id * kargs.stride_b_batch
+                             + (size_t)(col_base + phase * T::B_N) * kargs.stride_b);
         auto u_ga = make_layout_gmem_group_load_mxsk<T, 2>(lane_id, prod_wave, kargs.stride_a);
         auto u_sa = make_layout_smem_group_load_mxsk<T, 2>(lane_id, prod_wave);
         auto u_gb = make_layout_gmem_group_load_mxsk<T, 2>(lane_id, prod_wave, kargs.stride_b);
@@ -1613,11 +1686,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
     const int col = col_base + phase * T::B_N;
 
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
-                           + batch_id * kargs.stride_sfa_batch
-                           + row * kargs.stride_sfa);
+                           + (size_t)batch_id * kargs.stride_sfa_batch
+                           + (size_t)row * kargs.stride_sfa);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
-                           + batch_id * kargs.stride_sfb_batch
-                           + (col / T::GROUP_N) * kargs.stride_sfb);
+                           + (size_t)batch_id * kargs.stride_sfb_batch
+                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
 
     auto u_ra = make_layout_ra_mxsk<T>(lane_id, wave_id_m);
     auto u_rb = make_layout_rb_mxsk<T>(lane_id);
@@ -1647,7 +1720,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
 
     for (int k = 0; k < loops; ++k) {
         const int scale_base = k * T::SCALES_PER_BK;
-        vtype_sfa v_sfa = load(g_sfa, u_sfa, scale_base);
+        vtype_sfa v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
         vtype_sfb v_sfb;
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
@@ -1726,17 +1799,17 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
     const int row = row_base + m_phase * T::B_M;
 
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
-                         + batch_id * kargs.stride_a_batch
-                         + row * kargs.stride_a);
+                         + (size_t)batch_id * kargs.stride_a_batch
+                         + (size_t)row * kargs.stride_a);
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
-                         + batch_id * kargs.stride_b_batch
-                         + col * kargs.stride_b);
+                         + (size_t)batch_id * kargs.stride_b_batch
+                         + (size_t)col * kargs.stride_b);
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
-                           + batch_id * kargs.stride_sfa_batch
-                           + row * kargs.stride_sfa);
+                           + (size_t)batch_id * kargs.stride_sfa_batch
+                           + (size_t)row * kargs.stride_sfa);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
-                           + batch_id * kargs.stride_sfb_batch
-                           + (col / T::GROUP_N) * kargs.stride_sfb);
+                           + (size_t)batch_id * kargs.stride_sfb_batch
+                           + (size_t)(col / T::GROUP_N) * kargs.stride_sfb);
 
     __shared__ char smem_a[PREFETCH_SLOTS * M_PHASES * T::NUM_LOAD_GROUPS_PER_BM
                            * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size];
@@ -1804,7 +1877,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
 
     auto load_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
         const int scale_base = loop_k * T::SCALES_PER_BK;
-        v_sfa = load(g_sfa, u_sfa, scale_base);
+        v_sfa = load<T::SCALES_PER_BK>(g_sfa, u_sfa, scale_base);
         opus::static_for<T::N_SCALE_GROUPS>([&](auto ng_c) {
             constexpr int ng = decltype(ng_c)::value;
             auto sfb = load<T::SCALES_PER_BK>(g_sfb, ng * kargs.stride_sfb + scale_base);
