@@ -195,6 +195,16 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     # Public dispatch path, writing into the batch-major buffer via out=.
     candidates["auto (batched_gemm_a8w8_mxscale)"] = (_call_auto, ref)
 
+    flops = 2.0 * g * m * n * k
+    # fp8 A + fp8 W + e8m0 scales (uint8) + output.
+    nbytes = (
+        g * m * k
+        + g * n * k
+        + g * m * (k // GROUP)
+        + g * (n // GROUP) * (k // GROUP)
+        + m * g * n * torch.empty((), dtype=ydt).element_size()
+    )
+
     ret = {"gfx": get_gfx()}
     for name, (fn, fn_ref) in candidates.items():
         out, us = run_perftest(fn)
@@ -206,6 +216,8 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
             msg=f"mxscale_bmm_batch_first {name} g={g} m={m} n={n} k={k}",
         )
         ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
 
