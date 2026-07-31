@@ -962,6 +962,39 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                                           wave_id_n_cons, lane_id / mma.grpn_c);
         auto u_gc = partition_layout_c<T::VEC_C>(mma,
             opus::make_tuple(stride_c_main, 1_I), p_coord_c);
+        // tileN with COM_REP_N>1: two consumer waves split B_N and each replicates
+        // COM_REP_N N-repeats. The generic swap_ab C partition nests the register
+        // N-repeat (expd_n) OUTSIDE the consumer-wave tile (tile_n), which transposes
+        // the (wave, n-rep) -> column map (each wave writes a strided, interleaved
+        // column set) whenever BOTH T_N>1 and COM_REP_N>1 -- the accumulators are
+        // correct but land in swapped output columns. Consumer wave w computes n-rep
+        // j from B column-group (w*COM_REP_N + j) (see nbc = wave_id_n_cons*COM_REP_N
+        // + the num_blocks_n rb read), so store each n-rep slice to that contiguous
+        // column group with a single-N-tile (E_N=1,T_N=1) layout and a scalar column
+        // offset. tileM (T_N=1) and tileN COM_REP_N==1 keep the original single store
+        // (SPLIT_N_STORE=false), so they stay bit-identical.
+        constexpr bool SPLIT_N_STORE = T::IS_TILE_N && (T::COM_REP_N > 1);
+        constexpr int C_LEN = decltype(mma)::mma_c_len;
+        auto mma_c1 = make_tiled_mma<D_A, D_B, D_ACC>(
+            seq<T::COM_REP_M, 1, T::COM_REP_K>{}, seq<T::T_M, 1, T::T_K>{},
+            seq<T::W_M, T::W_N, T::W_K>{}, mfma_adaptor_swap_ab{});
+        auto p_coord_c1 = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c,
+                                           0, lane_id / mma.grpn_c);
+        auto u_gc1 = partition_layout_c<T::VEC_C>(mma_c1,
+            opus::make_tuple(stride_c_main, 1_I), p_coord_c1);
+        auto store_c = [&](auto& g) {
+            if constexpr (SPLIT_N_STORE) {
+                opus::static_for<T::COM_REP_N>([&](auto j_c) {
+                    constexpr int j = decltype(j_c)::value;
+                    auto vj = opus::slice(v_c, opus::number<j * C_LEN>{},
+                                          opus::number<j * C_LEN + C_LEN>{});
+                    store<T::VEC_C>(g, vj, u_gc1,
+                                    (wave_id_n_cons * T::COM_REP_N + j) * T::W_N);
+                });
+            } else {
+                store<T::VEC_C>(g, v_c, u_gc, 0);
+            }
+        };
         if constexpr (!std::is_void_v<D_OUT>) {
             if (kargs.split_k == 1) {
                 D_OUT* out_ptr = reinterpret_cast<D_OUT*>(kargs.ptr_c)
@@ -970,7 +1003,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                                + (size_t)col;
                 auto g_out = make_gmem(out_ptr,
                     (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
-                store<T::VEC_C>(g_out, v_c, u_gc, 0);
+                store_c(g_out);
             } else {
                 D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
                               + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
@@ -978,7 +1011,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                               + (size_t)row * kargs.stride_ws
                               + (size_t)col;
                 auto g_c = make_gmem(ws_c_ptr);
-                store<T::VEC_C>(g_c, v_c, u_gc, 0);
+                store_c(g_c);
             }
         } else {
             D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
@@ -987,7 +1020,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                           + (size_t)row * kargs.stride_ws
                           + (size_t)col;
             auto g_c = make_gmem(ws_c_ptr);
-            store<T::VEC_C>(g_c, v_c, u_gc, 0);
+            store_c(g_c);
         }
     }
 

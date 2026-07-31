@@ -38,6 +38,12 @@ FLATMM_KIDS = {
     # M-tile interleaved 128x128 (MI=2 tiles/WG share B). Needs M % 256 == 0;
     # wins on large-M shapes where the 64x64 tiles are memory/pipeline bound.
     "m128n128k128_minterleave": (163, 256, 128),
+    # tileN (T_N=2) COM_REP_N>1 regression guards: these are the configs that
+    # transposed output column groups on signed / varied-block-scale data (the
+    # DSV4 wo_a DP-attention G=16 small-M case). Kept in the sweep so the
+    # correctness check keeps exercising the fixed consumer-store column map.
+    "m16n64k256_tileN_crn2": (313, 16, 64),
+    "m16n128k256_tileN_crn4": (312, 16, 128),
 }
 
 
@@ -84,13 +90,30 @@ def run_torch(O_fp8, W_fp8, x_scale, w_scale):
     return torch.einsum("gmk,gnk->gmn", act, W).to(dtypes.fp32)
 
 
+def _block_varied(shape, k):
+    """Signed random tensor whose per-128-K-block magnitude spans several powers
+    of two, so the e8m0 128-block scales cover many exponents.
+
+    ``rand()/10`` (non-negative, near-uniform) is what let the shipped kid312/313
+    tileN COM_REP_N>1 kernels pass this test at ~0.007 rel while silently
+    transposing output column groups: a pure column permutation over symmetric
+    positive columns barely moves any element, and the collapsed single block
+    scale hides scale-application bugs. Signed data makes swapped columns
+    uncorrelated (~100% element mismatch), and the varied amplitude exercises
+    real per-block scales -- together they turn this test into a real guard."""
+    x = torch.randn(shape, dtype=dtypes.fp32)
+    amp = torch.exp2(torch.randint(-4, 4, (k // GROUP,), device=x.device).float())
+    x = x * amp.repeat_interleave(GROUP)
+    return x.to(dtypes.bf16)
+
+
 @benchmark()
 def test_mxscale_bmm(g, m, n, k, dtype):
     ydt = _DT[dtype]
     # Canonical batch-major tensors, then feed the kernel transposed (mmajor)
     # views exactly like the DSV4 wo_a call does (zero-copy, no contiguous copy).
-    O_bf16 = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
-    W_bf16 = (torch.rand((g, n, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
+    O_bf16 = _block_varied((g, m, k), k)
+    W_bf16 = _block_varied((g, n, k), k)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
 
@@ -136,8 +159,8 @@ def test_mxscale_bmm(g, m, n, k, dtype):
         err = checkAllclose(
             fn_ref.to(dtypes.fp32),
             out.to(dtypes.fp32),
-            rtol=0.1,
-            atol=0.5,
+            rtol=1e-2,
+            atol=1e-2,
             msg=f"mxscale_bmm {name} g={g} m={m} n={n} k={k}",
         )
         ret[f"{name} us"] = us
@@ -164,8 +187,8 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     [G, M, N] order.
     """
     ydt = _DT[dtype]
-    O_bf16 = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
-    W_bf16 = (torch.rand((g, n, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
+    O_bf16 = _block_varied((g, m, k), k)
+    W_bf16 = _block_varied((g, n, k), k)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
 
@@ -211,8 +234,8 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
         err = checkAllclose(
             fn_ref.to(dtypes.fp32),
             out.to(dtypes.fp32),
-            rtol=0.1,
-            atol=0.5,
+            rtol=1e-2,
+            atol=1e-2,
             msg=f"mxscale_bmm_batch_first {name} g={g} m={m} n={n} k={k}",
         )
         ret[f"{name} us"] = us
