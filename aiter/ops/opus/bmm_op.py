@@ -150,8 +150,10 @@ def _lookup_mxscale_bmm(g: int, m: int, n: int, k: int):
 def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
     """Coarse M/G kid picker for shapes not in the tuned CSV.
 
-    kid 150 (256x256) for large-M/high-G; kid 320/640 for small-M; kid 653 the
-    general strong mid/small-M pick; kid 0 (k32 fused) for unaligned shapes.
+    kid 158 (512x256 preload pipeline) for aligned large-M/high-G, falling back
+    to kid 150 (256x256 plain) for K>8192 where 158 early-returns; kid 320/640
+    for small-M; kid 653 the general strong mid/small-M pick; kid 0 (k32 fused)
+    for unaligned shapes.
     """
 
     def div(a: int, b: int) -> bool:
@@ -163,7 +165,14 @@ def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
         and div(k, 128)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
-        return 150
+        # Aligned large M: the preload pipeline (kid158) is the tuned winner
+        # across this whole region (CSV picks 158 for every aligned m>=2048).
+        # kid158 stages the SFA/SFB scales into LDS and early-returns for
+        # K>8192 (SFA_K_MAX), so gate the preload pick at K<=8192 and fall back
+        # to the plain 256x256 (kid150) for K>8192 -- identical to the M-split
+        # bulk_kid rule above. Measured on g=2,n=1024,k=4096: kid150 was 34-51%
+        # slower than 158 at the untuned m=2560/3072/3584 buckets.
+        return 158 if 4096 <= k <= 8192 else 150
     # Sub-tile M: B_M=32/64 tiles mask partial M via buffer OOB, so run any M
     # (no m-alignment needed -- verified 653/321/... run arbitrary unaligned M).
     if m < 64:
