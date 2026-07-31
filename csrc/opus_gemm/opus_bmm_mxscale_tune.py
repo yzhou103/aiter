@@ -72,6 +72,11 @@ from test_opus_a8w8_bmm import (
     run_torch,
 )
 
+# These 128x128x128 split-K-capable kernels are valid and fast at splitK=1
+# (direct Cbf16 output), but their splitK>1 Cvoid workspace instances hit a
+# clang-22 gfx950 greedy-VGPR miscompile under --amdgpu-mfma-vgpr-form.
+_SPLITK1_ONLY_KIDS = {128, 137, 325}
+
 SHIPPED_CSV = os.path.join(
     _REPO,
     "aiter",
@@ -326,6 +331,13 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             n_cand = 0
             for kid in CANDIDATES:
                 for sk in _applicable(kid, b, m, n, k):
+                    # Drop only splitK>1 for these 128x128x128 kernels. splitK=1
+                    # dispatches the direct-output Cbf16 instance (audited/runtime
+                    # clean), while splitK=2/4/8 dispatch the Cvoid fp32-workspace
+                    # instance where clang-22/gfx950 greedy VGPR allocation leaves
+                    # one C-store element unmaterialized under mfma-vgpr-form.
+                    if kid in _SPLITK1_ONLY_KIDS and sk != 1:
+                        continue
                     info = (info_keys, kid, sk, "")
                     task.append(
                         (

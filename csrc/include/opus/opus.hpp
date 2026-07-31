@@ -1919,25 +1919,6 @@ struct gmem {
             int vo_ = v_os;
             asm volatile("" : "+v"(vo_));
             __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, vo_, s_os, aux);
-#elif (defined(__gfx950__) || defined(__gfx942__)) && (__clang_major__ <= 22)
-            // clang<=22 (HIP<=7.2) gfx9 b128-store defect: under high C-store register
-            // expansion (128x128x128 split-K fp32 workspace, 32 C frags/lane) the
-            // `buffer_store_dwordx4` drops a structured set of lane writes -> ~0.8% of the
-            // tile stays 0 in the fresh workspace (~0.9% error). Two `buffer_store_dwordx2`
-            // at offset 0/8 with the identical SRD+voffset (same 16 bytes) are correct, so
-            // the fault is the dwordx4 opcode, not addressing (gfx1250's voffset barrier
-            // does not fix the gfx9 form). Scoped to fp32 (the split-K fp32-workspace class
-            // in a8w8_mxscale BMM + a16w16 splitk); bf16 16B stores (a16w16 direct output,
-            // verified clean) keep the single b128. Compiles out on clang-23/HIP 7.14.
-            if constexpr (sizeof(scalar_type) == 4) {
-                auto xw = __builtin_bit_cast(i32x4_t, x);
-                i32x2_t lo = {xw[0], xw[1]};
-                i32x2_t hi = {xw[2], xw[3]};
-                __builtin_amdgcn_raw_buffer_store_b64(lo, cached_rsrc, v_os,     s_os, aux);
-                __builtin_amdgcn_raw_buffer_store_b64(hi, cached_rsrc, v_os + 8, s_os, aux);
-            } else {
-                __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux);
-            }
 #else
             __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux);
 #endif
