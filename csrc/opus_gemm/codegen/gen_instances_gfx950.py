@@ -1589,14 +1589,9 @@ void
   const int batch = O.size(1);
   const int N = wo_a.size(1);
   const int K = O.size(2);
-  // Partial M tiles handled in-kernel via buffer OOB masking, so B_M<128 tiles
-  // need not have M % B_M == 0. Keep the divisibility requirement for big
-  // (B_M>=128) tiles (never the right pick for tiny M anyway).
-  if constexpr (Traits::B_M >= 128) {
-    AITER_CHECK(M % Traits::B_M == 0,
-                "@@NAME@@ (B_M>=128 tile) requires M % ", Traits::B_M,
-                " == 0, got ", M, " (use a B_M<=64 tile for small M)");
-  }
+  // No M alignment at any tile size: A and SFA are bounded to the tile's valid row
+  // count, the split_k==1 store bounds C the same way, split_k>1 partials go to a
+  // workspace sized for padded_M, and both reducers touch only rows < M.
   AITER_CHECK(N % Traits::B_N == 0,
               "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
   AITER_CHECK(K % Traits::B_K == 0,
@@ -2482,8 +2477,8 @@ void
   const int batch = O.size(1);
   const int N = wo_a.size(1);
   const int K = O.size(2);
-  AITER_CHECK(M % Bf16Traits::B_M == 0,
-              "@@NAME@@ requires M % ", Bf16Traits::B_M, " == 0, got ", M);
+  // No M alignment requirement: the kernel bounds its A / sfa / C buffers to the
+  // tile's valid row window, so a partial trailing M tile is masked by buffer OOB.
   AITER_CHECK(N % Bf16Traits::B_N == 0,
               "@@NAME@@ requires N % ", Bf16Traits::B_N, " == 0, got ", N);
   AITER_CHECK(K % Bf16Traits::B_K == 0,
@@ -2510,7 +2505,7 @@ void
   kargs.stride_sfb = (int)w_scale.stride(1);
   kargs.stride_sfb_batch = (int)w_scale.stride(0);
 
-  const int num_tiles_m = M / Bf16Traits::B_M;
+  const int num_tiles_m = (M + Bf16Traits::B_M - 1) / Bf16Traits::B_M;
   const int num_tiles_n = N / Bf16Traits::B_N;
   dim3 grid_main(num_tiles_m * num_tiles_n, 1, batch);
   dim3 block_main(Bf16Traits::BLOCK_SIZE);
@@ -2635,11 +2630,7 @@ void
   const int batch = O.size(1);
   const int N = wo_a.size(1);
   const int K = O.size(2);
-  if constexpr (Traits::B_M >= 128) {
-    AITER_CHECK(M % Traits::B_M == 0,
-                "@@NAME@@ (B_M>=128 tile) requires M % ", Traits::B_M,
-                " == 0, got ", M);
-  }
+  // No M alignment: the partial tile is masked in-kernel (see the launcher above).
   AITER_CHECK(N % Traits::B_N == 0,
               "@@NAME@@ requires N % ", Traits::B_N, " == 0, got ", N);
   AITER_CHECK(K % Traits::B_K == 0,

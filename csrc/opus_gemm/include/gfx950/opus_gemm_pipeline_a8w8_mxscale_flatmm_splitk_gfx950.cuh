@@ -483,7 +483,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr int SFA_ROWS         = T::B_M / T::GROUP_M;
     constexpr int SF_LDS_ELEMS     =
         PRELOAD_SF_LDS ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX) : 1;
-    __shared__ D_SF smem_sf[SF_LDS_ELEMS];
+    // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
+    // only byte-aligned as far as the language is concerned.
+    __shared__ alignas(16) D_SF smem_sf[SF_LDS_ELEMS];
 
     auto smem_a_at = [&](int slot_k, int m_block, int k_group) -> D_A* {
         return reinterpret_cast<D_A*>(smem_a
@@ -521,6 +523,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         if (opus::thread_id_x() < T::prefetch_k_iter) {
             b_ready[opus::thread_id_x()] = -1;
         }
+        s_waitcnt_lgkmcnt(0_I);  // retire the init writes before other waves read them
         __builtin_amdgcn_s_barrier();
         if ((wave_id & 1) == 0) return;
 
@@ -650,20 +653,35 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         if (loops > SFA_K_TILES_MAX) return;
         const int tid = opus::thread_id_x();
         auto sm_sfa = make_smem(s_sfa_ptr);
-        const int sfa_total = SFA_ROWS * sf_k_scales;
-        for (int idx = tid; idx < sfa_total; idx += T::BLOCK_SIZE) {
-            const int m  = idx / sf_k_scales;
-            const int kt = idx % sf_k_scales;
-            sm_sfa.template store<1>(load<1>(g_sfa, m * kargs.stride_sfa + kt), idx);
-        }
         auto sm_sfb = make_smem(s_sfb_ptr);
+        const int sfa_total = SFA_ROWS * sf_k_scales;
         const int sfb_total = T::N_SCALE_GROUPS * sf_k_scales;
-        for (int idx = tid; idx < sfb_total; idx += T::BLOCK_SIZE) {
-            const int ng = idx / sf_k_scales;
-            const int kt = idx % sf_k_scales;
-            sm_sfb.template store<1>(load<1>(g_sfb, ng * kargs.stride_sfb + kt), idx);
-        }
+        // Copy the widest chunk the panel geometry allows. Byte-at-a-time is 16
+        // grid-stride iterations per thread for the 128-row SFA panel at K=4096
+        // (kid325/326), and the fill sits in front of a barrier, so its latency is
+        // exposed rather than overlapped. A chunk must not span two panel rows and
+        // its source offset must stay naturally aligned, so the width has to divide
+        // both sf_k_scales and the row stride; hence the short-K fallbacks.
+        auto fill = [&](auto vec_c, auto sm, auto g, int stride, int total) {
+            constexpr int VEC = decltype(vec_c)::value;
+            for (int idx = tid * VEC; idx < total; idx += T::BLOCK_SIZE * VEC) {
+                const int r  = idx / sf_k_scales;
+                const int kt = idx - r * sf_k_scales;
+                sm.template store<VEC>(load<VEC>(g, r * stride + kt), idx);
+            }
+        };
+        auto fill_panel = [&](auto sm, auto g, int stride, int total) {
+            const int widths = sf_k_scales | stride;
+            if      ((widths & 15) == 0) fill(number<16>{}, sm, g, stride, total);
+            else if ((widths & 3) == 0)  fill(number<4>{},  sm, g, stride, total);
+            else                         fill(number<1>{},  sm, g, stride, total);
+        };
+        fill_panel(sm_sfa, g_sfa, kargs.stride_sfa, sfa_total);
+        fill_panel(sm_sfb, g_sfb, kargs.stride_sfb, sfb_total);
+        // vmcnt retires the global reads feeding the panel; lgkmcnt retires the
+        // ds_writes that actually publish it. s_barrier does neither on its own.
         s_waitcnt_vmcnt(0_I);
+        s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
     }
 
@@ -812,11 +830,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         auto do_scaled_mma = [&](const auto& va, const auto& vb,
                                  const vtype_sfa& v_sfa, const vtype_sfb& v_sfb) {
             if constexpr (PRELOAD_SF_LDS) {
-                // SFA/SFB now come from LDS; wait on the ds_read (lgkmcnt) rather
-                // than a global vmcnt. lgkmcnt(0) also drains the just-issued
-                // next-buffer A/B ds_reads -- acceptable for this prototype since
-                // it trades the (much longer) global scale-load stall for the
-                // short LDS-read latency.
+                // Scales come from LDS now, so wait on lgkmcnt rather than vmcnt.
+                // This also drains the just-issued next-buffer A/B ds_reads, still
+                // a win against the global scale-load stall it replaces.
                 s_waitcnt_lgkmcnt(0_I);
             } else {
                 s_waitcnt_vmcnt(0_I);
@@ -1031,6 +1047,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         if (opus::thread_id_x() == 0) {
             fused_do_reduce = 0;
         }
+        s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         __builtin_amdgcn_s_barrier();
@@ -1043,6 +1060,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             const int old = __atomic_fetch_add(counters + tile_id, 1, __ATOMIC_ACQ_REL);
             fused_do_reduce = (old == kargs.split_k - 1);
         }
+        // Every thread branches on this below, so lane 0's write has to be retired
+        // (not merely issued) before the barrier lets the rest read it.
+        s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
         if (fused_do_reduce) {

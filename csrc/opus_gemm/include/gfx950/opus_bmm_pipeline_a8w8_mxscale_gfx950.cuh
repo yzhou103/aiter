@@ -101,6 +101,11 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
     const int tiles_per_group = GROUP_M * num_tiles_n;
+
+    // A batch swizzle here (advance batch once per panel, spreading the C drain
+    // over more memory channels) was 15% faster in isolation but 1.5% slower in
+    // DPA serving: it pays for those channels with the GROUP_M reuse above, and a
+    // real step arrives with L2 contended. See opus_bmm.md.
     const int group_id = wgid / tiles_per_group;
     const int first_m = group_id * GROUP_M;
     const int local = wgid - group_id * tiles_per_group;
@@ -113,16 +118,32 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 
-    // Base offsets must be computed in 64-bit: with a batch-in-the-middle layout
-    // stride_*_batch = M*K (A) / M*N (C), so batch_id*stride_*_batch overflows a
-    // 32-bit int well before the 4 GiB buffer limit (e.g. M=131072,K=4096 gives
-    // stride_a_batch=5.4e8, so batch_id>=4 wraps int32). Cast the batch/row
-    // products to size_t so the pointer arithmetic stays exact.
-    auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + (size_t)batch_id*kargs.stride_a_batch + (size_t)row*kargs.stride_a);
-    auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + (size_t)batch_id*kargs.stride_b_batch + (size_t)col*kargs.stride_b);
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + (size_t)batch_id*kargs.stride_c_batch + (size_t)row*kargs.stride_c + col);
+    // Base offsets in 64-bit: with a batch-in-the-middle layout stride_*_batch is
+    // M*K (A) / M*N (C), which overflows int32 well before the 4 GiB buffer limit.
+    //
+    // OOB masking for partial M tiles: bound A / sfa / C to this tile's valid row
+    // window so lanes past M read 0 and their stores are dropped by num_records.
+    // Any M then runs on a B_M tile (N and K stay divisible, so B and sfb need no
+    // bound); the garbage accumulated for masked rows is never stored.
+    //
+    // Clamp to B_M rather than the full (M - row) span: stride_a = batch*K here,
+    // so rows_avail*stride_a would overflow the 32-bit num_records field and wrap
+    // on a large-M / high-batch shape. Each WG owns one B_M tile and the base is
+    // already at `row`, so the clamp still masks the tail.
+    const int rows_left  = kargs.m - row;
+    const int rows_avail = rows_left < T::B_M ? rows_left : T::B_M;
+    const unsigned int a_bytes =
+        (unsigned int)rows_avail * (unsigned int)kargs.stride_a * sizeof(D_A);
+    const unsigned int c_bytes =
+        (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_C);
+    const unsigned int sfa_bytes =
+        (unsigned int)ceil_div(rows_avail, T::GROUP_M) * (unsigned int)kargs.stride_sfa * sizeof(D_SF);
 
-    auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + (size_t)batch_id*kargs.stride_sfa_batch + (size_t)(row/T::GROUP_M)*kargs.stride_sfa);
+    auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + (size_t)batch_id*kargs.stride_a_batch + (size_t)row*kargs.stride_a, a_bytes);
+    auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + (size_t)batch_id*kargs.stride_b_batch + (size_t)col*kargs.stride_b);
+    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + (size_t)batch_id*kargs.stride_c_batch + (size_t)row*kargs.stride_c + col, c_bytes);
+
+    auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + (size_t)batch_id*kargs.stride_sfa_batch + (size_t)(row/T::GROUP_M)*kargs.stride_sfa, sfa_bytes);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + (size_t)batch_id*kargs.stride_sfb_batch + (size_t)(col/T::GROUP_N)*kargs.stride_sfb);
 
     int wave_id_m = wave_id % T::T_M;
@@ -200,7 +221,9 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     constexpr int SFA_ROWS      = T::B_M / T::GROUP_M;
     constexpr int SFA_LDS_BYTES =
         PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_K_TILES_MAX * (int)sizeof(D_SF)) : 1;
-    __shared__ char smem_sfa[SFA_LDS_BYTES];
+    // 16B-aligned so the panel fill below can land ds_write_b128; a bare char
+    // array is only byte-aligned as far as the language is concerned.
+    __shared__ alignas(16) char smem_sfa[SFA_LDS_BYTES];
     D_SF* s_sfa_ptr = reinterpret_cast<D_SF*>(smem_sfa);
     // Runtime packed K-tile count (== loops); used as the compact LDS M-row
     // stride so the read layout reuses make_layout_sfa with stride_sfa replaced.
@@ -245,7 +268,10 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
             return load(g_sfb, sfb_offset(half_tile_n, tile_k));
         }
     };
-    // Steady-state vmcnt contribution of the SFB global loads (0 once preloaded).
+    // A preloaded panel is read from LDS and issues no vm ops, so it must drop out
+    // of every vmcnt threshold below: over-counting retires the wait early and lets
+    // the barrier release while the A/B async_loads are still landing.
+    constexpr int SFA_VM = PRELOAD_SFA_LDS ? 0 : T::sfa_buffer_load_insts;
     constexpr int SFB_VM = PRELOAD_SFB_LDS ? 0 : T::sfb_buffer_load_insts;
 
     if constexpr (K1024_ONLY) {
@@ -261,32 +287,61 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     const int loops = K1024_ONLY ? 8 : ceil_div(kargs.k, T::B_K);
     int tic = 0, toc = 1;
 
-    // kid157: cooperative one-shot fill of the A-scale panel into LDS. Grid-stride
-    // over the SFA_ROWS*sfa_k_tiles scalar bytes; a barrier publishes the panel
-    // before the first per-tile read below.
+    // kid158: issue the B-scale fetch before the A panel fill so the two global round
+    // trips overlap -- the A fill's own vmcnt(0) retires this load too. The panel is
+    // under one byte per thread, so one predicated load covers it and the value can
+    // sit in a register across the A fill.
+    using sfb_reg_t = decltype(load<1>(g_sfb, 0));
+    sfb_reg_t sfb_val{};
+    bool sfb_take = false;
+    if constexpr (PRELOAD_SFB_LDS) {
+        static_assert(SFB_ROWS * SFB_K_TILES_MAX * SFB_SPK <= T::BLOCK_SIZE,
+                      "B-scale panel must fit one byte per thread");
+        const int tid = opus::thread_id_x();
+        sfb_take = tid < SFB_ROWS * sfb_k_scales;
+        if (sfb_take) {
+            const int ng = tid / sfb_k_scales;
+            const int ks = tid - ng * sfb_k_scales;
+            sfb_val = load<1>(g_sfb, ng * kargs.stride_sfb + ks);
+        }
+    }
+
+    // kid157: one-shot cooperative fill of the A-scale panel into LDS, published by
+    // the barrier below. Byte-at-a-time was 16 iterations per thread at K=4096, each
+    // stalling on its own vmcnt(0). A chunk must not span two M rows nor land
+    // unaligned, so the width has to divide both sfa_k_tiles and stride_sfa.
     if constexpr (PRELOAD_SFA_LDS) {
         auto s_sfa = make_smem(s_sfa_ptr);
         const int tid = opus::thread_id_x();
         const int sfa_total = SFA_ROWS * sfa_k_tiles;
-        for (int idx = tid; idx < sfa_total; idx += T::BLOCK_SIZE) {
-            int m   = idx / sfa_k_tiles;
-            int kt  = idx % sfa_k_tiles;
-            s_sfa.template store<1>(load<1>(g_sfa, m * kargs.stride_sfa + kt), idx);
-        }
-        __builtin_amdgcn_s_barrier();
+        auto fill = [&](auto vec_c) {
+            constexpr int VEC = decltype(vec_c)::value;
+            for (int idx = tid * VEC; idx < sfa_total; idx += T::BLOCK_SIZE * VEC) {
+                const int m  = idx / sfa_k_tiles;
+                const int kt = idx - m * sfa_k_tiles;
+                s_sfa.template store<VEC>(
+                    load<VEC>(g_sfa, m * kargs.stride_sfa + kt), idx);
+            }
+        };
+        const int widths = sfa_k_tiles | kargs.stride_sfa;
+        if      ((widths & 15) == 0) fill(number<16>{});
+        else if ((widths & 3) == 0)  fill(number<4>{});
+        else                         fill(number<1>{});
     }
 
-    // kid158: cooperative one-shot fill of the B-scale panel into LDS. Grid-stride
-    // over the SFB_ROWS*sfb_k_scales scalar bytes; barrier publishes before use.
+    // Land the B scale fetched above; its latency is already spent by now.
     if constexpr (PRELOAD_SFB_LDS) {
-        auto s_sfb = make_smem(s_sfb_ptr);
-        const int tid = opus::thread_id_x();
-        const int sfb_total = SFB_ROWS * sfb_k_scales;
-        for (int idx = tid; idx < sfb_total; idx += T::BLOCK_SIZE) {
-            int ng = idx / sfb_k_scales;
-            int ks = idx % sfb_k_scales;
-            s_sfb.template store<1>(load<1>(g_sfb, ng * kargs.stride_sfb + ks), idx);
+        if (sfb_take) {
+            make_smem(s_sfb_ptr).template store<1>(sfb_val, opus::thread_id_x());
         }
+    }
+
+    // One barrier for both panels: draining after each fill in turn cost two full
+    // global round trips, since B could not issue until A's barrier released. The
+    // panels live in disjoint LDS, so the fills need no ordering between them.
+    // s_barrier does not retire LDS traffic, hence the explicit lgkmcnt wait.
+    if constexpr (PRELOAD_SFA_LDS || PRELOAD_SFB_LDS) {
+        s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
     }
 
@@ -302,7 +357,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
 
     if (wave_id_n == 1) __builtin_amdgcn_s_barrier();
 
-    s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + T::sfa_buffer_load_insts + SFB_VM>{});
+    s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFA_VM + SFB_VM>{});
     __builtin_amdgcn_s_barrier();
 
     v_sfa[toc][0] = load_sfa(0, 1);
@@ -311,7 +366,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1));
     async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, 1));
 
-    s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + T::sfa_buffer_load_insts + SFB_VM>{});
+    s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + SFA_VM + SFB_VM>{});
     __builtin_amdgcn_s_barrier();
 
     v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
@@ -375,7 +430,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         s_waitcnt_vmcnt(number<
             2 * T::a_buffer_load_insts +
             T::b_buffer_load_insts +
-            2 * T::sfa_buffer_load_insts +
+            2 * SFA_VM +
             SFB_VM>{});
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -444,7 +499,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         v_sfa[toc][0] = load_sfa(0, tile + 3);
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 3));
-        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + SFB_VM>{});
+        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * SFA_VM + SFB_VM>{});
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
@@ -486,7 +541,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         __builtin_amdgcn_sched_barrier(0);
 
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFB_VM + 2 * T::sfa_buffer_load_insts>{});
+        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFB_VM + 2 * SFA_VM>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -504,7 +559,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     {
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + SFB_VM + T::sfa_buffer_load_insts>{});
+        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + SFB_VM + SFA_VM>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
