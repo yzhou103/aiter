@@ -2,12 +2,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Framework tuner for the opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a).
 
-This is the *shareable* counterpart to the standalone
-``op_tests/_tune_bmm_mxscale.py``: same op, same verification data, same
-correctness gate, but wired into the canonical :class:`GemmCommonTuner` so it
-runs exactly like the other aiter GEMM tuners --- multi-GPU via ``mp_tuner``,
-standard ``-i/--untune_file`` / ``-o/--tune_file`` CLI, batching, and the shared
-post-process / CSV writer.
+Wired into the canonical :class:`GemmCommonTuner`, so it runs like the other
+aiter GEMM tuners: multi-GPU via ``mp_tuner``, standard ``-i/--untune_file`` /
+``-o/--tune_file`` CLI, batching, and the shared post-process / CSV writer.
+
+The candidate pool lives here (``_TUNE_POLICY``). Per kid it holds only the
+split-K factors to sweep; tile geometry, kernelName and the M alignment come from
+the codegen instance table, so a kid cannot be tuned on a shape its launcher
+rejects. That alignment used to be a second hand-maintained column and was wrong
+in both directions -- it hid kid326, which is really arbitrary-M, from every
+unaligned shape while the runtime dispatched it there anyway.
 
 Runtime schema (what the tuner emits, and what the runtime reads back):
     gfx,b,m,n,k,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
@@ -54,17 +58,19 @@ from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
-# The candidate pool, splitK filter and quant helpers are the single source of
-# truth in op_tests; import them so this tuner can never drift from the
-# standalone script or the unit test. op_tests is not a package, so put it on
-# sys.path (works in the spawned mp_tuner subprocesses too, since they re-import
-# this module top-to-bottom).
-_REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Neither op_tests nor this directory is a package, so put both on sys.path. This
+# also has to hold in the spawned mp_tuner subprocesses, which re-import this
+# module top-to-bottom.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _OPTESTS = os.path.join(_REPO, "op_tests")
-if _OPTESTS not in sys.path:
-    sys.path.insert(0, _OPTESTS)
+for _p in (_HERE, _OPTESTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from _tune_bmm_mxscale import CANDIDATES, _applicable
+# opus_gemm_common is pure python (stdlib only), so importing the codegen kid
+# table here does not pull in the build.
+from opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -72,10 +78,112 @@ from test_opus_a8w8_bmm import (
     run_torch,
 )
 
-# These 128x128x128 split-K-capable kernels are valid and fast at splitK=1
-# (direct Cbf16 output), but their splitK>1 Cvoid workspace instances hit a
-# clang-22 gfx950 greedy-VGPR miscompile under --amdgpu-mfma-vgpr-form.
-_SPLITK1_ONLY_KIDS = {128, 137, 325}
+# kid -> OpusGemmInstance. Kids are disjoint across the BMM families today;
+# assert so a future collision (which the codegen dedups by launcher name
+# downstream) is caught here instead of silently tuning one of the two.
+_CODEGEN_BMM = {}
+for _fam in a8w8_mxscale_bmm_kernel_lists:
+    for _kid, _inst in _fam.items():
+        assert (
+            _kid not in _CODEGEN_BMM
+        ), f"bmm kid {_kid} collides across codegen families; disambiguate by name"
+        _CODEGEN_BMM[_kid] = _inst
+
+# Split-K sweep for the flatmm_splitk family. Small-M / few-tile shapes (the G16
+# wo_a decode: 16 batch * n1024 * k4096) underfill the CUs at splitK=1, so split-K
+# (fp32-workspace partials + fused reduce tail) can win by exposing parallelism
+# along K. The correctness gate drops any combo a kernel mishandles, so an
+# over-broad sweep is safe, just slower.
+_SK = [1, 2, 4, 8]
+
+# Tuning policy: kid -> splitK list. The ONLY hand-maintained per-kid metadata --
+# it decides which kids to sweep and with which split-K factors, not their
+# geometry and not their M alignment. Tile shape, kernelName and m_align all come
+# from the codegen instance, so this cannot drift from what compiles. kid 0 (the
+# heuristic default) is intentionally not tuned.
+_TUNE_POLICY = {
+    # flatmm_splitk family: the M=16/32 last-mile tiles, the mid-M SFA/SFB-preload
+    # tiles and the 64x* tiles. All are split-K capable via the fused reduce tail,
+    # except kid646 whose persistent DIRECT_ONLY schedule requires splitK == 1.
+    32: _SK,
+    64: _SK,
+    138: _SK,
+    139: _SK,
+    256: _SK,
+    311: _SK,
+    312: _SK,
+    313: _SK,
+    314: _SK,
+    316: _SK,
+    317: _SK,
+    318: _SK,
+    319: _SK,
+    320: _SK,
+    321: _SK,
+    322: _SK,
+    323: _SK,
+    324: _SK,
+    326: _SK,
+    327: _SK,
+    640: _SK,
+    642: _SK,
+    646: [1],
+    650: _SK,
+    653: _SK,
+    # fused single-tile launcher.
+    100: [1],
+    # pipeline family; kid158 preloads both the per-token SFA and the block SFB
+    # panel into LDS.
+    149: [1],
+    150: [1],
+    151: [1],
+    152: [1],
+    158: [1],
+    # monolithic mouter / wave pipelines.
+    131: [1],
+    132: [1],
+    134: [1],
+    142: [1],
+    144: [1],
+    148: [1],
+    160: [1],
+    161: [1],
+    # minterleave only exists in split-K form.
+    162: [2, 4, 8],
+    163: [2, 4, 8],
+    # 128x128x128 tiles, splitK=1 only and deliberately so. They are the largest
+    # BMM tile (COM_REP_M=4 x COM_REP_N=8 -> 32 C fragments, 128 fp32 C values per
+    # lane) at 512 VGPRs / occupancy 1. At splitK=1 they run the Cbf16
+    # direct-output kernel and are strong -- kid325 wins 5 shipped wo_a rows. At
+    # splitK>1 they switch to the Cvoid fp32-workspace kernel, which spills and has
+    # never won (g2/m256: best kid325 split-K is 23.6us against the 14.5us winner),
+    # and which is also where the clang-22 gfx950 greedy-VGPR miscompile lives (one
+    # C-fragment dword left unmaterialized under --amdgpu-mfma-vgpr-form).
+    128: [1],
+    137: [1],
+    325: [1],
+}
+
+# Only the flatmm_splitk (non-direct) and minterleave launchers honor splitK>1.
+# Any other family sweeping it is a policy bug, so fail loudly at import.
+for _kid, _sks in _TUNE_POLICY.items():
+    if any(s > 1 for s in _sks):
+        _tag = _CODEGEN_BMM[_kid].kernel_tag
+        assert (
+            _tag == "a8w8_mxscale_bmm_flatmm_splitk"
+            and not getattr(_CODEGEN_BMM[_kid], "direct_only", False)
+        ) or _tag == "a8w8_mxscale_bmm_minterleave", (
+            f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
+        )
+
+
+def _applicable(kid, g, m, n, k):
+    """Split-K factors worth trying for this kid on this shape ([] == skip it)."""
+    k_inst = _CODEGEN_BMM[kid]
+    if n % k_inst.B_N or k % k_inst.B_K or m % k_inst.m_align:
+        return []
+    return _TUNE_POLICY[kid]
+
 
 SHIPPED_CSV = os.path.join(
     _REPO,
@@ -172,8 +280,8 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
-        cand = CANDIDATES.get(int(kernelId))
-        return cand[5] if cand else None
+        k_inst = _CODEGEN_BMM.get(int(kernelId))
+        return k_inst.name if k_inst else None
 
     def calculate(self, results, bpes=None):
         info, time, _err = results
@@ -182,7 +290,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         _gfx, b, m, n, k = info[0]
         us_s = time * 1e-6
         tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
-        # fp8 A + fp8 W + bf16 out (matches _tune_bmm_mxscale bandwidth model).
+        # fp8 A + fp8 W + bf16 out.
         bw = round((b * m * k + b * n * k + 2 * b * m * n) / us_s / 1e9, 2)
         return tflops, bw
 
@@ -329,15 +437,8 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             info_keys = (gfx, b, m, n, k)
 
             n_cand = 0
-            for kid in CANDIDATES:
+            for kid in _TUNE_POLICY:
                 for sk in _applicable(kid, b, m, n, k):
-                    # Drop only splitK>1 for these 128x128x128 kernels. splitK=1
-                    # dispatches the direct-output Cbf16 instance (audited/runtime
-                    # clean), while splitK=2/4/8 dispatch the Cvoid fp32-workspace
-                    # instance where clang-22/gfx950 greedy VGPR allocation leaves
-                    # one C-store element unmaterialized under mfma-vgpr-form.
-                    if kid in _SPLITK1_ONLY_KIDS and sk != 1:
-                        continue
                     info = (info_keys, kid, sk, "")
                     task.append(
                         (
