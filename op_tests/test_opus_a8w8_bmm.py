@@ -7,13 +7,20 @@ batch-major [G, M, *]); wo_a + w_scale stay batch-major. Activation scale is
 per-token e8m0 (GROUP_M=1), weight scale is 128x128-block e8m0. Candidates are
 the curated flatmm kernel IDs; the reference is a dequantized fp32 einsum.
 
+``--check-m-align`` runs a different check instead of the sweep: an every-kid
+guard that OpusGemmInstance.m_align still matches launcher behaviour (see
+``check_m_align``). It is kept out of the sweep because it deliberately provokes
+launch failures and needs no timing.
+
 Usage:
     python3 op_tests/test_opus_a8w8_bmm.py
     python3 op_tests/test_opus_a8w8_bmm.py -s 512,1024,4096 -g 2 -d bf16
+    python3 op_tests/test_opus_a8w8_bmm.py --check-m-align
 """
 
 import argparse
 import itertools
+import sys
 
 import pandas as pd
 import torch
@@ -245,6 +252,129 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     return ret
 
 
+# --- m_align guard ---------------------------------------------------------
+# Straddles every tile boundary in the family (B_M is 16/32/64/128/256) and every
+# declared m_align (1 / B_M / 2*B_M), with aligned and unaligned M on both sides.
+_ALIGN_MS = [1, 17, 48, 64, 96, 127, 128, 129, 200, 255, 256, 512]
+_ALIGN_G = 2
+# (N, K) candidates: the second entry serves the k1024-only pipeline kids.
+_ALIGN_SHAPES = [(1024, 4096), (1024, 1024)]
+_ALIGN_ERR_TOL = 0.003  # e8m0 quant floor is ~0.0014; same gate the tuner uses
+
+
+def _align_kids():
+    # Imported here so the sweep and the many scripts reusing the helpers above
+    # never need the codegen package on sys.path.
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return {
+        int(kid): inst
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+    }
+
+
+_ALIGN_INPUTS = {}
+
+
+def _align_inputs(m, n, k):
+    """Quantized inputs + fp32 reference for one shape, shared across kids."""
+    key = (m, n, k)
+    if key not in _ALIGN_INPUTS:
+        g = _ALIGN_G
+        O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
+        W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
+        ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+        _ALIGN_INPUTS[key] = (
+            O_mx.transpose(0, 1),
+            W_mx,
+            xs_mx.transpose(0, 1),
+            ws_mx,
+            ref,
+        )
+    return _ALIGN_INPUTS[key]
+
+
+def _align_run(kid, m, n, k):
+    """Return (ok, rel_err). ok False means the launcher refused the shape."""
+    O_in, W_mx, xs_in, ws_mx, ref = _align_inputs(m, n, k)
+    # NaN-filled so a row the kernel never writes shows up as nan, not as a
+    # plausible value that a mean error would dilute.
+    Y = torch.full((m, _ALIGN_G, n), float("nan"), dtype=dtypes.bf16)
+    try:
+        _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
+        torch.cuda.synchronize()
+    except RuntimeError:
+        # The launcher's AITER_CHECK on M surfaces here. Deliberately not a
+        # blanket except: a harness bug must fail loudly, not read as a refusal.
+        return False, 0.0
+    d = (Y.to(dtypes.fp32) - ref).abs()
+    # Per-row, not global: one wrong row out of a long M barely moves the mean.
+    rows = d.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+    return True, rows.max().item()
+
+
+def _align_pick_shape(kid, inst):
+    """First (N, K) this kid accepts at an aligned M, or None if it accepts none."""
+    for n, k in _ALIGN_SHAPES:
+        if n % inst.B_N or k % inst.B_K:
+            continue
+        if _align_run(kid, max(inst.m_align, inst.B_M), n, k)[0]:
+            return n, k
+    return None
+
+
+def check_m_align():
+    """Assert OpusGemmInstance.m_align matches what each mxscale BMM kid does.
+
+    m_align says which M values a kid's launcher accepts (1 == it masks a partial
+    M tile). Both the runtime's padded-M lookup (aiter/ops/opus/bmm_op.py) and a
+    tuner's candidate filter act on it, so a wrong value is not merely cosmetic:
+    too strict hides the fastest kernel from tuning (kid326 lost ~9% at the DSV4
+    wo_a decode shapes that way, while the runtime dispatched it at those very
+    M), too loose makes both propose a kid whose launcher throws.
+
+    For every kid this checks the declaration against observed behaviour: at an M
+    the declaration accepts, the launch must succeed and match the dequantized
+    fp32 reference; at an M it rejects, the launch must raise. Kids are never
+    silently skipped -- an unrunnable kid is reported.
+    """
+    kids = _align_kids()
+    failures, unrunnable = [], []
+
+    for kid, inst in sorted(kids.items()):
+        shape = _align_pick_shape(kid, inst)
+        if shape is None:
+            unrunnable.append(kid)
+            continue
+        n, k = shape
+        align = inst.m_align
+        for m in _ALIGN_MS:
+            ok, err = _align_run(kid, m, n, k)
+            if m % align == 0:
+                if not ok:
+                    failures.append(f"kid {kid}: m_align={align} but M={m} rejected")
+                elif not (err <= _ALIGN_ERR_TOL):
+                    failures.append(
+                        f"kid {kid}: M={m} accepted but worst row rel err "
+                        f"{err:.4f} > {_ALIGN_ERR_TOL}"
+                    )
+            elif ok:
+                failures.append(
+                    f"kid {kid}: m_align={align} claims M={m} unusable, "
+                    f"but it ran (worst row rel err {err:.4f}) -- m_align too strict"
+                )
+
+    assert not unrunnable, (
+        f"kids that ran on no test shape: {unrunnable}; extend _ALIGN_SHAPES so "
+        f"the guard keeps covering them"
+    )
+    assert not failures, "m_align disagrees with the launcher:\n  " + "\n  ".join(
+        failures
+    )
+    return len(kids)
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -289,7 +419,23 @@ def main():
         ],
         help="(m,n,k) shapes to sweep",
     )
+    parser.add_argument(
+        "--check-m-align",
+        action="store_true",
+        help="run the every-kid m_align guard instead of the perf sweep",
+    )
     args = parser.parse_args()
+
+    if args.check_m_align:
+        try:
+            n_kids = check_m_align()
+        except AssertionError as exc:
+            aiter.logger.error("m_align guard FAILED: %s", exc)
+            sys.exit(1)
+        aiter.logger.info(
+            "m_align matches launcher behaviour for all %d mxscale BMM kids", n_kids
+        )
+        return
 
     for dtype in args.dtype:
         df = []

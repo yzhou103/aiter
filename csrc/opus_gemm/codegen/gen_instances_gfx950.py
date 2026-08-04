@@ -1550,6 +1550,23 @@ void
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
 
 
+def _assert_m_align(k, tile_mult):
+    """Tie the declared m_align to the M guard the launcher body actually emits.
+
+    `tile_mult` is the B_M multiple the body below hardcodes in its AITER_CHECK,
+    or 0 when it emits no M check because the kernel masks the partial tile.
+    OpusGemmInstance.m_align is what the tuner's candidate filter and the
+    runtime's padded-M lookup read, so a guard edit that forgets to update
+    _BMM_M_ALIGN_TILES must fail the build rather than silently teach the two
+    consumers a wrong alignment.
+    """
+    expect = k.B_M * tile_mult if tile_mult else 1
+    assert k.m_align == expect, (
+        f"{k.name}: launcher guards M % {expect} == 0 but m_align says "
+        f"{k.m_align}; fix _BMM_M_ALIGN_TILES in opus_gemm_common.py"
+    )
+
+
 # Body of the a8w8_mxscale BMM flatmm split-K launcher (mmajor layout), a
 # faithful port of opus_bmm_a8w8_mxscale_flatmm_splitk_impl() in
 # opus_bmm.cu. Written with @@TOKEN@@ placeholders + .replace() (NOT an
@@ -2784,27 +2801,42 @@ register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)
 register_emit("gfx950", "a16w16_flatmm_splitk", gen_flatmm_splitk_instance)
-register_emit(
-    "gfx950",
-    "a8w8_mxscale_bmm_flatmm_splitk",
-    gen_bmm_mxscale_flatmm_splitk_instance,
+
+
+def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):
+    """register_emit + the m_align cross-check for the BMM families.
+
+    `launcher_tile_mult` is the B_M multiple this family's launcher body
+    hardcodes in its M guard, or 0 for the bodies that mask a partial M tile and
+    emit no M check. Checking it at emit time is what stops the guard and
+    OpusGemmInstance.m_align -- which the tuner and the runtime dispatch both
+    read -- from drifting apart.
+    """
+
+    def emit(cg, k, **kwargs):
+        _assert_m_align(k, launcher_tile_mult)
+        return fn(cg, k, **kwargs)
+
+    emit.__name__ = fn.__name__
+    register_emit("gfx950", kernel_tag, emit)
+
+
+# _BMM_MXSCALE_SPLITK_LAUNCHER_BODY / _BMM_PIPELINE_LAUNCHER_BODY /
+# _BMM_FUSED_LAUNCHER_BODY emit no M check ("No M alignment ..."); minterleave
+# guards MI(=2)*B_M, wave4m2 guards LOGICAL_B_M(=2*B_M), the rest guard B_M.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_flatmm_splitk", gen_bmm_mxscale_flatmm_splitk_instance, 0
 )
-register_emit(
-    "gfx950",
-    "a8w8_mxscale_bmm_minterleave",
-    gen_bmm_mxscale_minterleave_instance,
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_minterleave", gen_bmm_mxscale_minterleave_instance, 2
 )
-register_emit("gfx950", "a8w8_mxscale_bmm_fused", gen_bmm_mxscale_fused_instance)
-register_emit("gfx950", "a8w8_mxscale_bmm_pipeline", gen_bmm_mxscale_pipeline_instance)
-register_emit("gfx950", "a8w8_mxscale_bmm_mouter", gen_bmm_mxscale_mouter_instance)
-register_emit(
-    "gfx950",
-    "a8w8_mxscale_bmm_mouter_tunable",
-    gen_bmm_mxscale_mouter_tunable_instance,
+_register_bmm_emit("a8w8_mxscale_bmm_fused", gen_bmm_mxscale_fused_instance, 0)
+_register_bmm_emit("a8w8_mxscale_bmm_pipeline", gen_bmm_mxscale_pipeline_instance, 0)
+_register_bmm_emit("a8w8_mxscale_bmm_mouter", gen_bmm_mxscale_mouter_instance, 1)
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_mouter_tunable", gen_bmm_mxscale_mouter_tunable_instance, 1
 )
-register_emit("gfx950", "a8w8_mxscale_bmm_wave8n2", gen_bmm_mxscale_wave8n2_instance)
-register_emit(
-    "gfx950",
-    "a8w8_mxscale_bmm_wave4m2_selfload",
-    gen_bmm_mxscale_wave4m2_selfload_instance,
+_register_bmm_emit("a8w8_mxscale_bmm_wave8n2", gen_bmm_mxscale_wave8n2_instance, 1)
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_wave4m2_selfload", gen_bmm_mxscale_wave4m2_selfload_instance, 2
 )

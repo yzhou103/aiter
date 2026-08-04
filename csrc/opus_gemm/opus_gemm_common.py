@@ -228,6 +228,42 @@ class OpusGemmInstance:
             parts.append(f"cA{self.cachectl_a}cB{self.cachectl_b}")
         return "_".join(parts)
 
+    @property
+    def m_align(self) -> int:
+        """M multiple this kid's generated host guard enforces (1 == any M).
+
+        The launcher family decides it, not the kid: see _BMM_M_ALIGN_TILES and
+        the AITER_CHECK blocks the matching launcher body in
+        codegen/gen_instances_gfx950.py emits. Consumers that pick a kid for a
+        shape (the tuner's candidate filter, the runtime's padded-M lookup) must
+        read it from here rather than keep their own list -- two hand-maintained
+        copies is exactly how kid326 ended up excluded from tuning while the
+        runtime dispatched it anyway.
+        """
+        mult = _BMM_M_ALIGN_TILES.get(self.kernel_tag)
+        if mult is not None:
+            return self.B_M * mult if mult else 1
+        # Non-BMM families: has_oob is the codegen flag that says whether the
+        # tail is masked, and opus_gemm_tune.py already gates on it this way.
+        return 1 if self.has_oob else self.B_M
+
+
+# a8w8_mxscale BMM launcher family -> the B_M multiple its host guard requires,
+# or 0 when the launcher masks a partial M tile and emits no M check at all.
+# Mirrors the AITER_CHECK blocks in the launcher bodies of
+# codegen/gen_instances_gfx950.py (_BMM_*_LAUNCHER_BODY); gen_instances asserts
+# the two agree, so a guard edit that forgets this table fails the build.
+_BMM_M_ALIGN_TILES = {
+    "a8w8_mxscale_bmm_flatmm_splitk": 0,
+    "a8w8_mxscale_bmm_pipeline": 0,
+    "a8w8_mxscale_bmm_fused": 0,
+    "a8w8_mxscale_bmm_minterleave": 2,  # MI=2 M tiles per WG, baked in
+    "a8w8_mxscale_bmm_wave4m2_selfload": 2,  # LOGICAL_B_M = B_M * 2
+    "a8w8_mxscale_bmm_wave8n2": 1,
+    "a8w8_mxscale_bmm_mouter": 1,
+    "a8w8_mxscale_bmm_mouter_tunable": 1,
+}
+
 
 def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl_b=17):
     """Factory for a16w16 split-barrier kid instances.

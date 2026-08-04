@@ -102,16 +102,29 @@ def _mxscale_bmm_buckets() -> dict:
     return buckets
 
 
-# Kids that predicate partial M via buffer OOB and so run any M. Their launchers
-# grid on ceil_div(M, B_M) and bound A / sfa / C to the tile's valid row window;
-# split-K partials land in a padded_M workspace. 163 is excluded: its minterleave
-# store path is not OOB-masked, so it still needs M % B_M == 0.
-ARBITRARY_M_KIDS = frozenset(
-    # flatmm-splitk family, every tile size
-    {128, 137, 139, 311, 313, 320, 321, 324, 325, 326, 640, 650, 653}
-    # a8w8 mxscale pipeline family
-    | {149, 150, 151, 152, 158}
-)
+@functools.cache
+def _mxscale_kid_m_align() -> dict[int, int]:
+    """kid -> M multiple its launcher requires (1 == it masks a partial M tile).
+
+    Comes from the codegen instance table, which is also what the tuner filters
+    candidates on. This used to be a hand-kept kid allowlist here and a second
+    hand-kept m_align column in the tuner, and the two disagreed: kid326 was
+    dispatched at unaligned M by this file while the tuner never tuned it there,
+    which cost ~9% at the wo_a decode shapes.
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return {
+        int(kid): int(inst.m_align)
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+    }
+
+
+def _kid_runs_m(kid: int, m: int) -> bool:
+    """True iff kid's launcher accepts this M (unknown kid -> assume it does not)."""
+    align = _mxscale_kid_m_align().get(int(kid))
+    return align is not None and m % align == 0
 
 
 def _lookup_mxscale_bmm(g: int, m: int, n: int, k: int):
@@ -216,12 +229,10 @@ def bmm_a8w8_mxscale_opus(
 
     if kernelId is None:
         cfg, padded_m = _lookup_mxscale_bmm(g, m, n, k)
-        # Accept an exact hit, or a padded-M hit whose kernel is OOB-masked (it runs
-        # the real, smaller M with no pad/copy). A padded-M hit on an aligned-only
-        # tile is rejected: that kernel asserts M % B_M == 0.
-        if cfg is not None and (
-            padded_m == m or int(cfg["kernelId"]) in ARBITRARY_M_KIDS
-        ):
+        # Accept an exact hit, or a padded-M hit whose kernel accepts the real,
+        # smaller M (it runs it with no pad/copy). A padded-M hit on an
+        # aligned-only tile is rejected: that kernel's launcher would throw.
+        if cfg is not None and (padded_m == m or _kid_runs_m(int(cfg["kernelId"]), m)):
             kernelId = int(cfg["kernelId"])
             if splitK is None:
                 splitK = int(cfg["splitK"])
