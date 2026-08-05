@@ -263,9 +263,11 @@ __global__ void splitk_reduce_kernel(
 // the split axis and casts to D_OUT, writing an mmajor C tensor whose row
 // (M) and batch strides are passed explicitly (stride_c / stride_c_batch).
 // Distinct from splitk_reduce_kernel above (no bias fold, mmajor C strides,
-// VEC/BLOCK defaults tuned for the BMM launcher's 8x128 grid). Moved out of
-// opus_bmm.cu so the codegen'd a8w8_mxscale BMM launcher (.device.cu / fused
-// host TU) can reference it; the explicit instantiations live in opus_bmm.cu.
+// VEC/BLOCK defaults tuned for the BMM launcher's 8x128 grid). Lives here so
+// the codegen'd a8w8_mxscale BMM launcher (.device.cu / fused host TU) can
+// reference it; the explicit instantiations are emitted alongside the baseline
+// reduce into splitk_reduce_gfx950.device.cu (gen_instances_gfx950.py's
+// splitk_reduce_extra hook).
 template <typename D_OUT, int VEC = 16, int BLOCK = 64>
 __global__ void opus_bmm_splitk_reduce_kernel(
     const opus_splitk_ws_handle* __restrict__ ws_handle,

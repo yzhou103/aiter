@@ -130,11 +130,36 @@ KARGS_NAME_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": "opus_gemm_scale_splitk_kargs_gfx950",
 }
 
+
+def splitk_reduce_extra_device_instantiations():
+    # gfx950 carries a second reduce kernel: the mmajor BMM reduce used by the
+    # a8w8_mxscale BMM split-K launchers (VEC=8/BLOCK=128, explicit C strides,
+    # no bias fold). Those launchers <<<>>> it from their fused host TU and only
+    # see a forward decl, so exactly one TU must own the device kernel plus its
+    # host stub. It lives in the same splitk_reduce_gfx950.cuh as the baseline
+    # reduce, so it rides along in this TU; that keeps opus_bmm.cu out of the
+    # device pass entirely, matching opus_gemm.cu.
+    return (
+        "// mmajor BMM reduce (a8w8_mxscale split-K launchers)\n"
+        "template __global__ void opus_bmm_splitk_reduce_kernel<__bf16, 8, 128>(\n"
+        "    const opus_splitk_ws_handle*, __bf16*,\n"
+        "    int, int, int, int, int, int, int, int);\n"
+        "template __global__ void opus_bmm_splitk_reduce_kernel<float, 8, 128>(\n"
+        "    const opus_splitk_ws_handle*, float*,\n"
+        "    int, int, int, int, int, int, int, int);\n"
+    )
+
+
+SPLITK_REDUCE_EXTRA_MAP = {
+    "device_instantiations": splitk_reduce_extra_device_instantiations,
+}
+
 register_arch_map("gfx950", "pipeline_header", PIPELINE_HEADER_MAP)
 register_arch_map("gfx950", "traits_header", TRAITS_HEADER_MAP)
 register_arch_map("gfx950", "kernel_func", KERNEL_FUNC_MAP)
 register_arch_map("gfx950", "traits_name", TRAITS_NAME_MAP)
 register_arch_map("gfx950", "kargs_name", KARGS_NAME_MAP)
+register_arch_map("gfx950", "splitk_reduce_extra", SPLITK_REDUCE_EXTRA_MAP)
 
 
 # ---------------- gfx950 validators ----------------

@@ -3,32 +3,13 @@
 
 // Host-side BMM frontends. These expose BMM/grouped-layout APIs while reusing
 // the generated opus GEMM backend launcher symbols.
-#include "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh"
-#include "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh"
-
-// The flatmm-splitk compute-kernel device instantiations (and their traits
-// aliases) used to live here. Every tile is now codegen'd into its own
-// <tile>_C{void,bf16,fp32}.device.cu (gen_instances_gfx950.py) which owns the
-// device symbol, so the manual block here was removed as redundant.
-
-// opus_bmm_splitk_reduce_kernel's definition lives in the shared header
-// gfx950/splitk_reduce_gfx950.cuh (pulled in transitively via the flatmm
-// split-K pipeline header included at the top of this file) so the codegen'd
-// a8w8_mxscale BMM launchers can reference it too.
 //
-// <VEC=8, BLOCK=128> variant used by the codegen'd split-K launchers, which
-// only forward-declare the reduce kernel (fused host TU) and therefore emit a
-// stub *reference*. This TU is the single owner of both the device kernel and
-// the host __device_stub__ for this specialization, so the instantiations must
-// be UNCONDITIONAL (host pass emits the stub definition, device pass the
-// kernel). No other TU defines this host stub, so there is no duplicate.
-template __global__ void opus_bmm_splitk_reduce_kernel<__bf16, 8, 128>(
-    const opus_splitk_ws_handle*, __bf16*,
-    int, int, int, int, int, int, int, int);
-template __global__ void opus_bmm_splitk_reduce_kernel<float, 8, 128>(
-    const opus_splitk_ws_handle*, float*,
-    int, int, int, int, int, int, int, int);
-
+// Host pass only, like opus_gemm.cu. Every device symbol this module needs is
+// codegen'd: the per-tile compute kernels into <tile>_C{void,bf16,fp32}.device.cu
+// and opus_bmm_splitk_reduce_kernel<{__bf16,float}, 8, 128> into
+// splitk_reduce_gfx950.device.cu (gen_instances_gfx950.py's splitk_reduce_extra
+// hook), which owns both the device kernel and the host __device_stub__ the
+// codegen'd split-K launchers reference.
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "opus_bmm.h"
