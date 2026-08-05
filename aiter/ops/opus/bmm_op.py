@@ -7,16 +7,11 @@ batch-in-the-middle or grouped layouts (for example DSV4 `wo_a`) while the
 underlying kernels still live in the shared opus GEMM backend.
 """
 
-import bisect
 import functools
-import logging
 
 import torch
 
-from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
-from ...jit.utils.chip_info import get_gfx_runtime as _get_gfx
-
-logger = logging.getLogger("aiter")
+from ...jit.core import compile_ops
 
 
 def _gen_bmm_a8w8_scale_fake_tensors(
@@ -57,49 +52,11 @@ def _opus_bmm_a8w8_mxscale_raw(
     ...
 
 
-# ---- Shape-driven mxscale flatmm BMM (CSV lookup + heuristic fallback) -----
+# ---- Shape-driven mxscale flatmm BMM (tuned row + heuristic fallback) ------
 # The raw binding has no tuning of its own (kernelId=0 -> slow k32 fused). This
-# wrapper adds selection: explicit kernelId -> verbatim; else tuned-CSV winner;
-# else M-split for large unaligned M; else a coarse M/G heuristic.
-
-
-@functools.lru_cache(maxsize=1)
-def _load_mxscale_bmm_config() -> dict:
-    """Load the opus mxscale BMM tuned CSV into a {(gfx,g,m,n,k): row} dict.
-
-    Rows are filtered to ``libtype == 'opus'`` (backend-selection seam).
-    Returns {} if the file is missing so callers fall back to the heuristic.
-    """
-    import pandas as pd
-
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
-    try:
-        df = pd.read_csv(path).drop_duplicates()
-    except FileNotFoundError:
-        logger.warning("opus mxscale BMM tuned CSV not found at %s", path)
-        return {}
-    if "libtype" in df.columns:
-        # Backend-selection seam (see docstring): only consume opus rows.
-        df = df[df["libtype"] == "opus"]
-    return df.set_index(["gfx", "b", "m", "n", "k"])[["kernelId", "splitK"]].to_dict(
-        "index"
-    )
-
-
-@functools.lru_cache(maxsize=1)
-def _mxscale_bmm_buckets() -> dict:
-    """Per-(gfx,g,n,k) sorted list of tuned M buckets, for padded-M lookup.
-
-    Mirrors the GEMM ``get_padded_m`` idea but keyed on the BMM batch dim ``g``
-    (the tuned table is per-g), so the nearest tuned M is chosen within the same
-    (g,n,k) family instead of a g-agnostic global rule.
-    """
-    buckets: dict = {}
-    for gfx, g, m, n, k in _load_mxscale_bmm_config():
-        buckets.setdefault((gfx, g, n, k), []).append(m)
-    for ms in buckets.values():
-        ms.sort()
-    return buckets
+# wrapper adds selection: explicit kernelId -> verbatim; else the tuned row the
+# family entry looked up; else M-split for large unaligned M; else a coarse M/G
+# heuristic.
 
 
 @functools.cache
@@ -121,49 +78,17 @@ def _mxscale_kid_m_align() -> dict[int, int]:
     }
 
 
-def _kid_runs_m(kid: int, m: int) -> bool:
-    """True iff kid's launcher accepts this M (unknown kid -> assume it does not)."""
+def kid_runs_m(kid: int, m: int) -> bool:
+    """True iff kid's launcher accepts this M (unknown kid -> assume it does not).
+
+    Only a padded-M row can name a kernel that rejects the real, smaller M, so
+    this is what batched_gemm_a8w8_mxscale checks before trusting one. No tuned
+    winner needs alignment today (all 11 mask their partial M tile), but 10 of
+    the 45 codegen instances require M % 128 or % 256, so a re-tune can put one
+    in the CSV.
+    """
     align = _mxscale_kid_m_align().get(int(kid))
     return align is not None and m % align == 0
-
-
-def _lookup_mxscale_bmm(g: int, m: int, n: int, k: int):
-    """Exact CSV lookup, then GEMM-style padded-M (round M up to nearest tuned
-    bucket in the same (g,n,k) family). Returns ``(cfg, padded_m)``; ``cfg`` is
-    ``None`` only when neither exact nor any padded bucket exists.
-    """
-    gfx = _get_gfx()
-    cfgmap = _load_mxscale_bmm_config()
-    tuned_file = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
-
-    cfg = cfgmap.get((gfx, g, m, n, k))
-    if cfg is not None:
-        if AITER_LOG_TUNED_CONFIG:
-            logger.info(
-                f"shape is G:{g}, M:{m}, N:{n}, K:{k}, is tuned on gfx = {gfx} in "
-                f"{tuned_file}, kernelId is {cfg['kernelId']}, splitK is {cfg['splitK']}!"
-            )
-        return cfg, m
-
-    ms = _mxscale_bmm_buckets().get((gfx, g, n, k))
-    if ms:
-        i = bisect.bisect_left(ms, m)
-        if i < len(ms):
-            padded_m = ms[i]
-            pcfg = cfgmap[(gfx, g, padded_m, n, k)]
-            if AITER_LOG_TUNED_CONFIG:
-                logger.info(
-                    f"shape is G:{g}, M:{m}, N:{n}, K:{k}, exact miss; using "
-                    f"padded_M: {padded_m} kernelId {pcfg['kernelId']} "
-                    f"(splitK {pcfg['splitK']}) from {tuned_file}!"
-                )
-            return pcfg, padded_m
-
-    logger.info(
-        f"shape is G:{g}, M:{m}, N:{n}, K:{k}, not found tuned/padded config in "
-        f"{tuned_file}, will use heuristic fallback!"
-    )
-    return None, m
 
 
 def _heuristic_mxscale_kid(g: int, m: int, n: int, k: int) -> int:
@@ -206,18 +131,19 @@ def bmm_a8w8_mxscale_opus(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     out: torch.Tensor | None = None,
-    *,
     dtype: torch.dtype = torch.bfloat16,
     kernelId: int | None = None,
     splitK: int | None = None,
 ) -> torch.Tensor:
-    """Shape-driven opus fp8 e8m0 mxscale (block-scale) BMM.
+    """Opus fp8 e8m0 mxscale (block-scale) BMM by kernel id.
 
     mmajor DSV4 wo_a layout: ``x`` [M, G, K] fp8, ``wo_a`` [G, N, K] fp8,
     ``x_scale`` [M, G, K/128], ``w_scale`` [G, N/128, K/128], ``out`` optional
-    [M, G, N]. ``kernelId`` given -> verbatim; None -> tuned CSV then heuristic.
-    ``splitK`` defaults to the tuned value on a hit, else 1. Returns the [M, G, N]
-    output.
+    [M, G, N]. Returns the [M, G, N] output.
+
+    ``kernelId`` None falls back to the shape heuristic: the tuned CSV is read
+    one layer up, in batched_gemm_a8w8_mxscale, which hands the tuned id down.
+    ``splitK`` defaults to 1.
     """
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
@@ -228,16 +154,7 @@ def bmm_a8w8_mxscale_opus(
         Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
 
     if kernelId is None:
-        cfg, padded_m = _lookup_mxscale_bmm(g, m, n, k)
-        # Accept an exact hit, or a padded-M hit whose kernel accepts the real,
-        # smaller M (it runs it with no pad/copy). A padded-M hit on an
-        # aligned-only tile is rejected: that kernel's launcher would throw.
-        if cfg is not None and (padded_m == m or _kid_runs_m(int(cfg["kernelId"]), m)):
-            kernelId = int(cfg["kernelId"])
-            if splitK is None:
-                splitK = int(cfg["splitK"])
-        else:
-            kernelId = _heuristic_mxscale_kid(g, m, n, k)
+        kernelId = _heuristic_mxscale_kid(g, m, n, k)
     if splitK is None:
         splitK = 1
 
@@ -248,4 +165,5 @@ def bmm_a8w8_mxscale_opus(
 __all__ = [
     "_opus_bmm_a8w8_mxscale_raw",
     "bmm_a8w8_mxscale_opus",
+    "kid_runs_m",
 ]

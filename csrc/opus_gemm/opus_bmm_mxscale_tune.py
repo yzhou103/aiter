@@ -15,9 +15,10 @@ unaligned shape while the runtime dispatched it there anyway.
 
 Runtime schema (what the tuner emits, and what the runtime reads back):
     gfx,b,m,n,k,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-``aiter/ops/opus/bmm_op.py:_load_mxscale_bmm_config`` indexes on
-``["gfx","b","m","n","k"]`` and filters ``libtype == 'opus'`` for
-``[["kernelId","splitK"]]``, so those columns must match exactly.
+``aiter/ops/batched_gemm_op_a8w8.py:lookup_mxscale_bmm_config`` indexes on
+``["gfx","b","m","n","k"]``, dispatches to a backend on the winning row's
+``libtype``, and ``bmm_op.py`` reads ``kernelId`` / ``splitK`` off that row, so
+those columns must match exactly.
 
 Verification (the part that catches column-transpose / scale defects):
   * inputs are *signed* and have *per-128-K-block varied magnitude*
