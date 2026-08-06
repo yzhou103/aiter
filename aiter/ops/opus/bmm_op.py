@@ -78,14 +78,14 @@ def _mxscale_kid_m_align() -> dict[int, int]:
     }
 
 
-def kid_runs_m(kid: int, m: int) -> bool:
+def _kid_runs_m(kid: int, m: int) -> bool:
     """True iff kid's launcher accepts this M (unknown kid -> assume it does not).
 
-    Only a padded-M row can name a kernel that rejects the real, smaller M, so
-    this is what batched_gemm_a8w8_mxscale checks before trusting one. No tuned
-    winner needs alignment today (all 11 mask their partial M tile), but 10 of
-    the 45 codegen instances require M % 128 or % 256, so a re-tune can put one
-    in the CSV.
+    Only a tuned row found at a padded M can name a kernel that rejects the
+    real, smaller M, so this is what an incoming id is checked against below.
+    No tuned winner needs alignment today (all 11 mask their partial M tile),
+    but 10 of the 45 codegen instances require M % 128 or % 256, so a re-tune
+    can put one in the CSV.
     """
     align = _mxscale_kid_m_align().get(int(kid))
     return align is not None and m % align == 0
@@ -143,7 +143,9 @@ def bmm_a8w8_mxscale_opus(
 
     ``kernelId`` None falls back to the shape heuristic: the tuned CSV is read
     one layer up, in batched_gemm_a8w8_mxscale, which hands the tuned id down.
-    ``splitK`` defaults to 1.
+    An id this backend cannot run at this M gets the heuristic too, so the
+    caller never has to know the alignment rules; _opus_bmm_a8w8_mxscale_raw is
+    the entry that launches an id verbatim. ``splitK`` defaults to 1.
     """
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
@@ -153,6 +155,11 @@ def bmm_a8w8_mxscale_opus(
     else:
         Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
 
+    # A tuned row found at a padded M can name a kernel whose launcher rejects
+    # the real, smaller M; drop its splitK along with it and let the heuristic
+    # pick instead of letting the launcher throw.
+    if kernelId is not None and not _kid_runs_m(int(kernelId), m):
+        kernelId = splitK = None
     if kernelId is None:
         kernelId = _heuristic_mxscale_kid(g, m, n, k)
     if splitK is None:
@@ -165,5 +172,4 @@ def bmm_a8w8_mxscale_opus(
 __all__ = [
     "_opus_bmm_a8w8_mxscale_raw",
     "bmm_a8w8_mxscale_opus",
-    "kid_runs_m",
 ]

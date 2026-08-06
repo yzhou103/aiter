@@ -260,8 +260,6 @@ def batched_gemm_a8w8_mxscale(
     w_scale: Tensor,
     out: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    kernelId: int | None = None,
-    splitK: int | None = None,
 ) -> Tensor:
     """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
 
@@ -278,30 +276,25 @@ def batched_gemm_a8w8_mxscale(
     ``gemm_a8w8_blockscale`` which uses fp32 block scale. Scale type is baked
     into the name so a future fp32-block batched variant stays separate.
 
-    ``kernelId`` / ``splitK`` are overrides; left at None the shape is looked up
-    in the tuned CSV here and the winning row's libtype picks the backend. An
-    untuned shape reaches the backend with no id, so its heuristic decides.
+    The shape is looked up in the tuned CSV here and the winning row's libtype
+    picks the backend. No kernel override lives on this entry: how a kernel is
+    named is backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
     """
-    from .opus.bmm_op import bmm_a8w8_mxscale_opus, kid_runs_m
+    from .opus.bmm_op import bmm_a8w8_mxscale_opus
 
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
 
-    if kernelId is None:
-        cfg = lookup_mxscale_bmm_config(g, m, n, k)
-        libtype = cfg["libtype"] if cfg is not None else _MXSCALE_BMM_DEFAULT_LIBTYPE
-        if libtype != "opus":
-            raise NotImplementedError(
-                f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-                f"{libtype!r}, which has no batched mxscale backend here yet"
-            )
-        # A row found at a padded M can name a kernel whose launcher rejects the
-        # real, smaller M; leave kernelId None there so the backend heuristic
-        # picks instead of the launcher throwing.
-        if cfg is not None and kid_runs_m(int(cfg["kernelId"]), m):
-            kernelId = int(cfg["kernelId"])
-            splitK = int(cfg["splitK"]) if splitK is None else splitK
+    cfg = lookup_mxscale_bmm_config(g, m, n, k)
+    libtype = cfg["libtype"] if cfg is not None else _MXSCALE_BMM_DEFAULT_LIBTYPE
+    if libtype != "opus":
+        raise NotImplementedError(
+            f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
+            f"{libtype!r}, which has no batched mxscale backend here yet"
+        )
 
+    # Reading opus columns is this branch's job; whether that kernel can run
+    # this M, and what to do when it cannot, is the backend's.
     return bmm_a8w8_mxscale_opus(
         x,
         wo_a,
@@ -309,8 +302,8 @@ def batched_gemm_a8w8_mxscale(
         w_scale,
         out,
         dtype=dtype,
-        kernelId=kernelId,
-        splitK=splitK,
+        kernelId=int(cfg["kernelId"]) if cfg is not None else None,
+        splitK=int(cfg["splitK"]) if cfg is not None else None,
     )
 
 
