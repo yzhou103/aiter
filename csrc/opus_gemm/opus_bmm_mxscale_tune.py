@@ -1129,6 +1129,20 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         rows = []
         for info, time, err in results:
             keys, kernelId, splitK, kernelName = info
+            # A candidate that timed at zero did not run infinitely fast, it
+            # failed to be timed -- and zero wins every cell it is in, silently.
+            # The hipgraph path under --graph_m_max returns it sporadically: one
+            # sweep of this table had 63 of 3212 graph-timed measurements come
+            # back at 0.0, spread evenly over every kid family and flydsl alike,
+            # and they took 28 of the 680 winning rows with them. The table that
+            # came out gave m=1 to a 128-row allwave tile. Push them where they
+            # cannot win rather than dropping the row, so the shape still gets a
+            # winner from its candidates that did time.
+            if not (time > 0):
+                logger.warning(
+                    "%s: kid %s timed at %s, not ranking it", keys, kernelId, time
+                )
+                time = float("inf")
             resolved = kernelName or self.getKernelName(kernelId)
             tflops, bw = self.calculate((info, time, err))
             row = dict(zip(self.keys, keys))
