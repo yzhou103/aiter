@@ -715,9 +715,17 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // budget and the slack it leaves can be nothing. SF_RING_SLOT does not
     // depend on the depth, so there is no circularity.
     // B_DIRECT_REG stages no B, so only the A groups are budgeted (see
-    // per_block_iter_lds_size). That headroom is deliberately not spent on more
-    // slots: 4 measured ~25% slower than 3, occupancy here being VGPR-bound
-    // rather than LDS-bound.
+    // per_block_iter_lds_size). The headroom is real -- the 64x256 tiles could
+    // hold ten slots -- and deliberately not spent, but not for the reason this
+    // used to give ("4 measured ~25% slower than 3"). Raising the cap to 4 and
+    // sweeping eleven of these kids at b2/m512/n1024/k4096 is a wash: nine move
+    // under 0.3%, kid8408 loses 0.8%, and only kid8184 gains anything (28.58 ->
+    // 28.04, -1.9%), against allwave controls that reproduce to 0.7%. The depth
+    // is simply not the lever here, so it stays where the rest of the pipeline's
+    // vmcnt arithmetic was tuned. It is also not the cover for the barrier: a
+    // wave reaches it gated on its own B direct loads, which are per-wave
+    // addresses under one in-order vmcnt, and more slots do not make those
+    // uniform across the four waves.
     static constexpr int prefetch_k_iter_budget = SF_USE_RING
         ? (max_lds_size_per_wg - SF_RING_SLOT) / (per_block_iter_lds_size + SF_RING_SLOT)
         : max_lds_size_per_wg / per_block_iter_lds_size;
