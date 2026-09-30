@@ -272,6 +272,28 @@ _TUNE_POLICY = {
     409: [1],
     410: [1],
     411: [1],
+    # allwave, the 2x2 grid where all four waves stage and compute rather than
+    # splitting into producers and consumers. Same tiles as the 1x4 kids above --
+    # kid420 and kid408 are both 256x64x64x256 -- so the two grids meet head to
+    # head on every cell, which is the comparison the family was built for.
+    #
+    # Out of the pool until now for a reason that has since been fixed: they read
+    # the preshuffle through the row-major mapping, because the contiguous-issue
+    # layout only split a load group's chunks along k and four staging waves
+    # outrun a two-chunk group. kid420 was touching 40.5 cache lines per VMEM
+    # issue against flydsl's 15.9; it now touches 11.6 and runs 17.3 -> 15.27us.
+    # That is still behind kid408's 14.0 at the same tile, so this is a sweep to
+    # find the cells where two staging waves' worth of latency hiding is worth
+    # more than the 1x4's, not an expectation that they take the table.
+    #
+    # 421 does not exist: the tile table skips it.
+    420: [1],
+    422: [1],
+    423: [1],
+    424: [1],
+    425: [1],
+    426: [1],
+    427: [1],
     # bdirect, B straight to registers with no LDS hop: the 16x32 and 64x32
     # last-mile tiles, and the 128x128 tile that owns the mid band.
     171: [1],
@@ -1110,6 +1132,20 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         rows = []
         for info, time, err in results:
             keys, kernelId, splitK, kernelName = info
+            # A candidate that timed at zero did not run infinitely fast, it
+            # failed to be timed -- and zero wins every cell it is in, silently.
+            # The hipgraph path under --graph_m_max returns it sporadically: one
+            # sweep of this table had 63 of 3212 graph-timed measurements come
+            # back at 0.0, spread evenly over every kid family and flydsl alike,
+            # and they took 28 of the 680 winning rows with them. The table that
+            # came out gave m=1 to a 128-row allwave tile. Push them where they
+            # cannot win rather than dropping the row, so the shape still gets a
+            # winner from its candidates that did time.
+            if not (time > 0):
+                logger.warning(
+                    "%s: kid %s timed at %s, not ranking it", keys, kernelId, time
+                )
+                time = float("inf")
             resolved = kernelName or self.getKernelName(kernelId)
             tflops, bw = self.calculate((info, time, err))
             row = dict(zip(self.keys, keys))

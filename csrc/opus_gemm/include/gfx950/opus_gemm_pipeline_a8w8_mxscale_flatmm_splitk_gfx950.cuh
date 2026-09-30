@@ -128,9 +128,15 @@ inline constexpr int b_preshuffle_n_blocks_mxsk = T::LOAD_GROUP_N / 16;
 // LDS then holds B in preshuffle rather than row-major order, which the
 // matching consumer layout absorbs.
 //
-// Gated on !ALL_WAVE so the producer's WAVES is 1 or 2 and the wave index always
-// takes the innermost k chunks; ALL_WAVE stages with four waves, which both
-// layouts below assume away.
+// ALL_WAVE stages with four waves instead of the producer's 1 or 2, so the wave
+// index can outrun the k chunks and has to spill into the n blocks. That is the
+// WAVE_SPLITS_N branch below, and it is the whole reason ALL_WAVE was shut out
+// of this layout before: it read the preshuffle through the row-major mapping
+// at 40.5 cache-line touches per VMEM issue, against the 15.9 of a filled line
+// (blds, same pipeline and same scale ring, manages 19.3). The condition it
+// needs is only that the two splits divide, which is asserted in the layout and
+// mirrored here so a tile that cannot be split falls back to staged rather than
+// failing the build.
 //
 // tileN (T_N=2 without ALL_WAVE) is in, and had to be added: the B_M=16 tiles are
 // all tileN, so while this also required T_N==1 they were the one part of the
@@ -144,12 +150,21 @@ inline constexpr int b_preshuffle_n_blocks_mxsk = T::LOAD_GROUP_N / 16;
 // subtiles in the same order and the scale-side indexing by subtile is unaffected.
 template<typename T>
 inline constexpr bool b_preshuffle_contig_mxsk =
-    T::B_PRESHUFFLE && !T::B_DIRECT_REG && !T::ALL_WAVE
+    T::B_PRESHUFFLE && !T::B_DIRECT_REG
     && T::VEC_B == 16 && T::LOAD_GROUP_N % 16 == 0
     && (T::LOAD_GROUP_K * 16) % b_preshuffle_chunk_bytes_mxsk<T> == 0
     && b_preshuffle_k_chunks_mxsk<T> % 2 == 0
     && b_preshuffle_n_blocks_mxsk<T> * b_preshuffle_k_chunks_mxsk<T> == T::slots
-    && T::COM_REP_N % b_preshuffle_n_blocks_mxsk<T> == 0;
+    && T::COM_REP_N % b_preshuffle_n_blocks_mxsk<T> == 0
+    // Only ALL_WAVE can stage with more waves than the group has k chunks; the
+    // producer's 1 and 2 are covered by the k_chunks % 2 above.
+    && (!T::ALL_WAVE
+        || (T::LOAD_WAVES <= b_preshuffle_k_chunks_mxsk<T>
+                ? b_preshuffle_k_chunks_mxsk<T> % T::LOAD_WAVES == 0
+                : T::LOAD_WAVES % b_preshuffle_k_chunks_mxsk<T> == 0
+                      && b_preshuffle_n_blocks_mxsk<T>
+                                 % (T::LOAD_WAVES / b_preshuffle_k_chunks_mxsk<T>)
+                             == 0));
 
 // Contiguous-issue B global layout. One issue is chunk c = repeat*WAVES + wave
 // of the load group, which is the chunk the smem layout already puts at row c,
@@ -169,15 +184,35 @@ inline __device__ auto make_layout_gmem_group_load_b_preshuffle_contig_mxsk(
     constexpr int chunk_bytes = b_preshuffle_chunk_bytes_mxsk<T>;
     constexpr int k_chunks    = b_preshuffle_k_chunks_mxsk<T>;
     constexpr int n_blocks    = b_preshuffle_n_blocks_mxsk<T>;
-    static_assert(k_chunks % WAVES == 0,
-                  "the staging waves must divide the load group's k chunks");
-    constexpr int k_chunks_per_wave = k_chunks / WAVES;
-    static_assert(n_blocks * k_chunks_per_wave == T::slots / WAVES,
+    // Which of c's two factors the waves eat depends on whether a load group
+    // has more k chunks than there are waves to stage them:
+    //
+    //   WAVES <= k_chunks  the wave keeps every n block and takes every
+    //                      WAVES-th k chunk, so both stay y dims.
+    //   WAVES >  k_chunks  the wave's k chunk is fixed at wave % k_chunks and
+    //                      the split carries on into n, so only the n repeat
+    //                      is a y dim and it steps WAVES/k_chunks blocks.
+    //
+    // ALL_WAVE is the second case and the reason it exists: four staging waves
+    // against a two-chunk group. It used to be shut out of this layout and read
+    // the preshuffle through the row-major mapping instead, at 40.5 cache-line
+    // touches per VMEM issue against the 15.9 a filled line would cost (blds,
+    // same pipeline and scale ring, 19.3).
+    constexpr bool WAVE_SPLITS_N = WAVES > k_chunks;
+    static_assert(WAVE_SPLITS_N ? WAVES % k_chunks == 0 : k_chunks % WAVES == 0,
+                  "the staging waves and the load group's k chunks must divide "
+                  "one way or the other");
+    constexpr int n_per_wave = WAVE_SPLITS_N ? WAVES / k_chunks : 1;
+    static_assert(n_blocks % n_per_wave == 0,
+                  "the waves past the k chunks must divide the n blocks");
+    constexpr int n_blocks_per_wave  = n_blocks / n_per_wave;
+    constexpr int k_chunks_per_wave  = WAVE_SPLITS_N ? 1 : k_chunks / WAVES;
+    static_assert(n_blocks_per_wave * k_chunks_per_wave == T::slots / WAVES,
                   "one wave's issues must cover its share of the load group");
 
     constexpr auto g_block_shape = opus::make_tuple(
         opus::number<1>{},
-        opus::number<n_blocks>{},
+        opus::number<n_blocks_per_wave>{},
         opus::number<k_chunks_per_wave>{},
         opus::number<T::VEC_B>{});
 
@@ -186,14 +221,21 @@ inline __device__ auto make_layout_gmem_group_load_b_preshuffle_contig_mxsk(
         opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
+    // A wave's n repeat steps over the blocks its siblings did not take, and
+    // its k repeat over the chunks theirs did not; whichever axis the waves did
+    // not split has a repeat count of one and the stride below goes unused.
+    constexpr int k_repeat_bytes = (WAVE_SPLITS_N ? 1 : WAVES) * chunk_bytes;
     auto u_gb = opus::make_layout<0>(
         g_block_shape,
         opus::unfold_x_stride(g_block_dim, g_block_shape,
-            opus::tuple{stride_b * 16,
-                        opus::number<WAVES * chunk_bytes>{},
+            opus::tuple{n_per_wave * stride_b * 16,
+                        opus::number<k_repeat_bytes>{},
                         1_I}),
         opus::unfold_p_coord(g_block_dim, opus::tuple{0}));
-    u_gb += (wave_id % WAVES) * chunk_bytes + lane_id * T::VEC_B;
+    const int chunk = wave_id % WAVES;
+    u_gb += (WAVE_SPLITS_N ? (chunk / k_chunks) * stride_b * 16 : 0)
+          + (WAVE_SPLITS_N ? chunk % k_chunks : chunk) * chunk_bytes
+          + lane_id * T::VEC_B;
     return u_gb;
 }
 
