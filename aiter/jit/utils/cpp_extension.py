@@ -146,7 +146,7 @@ def _find_rocm_home() -> str | None:
         # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
         # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
         # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
-        # wrapper, not a real binary — realpath() can't recover the SDK
+        # wrapper, not a real binary -- realpath() can't recover the SDK
         # root from it.
         try:
             spec = importlib.util.find_spec("_rocm_sdk_devel")
@@ -180,8 +180,8 @@ def _find_rocm_devel_include() -> str | None:
     """Locate the header tree shipped by the rocm-sdk-devel pip package.
 
     The rocm-sdk split-package layout puts runtime bits in `_rocm_sdk_core`
-    (what ROCM_HOME/ROCM_PATH usually point at) but the full dev headers —
-    thrust, hipcub, hipblas, half, ... — live in `_rocm_sdk_devel/include`.
+    (what ROCM_HOME/ROCM_PATH usually point at) but the full dev headers --
+    thrust, hipcub, hipblas, half, ... -- live in `_rocm_sdk_devel/include`.
     torch's own headers (e.g. torch/headeronly/util/complex.h -> thrust/complex.h)
     need those, so when ROCM_HOME resolves to the core tree we must add the
     devel include dir explicitly or the build fails with "'thrust/complex.h'
@@ -1813,9 +1813,21 @@ def _write_ninja_file(
     if with_cuda:
         cuda_compile_rule = ["rule cuda_compile"]
         nvcc_gendeps = ""
+        # hipcc is a clang driver, so it takes the same -MMD/-MF as the host
+        # compiler. Without a depfile ninja knows nothing about the headers a
+        # device TU includes, and editing a kernel header leaves the stale
+        # object in place -- which only went unnoticed because the JIT used to
+        # regenerate every source file on every build and so always recompiled
+        # everything anyway. Real nvcc needs a different spelling, so leave the
+        # CUDA path alone.
+        if IS_HIP_EXTENSION:
+            nvcc_gendeps = "-MMD -MF $out.d"
         cuda_compile_rule.append(
             f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags"
         )
+        if IS_HIP_EXTENSION:
+            cuda_compile_rule.append("  depfile = $out.d")
+            cuda_compile_rule.append("  deps = gcc")
 
     # Emit one build rule per source to enable incremental build.
     # Optional per-source override: ninja allows variable bindings under a
