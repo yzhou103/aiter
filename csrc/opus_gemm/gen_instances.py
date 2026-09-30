@@ -4,6 +4,7 @@ import argparse
 import glob
 import json
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -48,6 +49,34 @@ from opus_gemm_common import (
     gfx1250_splitk_fuse_kernels_list,
     kernels_list,
 )
+
+
+def _get_gfx_runtime_standalone():
+    """Probe the live GPU's arch without importing the ``aiter`` package.
+
+    ``aiter/__init__.py`` pulls in torch and the whole op surface, and under
+    AITER_REBUILD it rebuilds module_aiter_core -- in this process, which the
+    JIT spawned only to emit source text. That cost the opus build a second
+    10s core build on every rebuild. ``chip_info`` itself only needs its own
+    directory on sys.path (its imports are flat), so load it by file path.
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("aiter")  # locates, does not execute
+    if spec is None or not spec.submodule_search_locations:
+        raise ImportError("aiter package not found")
+    utils_dir = os.path.join(
+        next(iter(spec.submodule_search_locations)), "jit", "utils"
+    )
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    mod_spec = importlib.util.spec_from_file_location(
+        "_opus_chip_info", os.path.join(utils_dir, "chip_info.py")
+    )
+    mod = importlib.util.module_from_spec(mod_spec)
+    mod_spec.loader.exec_module(mod)
+    return mod.get_gfx_runtime()
+
 
 # Merge the codegen maps registered by each architecture.
 PIPELINE_HEADER_MAP = {
@@ -1373,9 +1402,7 @@ if __name__ == "__main__":
     else:
         # GPU_ARCHS=native: probe live GPU; skip filter if rocminfo unavailable.
         try:
-            from aiter.jit.utils.chip_info import get_gfx_runtime
-
-            target_arches = {get_gfx_runtime().lower()}
+            target_arches = {_get_gfx_runtime_standalone().lower()}
         except Exception:  # noqa: BLE001
             target_arches = None
 
