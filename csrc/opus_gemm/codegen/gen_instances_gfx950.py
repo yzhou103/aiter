@@ -3,7 +3,6 @@
 """Generate gfx950 OPUS launchers."""
 
 import os
-from pathlib import Path
 
 from opus_gemm_common import OpusGemmInstance
 
@@ -12,6 +11,7 @@ from codegen.common import (
     register_arch_map,
     register_emit,
     splitk_workspace_type,
+    write_if_changed,
 )
 
 # ---------------- gfx950 arch-override maps ----------------
@@ -794,7 +794,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
 
@@ -956,7 +956,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_BLOCKSCALE_HOST_EXTRA)
 
 
@@ -1151,7 +1151,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     if k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         inst_extra_param = ",\n    std::optional<aiter_tensor_t>,\n    int"
@@ -1288,7 +1288,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     for CDtype in k.output_dtypes:
         host_decl = (
@@ -1417,7 +1417,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
 
@@ -1613,7 +1613,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(
         cg,
         k,
@@ -1995,14 +1995,23 @@ __global__ void opus_bmm_splitk_reduce_kernel(
         .replace("@@KERNEL@@", kernel_func)
         .replace(
             "@@XCD_FUSE@@",
-            "Traits::XCD_FUSE"
-            if kernel_func in ("gemm_a8w8_mxscale_flatmm_splitk_kernel",
-                               "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel")
-            else "false",
+            (
+                "Traits::XCD_FUSE"
+                if kernel_func
+                in (
+                    "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+                    "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
+                )
+                else "false"
+            ),
         )
         .replace(
             "@@XCD_SPLIT_IN_X@@",
-            "true" if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel" else "false",
+            (
+                "true"
+                if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel"
+                else "false"
+            ),
         )
         .replace("@@DIRECT@@", "true" if k.direct_only else "false")
         .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
@@ -2026,11 +2035,13 @@ __global__ void opus_bmm_splitk_reduce_kernel(
             (
                 "Traits::SF_SHUF_K_TILES_MAX"
                 if k.sf_shuf_in_lds
-                else "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
-                if k.preload_sf
-                # No panel: the bound is compiled out, and the wave1 traits
-                # carry no panel geometry to name.
-                else "0"
+                else (
+                    "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
+                    if k.preload_sf
+                    # No panel: the bound is compiled out, and the wave1 traits
+                    # carry no panel geometry to name.
+                    else "0"
+                )
             ),
         )
         .replace("@@SFMPACK@@", sfmpack)
@@ -2040,7 +2051,7 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     INSTANCE_IMPL = (
         f"{preamble}\n{host_tu_split}\n{reduce_fwd_decl}\n{traits_aliases}\n{launcher}"
     )
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     # Host instantiation(s): launcher templated on D_C; a single <fp32_t> stub.
     # (XQ/WQ/Y positional names in _make_host_decl map to O/wo_a/Y by type.)
@@ -2246,7 +2257,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     )
 
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     # Host instantiation: launcher templated on D_C; single <fp32_t> stub.
     host_extra = (
@@ -2326,7 +2337,7 @@ def _emit_bmm_specialized(
     """
     traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
@@ -2881,7 +2892,7 @@ def gen_bmm_mxscale_pipeline_instance(
     INSTANCE_IMPL = (
         f"{instance_impl_preamble()}\n{host_tu}\n{traits_aliases}\n{launcher}"
     )
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
@@ -3153,7 +3164,9 @@ _register_bmm_emit(
 )
 # wavetm1_blds: the same kernel on traits that stage B through the LDS ring.
 _register_bmm_emit(
-    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds", gen_bmm_mxscale_flatmm_splitk_instance, 0
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+    gen_bmm_mxscale_flatmm_splitk_instance,
+    0,
 )
 # wave1: one wave per workgroup, every operand global -> registers, no LDS and
 # no barrier -- the decode schedule. Shares the split-K launcher, fused tail

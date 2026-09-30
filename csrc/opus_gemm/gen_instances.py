@@ -4,7 +4,6 @@ import argparse
 import glob
 import json
 import os
-import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +18,10 @@ from codegen.common import (
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
+    open_if_changed,
+    prune_unwritten,
+    reset_written_paths,
+    write_if_changed,
 )
 from codegen.common import (
     kid_arch as _kid_arch_common,
@@ -688,8 +691,8 @@ class opus_gemm_codegen:
             macro_name = f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}"
             _write_rows(f, macro_name, rows, WORKSPACE_ENTRY)
 
-        with open(
-            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h"), "w"
+        with open_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h")
         ) as f:
             f.write(HEADER)
             for arch in SPLITK_REDUCE_ARCHES:
@@ -736,8 +739,8 @@ class opus_gemm_codegen:
                 f.write(line)
             f.write("\n")
 
-        with open(
-            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h"), "w"
+        with open_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h")
         ) as f:
             f.write(header)
             _emit_map(
@@ -803,16 +806,23 @@ class opus_gemm_codegen:
                 f.write(line)
             f.write("\n")
 
-        with open(
-            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
-            "w",
+        with open_if_changed(
+            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h")
         ) as f:
             f.write(header)
             f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            emit(f, "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)", entry,
-                 lambda r: {"kid": r[0], "kernel_name": r[1]})
-            emit(f, "GENERATE_BMM_MXSCALE_KID_GROUPS", group_entry,
-                 lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]})
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)",
+                entry,
+                lambda r: {"kid": r[0], "kernel_name": r[1]},
+            )
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_GROUPS",
+                group_entry,
+                lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]},
+            )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
@@ -889,23 +899,27 @@ void
     std::optional<aiter_tensor_t> workspace,
     int splitK);
 """
-        with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
-            f.write(MANIFEST_HEAD)
-            for k in kernels_dict.values():
-                if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
-                    f.write(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
-                elif k.kernel_tag in SPLITK_TAGS:
-                    f.write(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
-                elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
-                    f.write(MANIFEST_A16W16.format(kernel_name=k.name))
-                elif k.kernel_tag == "a8w8":
-                    f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
-                elif k.kernel_tag == "a8w8_scale":
-                    f.write(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
-                elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                    f.write(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
-                else:
-                    raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
+        parts = [MANIFEST_HEAD]
+        for k in kernels_dict.values():
+            if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
+                parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
+            elif k.kernel_tag in SPLITK_TAGS:
+                parts.append(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
+            elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
+                parts.append(MANIFEST_A16W16.format(kernel_name=k.name))
+            elif k.kernel_tag == "a8w8":
+                parts.append(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
+            elif k.kernel_tag == "a8w8_scale":
+                parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
+            elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
+                parts.append(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
+            else:
+                raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
+        # Every TU includes this header, so rewriting it unconditionally would
+        # invalidate the whole build even when the manifest is identical.
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_manifest.h"), "".join(parts)
+        )
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 
@@ -969,9 +983,10 @@ void
                 + host_body
                 + "#endif // host pass only\n"
             )
-            Path(
-                os.path.join(self.instances_path, f"all_instances_host_{arch}.cu")
-            ).write_text(contents)
+            write_if_changed(
+                os.path.join(self.instances_path, f"all_instances_host_{arch}.cu"),
+                contents,
+            )
 
     def _emit_device_tus(self):
         """Emit one device-only .device.cu per (kid, dtype).
@@ -1015,9 +1030,10 @@ void
                 + row["device_decl"]
                 + guard_close
             )
-            Path(
-                os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
-            ).write_text(contents)
+            write_if_changed(
+                os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu"),
+                contents,
+            )
 
     def _emit_splitk_reduce_tu(self):
         """Emit a single splitk_reduce.device.cu carrying the 4 reduce
@@ -1105,11 +1121,12 @@ void
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
             contents += extra_reduce.get("device_instantiations", lambda: "")()
             contents += guard_close
-            Path(
+            write_if_changed(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
-                )
-            ).write_text(contents)
+                ),
+                contents,
+            )
 
     def gen_instances(self, kernels_dict):
         """Regenerate launchers, manifests and exact-kid tables."""
@@ -1123,12 +1140,13 @@ void
         ):
             Path(self.working_path, legacy_header).unlink(missing_ok=True)
 
-        if os.path.exists(self.impl_path):
-            shutil.rmtree(self.impl_path)
-        os.mkdir(self.impl_path)
-        if os.path.exists(self.instances_path):
-            shutil.rmtree(self.instances_path)
-        os.mkdir(self.instances_path)
+        # Generate in place and prune afterwards instead of wiping these two
+        # trees: an rmtree hands every surviving file a fresh mtime, which made
+        # ninja recompile all ~670 opus TUs on every rebuild even when the
+        # generated text was byte-identical.
+        reset_written_paths()
+        os.makedirs(self.impl_path, exist_ok=True)
+        os.makedirs(self.instances_path, exist_ok=True)
 
         # Reset the instantiation accumulators so reruns under the same
         # codegen object don't double-emit.
@@ -1154,6 +1172,10 @@ void
         self.gen_a16w16_kid_dispatch(kernels_dict)
         self.gen_a8w8_kid_dispatch(kernels_dict)
         self.gen_bmm_mxscale_kid_dispatch()
+
+        # Kids that left the compile set must not leave a source behind.
+        prune_unwritten(self.impl_path)
+        prune_unwritten(self.instances_path)
 
 
 def _tune_df_kids(df):
@@ -1374,15 +1396,13 @@ if __name__ == "__main__":
         if target_arches is not None
         else ["gfx942", "gfx950", "gfx1250"]
     )
-    with open(os.path.join(args.working_path, "opus_build_archs.h"), "w") as f:
-        f.write(
-            "// SPDX-License-Identifier: MIT\n"
-            "// Auto-generated. See gen_instances.py.\n"
-            "#pragma once\n"
-        )
-        f.writelines(
-            f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header
-        )
+    write_if_changed(
+        os.path.join(args.working_path, "opus_build_archs.h"),
+        "// SPDX-License-Identifier: MIT\n"
+        "// Auto-generated. See gen_instances.py.\n"
+        "#pragma once\n"
+        + "".join(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header),
+    )
 
     # Family ABI defaults must be linkable even when no tuned row or sidecar
     # mentions them.  This set is arch-scoped so single-arch builds never pull
