@@ -399,11 +399,24 @@ _TUNE_POLICY = {
 # rows), and sweeping four factors over 27 more kids is the bulk of the tuning time.
 # A plain kid that wins a cell at splitK>1 is therefore still a cell the preshuffled
 # pool cannot answer; widen this if one ever appears.
+#
+# Both ids go through bmm_mxscale_global_kid, and the reason is worth keeping.
+# This block was written when the dict above was keyed in local ids, so a plain
+# `if plain in _TUNE_POLICY` was right and the twins were swept -- that is where
+# the "the tuner picks one on 11 of 133 rows" note in opus_gemm_common.py comes
+# from. Merge 2b01fe7b71 (2026-09-20) then brought in a main that had rewritten
+# the literal in global ids. Neither side was wrong and the two edits were in
+# different parts of the file, so git merged them clean: the test became "is a
+# local id a key of a global-keyed dict", which is never true, and all 27 twins
+# left the sweep without a word. Every retune since ran without them, which is
+# why no twin appears in the shipped table any more.
+#
+# Nothing here may compare the two id spaces without converting first.
 _TUNE_POLICY.update(
     {
-        twin: [1]
+        bmm_mxscale_global_kid(twin): [1]
         for plain, twin in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
-        if plain in _TUNE_POLICY
+        if bmm_mxscale_global_kid(plain) in _TUNE_POLICY
     }
 )
 # Small-M plain-scale panels. COM_REP_M=1 makes their M-packed destination
