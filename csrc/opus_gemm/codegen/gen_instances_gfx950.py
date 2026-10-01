@@ -2001,6 +2001,7 @@ __global__ void opus_bmm_splitk_reduce_kernel(
                 in (
                     "gemm_a8w8_mxscale_flatmm_splitk_kernel",
                     "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
+                    "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
                 )
                 else "false"
             ),

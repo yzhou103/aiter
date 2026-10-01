@@ -1040,6 +1040,12 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static_assert(std::is_same_v<D_ACC, fp32_t>);
     static_assert(std::is_same_v<D_SF, unsigned char>);
 
+    // Same-XCD fused split-K tail, as in the flatmm traits above and bounded the
+    // same way: the reducing workgroup holds a whole tile of partial sums in
+    // registers on top of the main loop's, and at 128 rows that pushes the
+    // scaled MFMA's scale operand into an AGPR, which the backend rejects.
+    static constexpr bool XCD_FUSE = B_M <= 64;
+
     // The schedule itself is written against WAVES, not against eight of them, so
     // the wave count follows BLOCK_SIZE: 512 gives the 8-wave grids this file was
     // built for, 256 gives the 4-wave ones. wave64 is assumed (gfx950 only), and
@@ -1054,7 +1060,8 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static_assert(BLOCK_SIZE == WAVES * opus::get_warp_size(),
                   "this schedule requires whole wave64 waves");
 #endif
-    static_assert(WAVES == 4 || WAVES == 8, "only the 4- and 8-wave grids are wired up");
+    static_assert(WAVES == 2 || WAVES == 4 || WAVES == 8,
+                  "only the 2-, 4- and 8-wave grids are wired up");
     static_assert(T_M * T_N == WAVES, "the wave grid must cover every wave once");
 
     static constexpr int W_M = 16;
@@ -1089,7 +1096,10 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int NUM_LOAD_GROUPS_PER_BN = B_N / LOAD_GROUP_N;
     static constexpr int NUM_LOAD_GROUPS_PER_BK = B_K / LOAD_GROUP_K;
     static_assert(NUM_LOAD_GROUPS_PER_BM * LOAD_GROUP_M == B_M);
-    static_assert(NUM_LOAD_GROUPS_PER_BN * LOAD_GROUP_N == B_N);
+    // No NUM_LOAD_GROUPS_PER_BN * LOAD_GROUP_N == B_N here. The load-group
+    // machinery stages A and only A in this family; B is either direct-to-register
+    // or takes B_LDS's own b_lds_chunks dealing, neither of which reads these.
+    // The constant was copied from the a16w16 traits, where B does share them.
     static_assert(T_M * W_M == LOAD_GROUP_M,
                   "the T_M waves must exactly divide one A load group's rows");
     static_assert(NUM_LOAD_GROUPS_PER_BK * SF_PER_MFMA_K == B_K / GROUP_K);
@@ -1099,9 +1109,14 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int COM_REP_K = B_K / (W_K * T_K);
     // The M-packed scale panel hands a K group's subtile bytes to the lane as
     // adjacent bytes, which scale_op_sel indexes four at a time.
-    static constexpr int SFA_WORDS = COM_REP_M / 4;
-    static_assert(COM_REP_M % 4 == 0 && SFA_WORDS >= 1,
-                  "the M-packed scale bytes must fill whole op_sel dwords");
+    // Ceiling, not an exact division. op_sel indexes a dword, so subtile im wants
+    // byte im%4 of word im/4; when COM_REP_M is not a multiple of 4 the last word
+    // is partial and the bytes past COM_REP_M are simply never selected. The pack
+    // loop in the pipeline bounds itself by COM_REP_M for exactly that reason, so
+    // a partial word costs the unbuilt bytes and nothing else. B_M=16 at T_M=1 is
+    // COM_REP_M=1: one byte, one word, three immediates that no MFMA names.
+    static constexpr int SFA_WORDS = (COM_REP_M + 3) / 4;
+    static_assert(SFA_WORDS >= 1);
 
     // ---- shuffle_scale A-scale geometry --------------------------------------
     // Aliased from opus_sf_shuf_geom rather than restated, so this pipeline and
@@ -1427,8 +1442,11 @@ template<int BLOCK_SIZE_,
 struct opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_blds_traits_gfx950
     : opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950<
           BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 1, true> {
-    static_assert(opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 128
-                      || opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) == 64,
+    // An upper bound, written as one. The reason is residency, and residency
+    // only bites from above: one wave owns all B_M rows, so A stays resident up
+    // to B_M=128 and no further. Spelling it as a two-value whitelist was what
+    // kept the 16-row decode tile out of this family.
+    static_assert(opus::get<0>(opus::remove_cvref_t<BLOCK_>{}) <= 128,
                   "one wave owns all B_M rows here, and A only stays resident up "
                   "to B_M=128");
 };

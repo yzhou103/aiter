@@ -345,6 +345,46 @@ _TUNE_POLICY = {
     8128: [1],
     8137: [1],
     8325: [1],
+    # wave1 family: one wave per workgroup, every operand global->registers, no
+    # LDS. Built for the decode last mile (b1/m1), where a 16-row tile leaves
+    # the machine latency-bound and staging through LDS only adds a hop. These
+    # eight had never been candidates, so no cell had ever been measured against
+    # them -- which is the same gap that hid kid8411.
+    #
+    # Listing them does not (yet) win b1/m1/n1024/k4096: the sweep there puts
+    # the best wave1 kid ~19% behind the flydsl config the shipped table already
+    # picks. They are here so the tuner can answer that question per cell rather
+    # than the pool silently conceding it.
+    #
+    # splitK 1 and 4 only. 2 and 8 win nothing anywhere in the sweep and 8 is
+    # last for all eight kids, so sweeping them only costs time. Both 1 and 4
+    # have to stay, because which one wins is not a property of the shape but of
+    # how resident B is. splitK 1 skips the fused tail, worth ~1.75us: three
+    # dependent L2 round trips (partial store ack, counter atomic, partial
+    # reload), measured with s_memrealtime stamps inside the kernel. splitK 4
+    # pays that tail but fields four times the workgroups, and on a 16-row tile
+    # that is the only thing covering HBM latency. Timing b1/m1/n1024/k4096 with
+    # 1/4/16/64 rotating operand sets puts kid8445's splitK-4 penalty at
+    # +0.41/+0.31/+0.03/-0.07us: it crosses zero near 64, and run_perftest
+    # rotates up to num_iters (101) sets by default, so the tuner sees the far
+    # end of that curve and picks 4. A one-operand benchmark sees the near end
+    # and picks 1. Neither is wrong; only the second resembles a serving stack.
+    8440: [1, 4],
+    8441: [1, 4],
+    8442: [1, 4],
+    8443: [1, 4],
+    8444: [1, 4],
+    8445: [1, 4],
+    8446: [1, 4],
+    8447: [1, 4],
+    # The B_N=16 halves of kid8440/8445. They do not raise in-flight bytes --
+    # the halved fragment cancels the doubled workgroup count, see the tile
+    # table -- so they sweep splitK the same way the B_N=32 kids do, plus 2.
+    # They are here for the tile: on a resident B they are the fastest decode
+    # point measured, and whether that survives a cold B is exactly the
+    # question the tuner answers per cell.
+    8448: [1, 2, 4],
+    8449: [1, 2, 4],
 }
 
 # The blds twins, derived rather than listed: a twin is its plain kid's tile with
@@ -610,17 +650,23 @@ def _shuf_arm(inst):
 _dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
 assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
 
-# Only the flatmm_splitk (non-direct) and minterleave launchers honor splitK>1.
+# Families whose launcher honors splitK>1: they write fp32 partials to the
+# caller-owned workspace and carry the fused reduce tail (per-tile counter,
+# last arrival sums in split order). Everything else is splitK==1 only, so a
+# policy entry sweeping splitK>1 on another family is a bug -- fail at import
+# rather than silently benchmark a wrong result.
+_SPLITK_FAMILIES = frozenset(
+    {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
+    }
+)
 
-
-# Only non-direct flatmm split-K launchers are swept with splitK>1.
-# Any other family sweeping it is a policy bug, so fail loudly at import.
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
         _tag = _CODEGEN_BMM[_kid].kernel_tag
         assert (
-            _tag == "a8w8_mxscale_bmm_flatmm_splitk"
-            and not _CODEGEN_BMM[_kid].direct_only
+            _tag in _SPLITK_FAMILIES and not _CODEGEN_BMM[_kid].direct_only
         ), f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
 
 
@@ -911,6 +957,13 @@ def _workspace_numel(kernel_id, split_k, batch, m, n):
         "a8w8_mxscale_bmm_bpreshuffle_bdirect",
         "a8w8_mxscale_bmm_bpreshuffle_blds",
         "a8w8_mxscale_bmm_bpreshuffle_wave1",
+        # The wavetm1 kids emit the same split-K branch as every other family in
+        # this list -- the impl stub AITER_CHECKs for the workspace -- but the
+        # tags were never added here, so asking one for split_k > 1 raised
+        # instead of running. It went unnoticed because the family's tiles were
+        # all B_M >= 64 large-M kids that never wanted a split.
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
     }:
         return 0
     tiles_m = (m + instance.B_M - 1) // instance.B_M

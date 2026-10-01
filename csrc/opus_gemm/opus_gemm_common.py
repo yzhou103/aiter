@@ -301,11 +301,15 @@ class OpusGemmInstance:
                 # "sfshuf_lds" rather than a separate token, so the reg/lds pair of
                 # one kid differs in exactly this suffix and nothing else.
                 parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
-        elif self.kernel_tag in ("a8w8_mxscale_bmm_bpreshuffle_wavetm1",
-                                 "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds"):
+        elif self.kernel_tag in (
+            "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+            "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+        ):
             # opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1[_blds]_<geom>_wgpcu{N}_sfpreload
             #     [_xcd{N}][_sfgmpack]
-            parts.insert(tag_at, self.kernel_tag.replace("a8w8_mxscale_bmm_", "a8w8_mxscale_"))
+            parts.insert(
+                tag_at, self.kernel_tag.replace("a8w8_mxscale_bmm_", "a8w8_mxscale_")
+            )
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.preload_sf:
                 parts.append("sfpreload")
@@ -2362,6 +2366,76 @@ _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_BLDS_TILES = {
     455: (256, 64, 128, 128, 1, 4),
     456: (256, 64, 128, 256, 1, 4),
     457: (256, 128, 256, 128, 1, 4),
+    # The decode tile, 2 waves. This is the one geometry the opus families did
+    # not have: a symmetric schedule at a 16-row tile. wave1 is symmetric but is
+    # one wave with no LDS at all; flatmm_splitk reaches B_M=16 but splits the
+    # workgroup into producer and consumer waves, so at m=1 half the threads
+    # never issue an MFMA; allwave is symmetric but its traits fix a 2x2 grid and
+    # its tiles start at B_M=64. wavetm1 is the general symmetric family
+    # (T_N = WAVES/T_M) and was gated to 4 and 8 waves only -- see the assert in
+    # the traits, now 2 as well. This is flydsl's t16x32x256_w1x2 outright.
+    #
+    # blds, not direct-B, for two reasons. It is what the reference kernel does
+    # on this tile, and it is the only one of the two the LDS share model lets
+    # exist: direct-B stages 3 slots of 4224 bytes, which prices the modelled
+    # footprint so low that SF_PANEL_RESIDENT_WGS comes out 11 and the shuffled
+    # panel gets 1966 bytes -- 7168 of per-split K against the 8192 tripwire.
+    # Staging B puts 8192 bytes a slot back and the model lands on 3 workgroups.
+    #
+    # What it measured, and it is not what the wave-asymmetry story predicted.
+    # Kernel-trace medians at b1/m1/n1024/k4096, 75 VGPR / 0 scratch / 54020 LDS:
+    #
+    #                        hot (NC=1)   cold (NC=64)
+    #     flydsl sk4            4.08         4.00
+    #     kid8460 sk4 main      4.20         4.40
+    #     kid8460 splitk reduce 3.84         3.68
+    #     kid8442 (wave1) sk1   3.96         5.36
+    #
+    # So the main kernel matches the reference within 3% hot and 10% cold, and
+    # cold it beats opus's best decode kid by 1.22x -- staging both operands is
+    # what buys that, the same +10% cold sensitivity the lds8316 measurement
+    # showed against wave1's +34%. The per-K-tile ISA is the same work too: the
+    # loop body is two tiles carrying 1 barrier, 10 ds_read and 6 buffer_load
+    # each against flydsl's 1, 12 and 9. The producer/consumer split was never
+    # the gap.
+    #
+    # And all of it is given back by the reduce: a separate 3.7us kernel behind
+    # every call, where flydsl fuses its split-K tail into the main kernel.
+    #
+    # Not for want of a fused tail -- of two, and the obvious one is the wrong
+    # one. The wave8 pipeline already had fused_do_reduce (so do flatmm_splitk
+    # and wave8_persist), dead because the split-K launcher picks the D_OUT=void
+    # instantiation. Wiring the launcher to the Y-typed one is worse, not
+    # better: 4.20 -> 9.88us on the main kernel, 5.9 -> 11.5us wall. That tail
+    # takes an agent-scope release fence, which writes back and invalidates L2
+    # across all eight XCDs, and sums scalar per element.
+    #
+    # The one worth having was flatmm's xcd_fused -- workgroup-scope atomic,
+    # partials meeting in a single XCD's L2 -- and it is now wired here too:
+    # XCD_FUSE on the wave8 traits, the (tile, split, batch) grid decode in the
+    # pipeline, and the kernel added to @@XCD_FUSE@@ in gen_instances_gfx950.py.
+    # kid8460 sk4 is then one kernel at 5.24us hot / 5.92 cold, against 4.20 +
+    # 3.84 in two before, and wall 5.9 -> 5.5.
+    #
+    # Ablating that tail (hot / cold): the main loop and the workspace store
+    # alone are 4.04 / 4.24, the arrival adds 0.88 / 1.32, the reduce adds
+    # 0.32 / 0.36. The reduce is that cheap only after porting flatmm's
+    # SPLITS_PER_PASS -- issuing every split's load before waiting on any of
+    # them, which is how flydsl writes it; the serial load-wait-add loop it
+    # replaced cost 1.16 cold instead of 0.36.
+    #
+    # And flydsl runs that same arrival protocol instruction for instruction.
+    # So its 4.04 / 4.12 is not a cheaper tail, it is a faster main loop -- on
+    # these numbers about 3.0us hot against our 4.04 -- carrying the same tail.
+    # The loop body is where the rest of the gap is after all; the earlier note
+    # above that called it even was comparing our main loop against flydsl's
+    # main loop plus reduce. flydsl spends 132 VGPR and 67KiB of LDS on nb5
+    # buffering to get there, against this kid's 88 and 54KiB.
+    #
+    # That is why this kid is not in _TUNE_POLICY yet: at sk4 it is still behind
+    # kid8442 hot, and at sk1 -- where no reduce runs -- the 16-tile serial K
+    # chain puts it at 5.92/6.83.
+    460: (128, 16, 32, 256, 2, 0),
 }
 _bmm_bpre_wavetm1_blds_local = {
     kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm, blds=True)
@@ -2561,6 +2635,37 @@ _BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES = {
     # kid445 with the ring pinned shallower (default 4 stages, 192 VGPRs).
     446: (16, 32, 256, 1, 2),
     447: (16, 32, 256, 1, 3),
+    # B_N=16: kid440/445's tile halved along N, so N=1024 fields 64 workgroups
+    # instead of 32. Kept for the tile, not for the reason it was added, and the
+    # difference is worth writing down because it is the same mistake twice.
+    #
+    # It was added to raise workgroup count. At b1/m1/n1024/k4096 the family
+    # reaches the machine with 32 waves and 59 outstanding L2 reads against
+    # flydsl's 256 and 141 (TCP_TCC_READ_REQ{,_LATENCY}_sum over
+    # GRBM_GUI_ACTIVE), which reads like a parallelism gap -- per wave opus is
+    # well ahead, 1.86 reads in flight against 0.55. It is not one. Halving B_N
+    # halves the B fragment with it (VGPRs 112 -> 76), so the per-wave figure
+    # halves to 0.98 and the aggregate lands on 63: exactly nothing. In-flight
+    # bytes are the product, and this axis moves both factors the opposite way.
+    #
+    # Deeper ring fails for a different reason and is not in this table: kid8445's
+    # tile at RING 6 and 8 spills nothing (VGPRs 112 -> 160 -> 212, scratch 0) and
+    # leaves TCP_TCC_READ_REQ_LATENCY_sum at 14.14M/14.16M/14.15M against an
+    # identical request count -- the memory system sees the same thing and the
+    # extra registers only cost time (3.98 -> 4.88/4.80us). See the RING
+    # derivation in opus_gemm_traits_a8w8_scale_gfx950.cuh.
+    #
+    # So split-K remains the only lever that actually moves aggregate in-flight,
+    # because it multiplies waves while leaving the fragment alone, and it always
+    # charges a reduce tail for it (sk8 reaches flydsl's 141 and loses 1.7us).
+    #
+    # What these two kids are worth keeping for is the tile itself: at b1/m1 they
+    # are the fastest thing measured on a resident B, 3.23us against flydsl's 3.62
+    # and kid8442's 3.70. On a cold B they are 4.57 against flydsl's 4.15, so this
+    # cell is not theirs -- but the tuner measures cold, per cell, and N is not
+    # always 1024.
+    448: (16, 16, 256, 2),
+    449: (16, 16, 256, 1),
 }
 _bmm_bpre_wave1_local = {
     kid: _a8w8_mxscale_bmm_bpreshuffle_wave1(*geom)

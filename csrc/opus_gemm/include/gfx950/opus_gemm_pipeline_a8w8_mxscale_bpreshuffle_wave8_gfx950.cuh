@@ -153,8 +153,14 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
                 int w = 0;
                 opus::static_for<4>([&](auto ib_c) {
                     constexpr int ib = decltype(ib_c)::value;
-                    w |= (static_cast<int>(v_sfa[ik * T::COM_REP_M + iw * 4 + ib]) & 0xFF)
-                         << (8 * ib);
+                    // The last word is partial when COM_REP_M is not a multiple
+                    // of 4 (see SFA_WORDS in the traits): those bytes have no
+                    // subtile, so no op_sel immediate below names them, and
+                    // reading them would run off v_sfa.
+                    if constexpr (iw * 4 + ib < T::COM_REP_M) {
+                        w |= (static_cast<int>(v_sfa[ik * T::COM_REP_M + iw * 4 + ib]) & 0xFF)
+                             << (8 * ib);
+                    }
                 });
                 packed_sfa[ik * T::SFA_WORDS + iw] = w;
             });
@@ -388,8 +394,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                   "this pipeline is the direct-B + LDS-scale-panel schedule only");
     static_assert(T::B_PRESHUFFLE && (T::B_DIRECT_REG || T::B_LDS),
                   "B is read from the 16x16 preshuffle, into registers or the LDS ring");
-    static_assert(T::ALL_WAVE && (T::WAVES == 8 || T::WAVES == 4),
-                  "four or eight all-compute waves");
+    static_assert(T::ALL_WAVE && (T::WAVES == 8 || T::WAVES == 4 || T::WAVES == 2),
+                  "two, four or eight all-compute waves");
     static_assert(T::GROUP_M == 1, "one A scale byte per row per K group");
     // Both host-side scale layouts pack 128-wide K blocks.
     static_assert(T::SF_PER_MFMA_K == 1 || (!SFA_MPACK_GLOBAL && !SHUFFLE_SCALE),
@@ -430,9 +436,27 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr bool B_STAGED_WAIT =
         !T::B_LDS && !SFA_MPACK_GLOBAL && (!SHUFFLE_SCALE || SF_SHUF_IN_LDS);
 
-    const int split_id = opus::block_id_x() % kargs.split_k;
-    const int wgid     = opus::block_id_x() / kargs.split_k;
+    // Same-XCD fused split-K: grid (tiles padded to a multiple of 8, split_k,
+    // batch). The linear workgroup id is x + gx * (y + split_k * z) and the XCD
+    // is that mod 8, so with gx a multiple of 8 every split of tile x runs on
+    // XCD x % 8 and their partials meet in that XCD's L2. The 1-D form below
+    // cannot do this: it makes the splits of one tile consecutive ids, which
+    // the dispatcher's round-robin then scatters across all eight XCDs.
+    constexpr bool XCD_FUSE = !std::is_void_v<D_OUT> && !DIRECT_ONLY && T::XCD_FUSE;
+    const bool xcd_fused = XCD_FUSE && kargs.ptr_xcd_counters != nullptr;
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
+    const int tiles_per_batch = num_tiles_m * ceil_div(kargs.n, T::B_N);
+    int split_id = 0;
+    int wgid     = (int)opus::block_id_x();
+    if constexpr (!DIRECT_ONLY) {
+        if (xcd_fused) {
+            if (wgid >= tiles_per_batch) return;  // the pad to a multiple of 8
+            split_id = (int)opus::block_id_y();
+        } else {
+            split_id = (int)opus::block_id_x() % kargs.split_k;
+            wgid     = (int)opus::block_id_x() / kargs.split_k;
+        }
+    }
     int row = (wgid % num_tiles_m) * T::B_M;
     int col = (wgid / num_tiles_m) * T::B_N;
     // L2 rasterization, the mapping the reference flydsl kernel runs (its
@@ -1446,12 +1470,53 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         s_waitcnt_vmcnt(number<(PF - 1) * CP>{});
         __builtin_amdgcn_s_barrier();
         read_tile(0, number<0>{});
-        int k = 0;
-        for (; k + 1 < loops; k += 2) {
-            step(k, number<0>{});
-            step(k + 1, number<1>{});
+        // A short split runs as one straight line, no backward branch. The
+        // decode shapes put four K tiles in a split (K=4096, B_K=256, sk4), and
+        // round the ring that is two trips carrying a barrier pair each, with
+        // the scheduler unable to move a load across the latch. The reference
+        // flydsl kernel emits this case with no loop at all -- eight MFMAs
+        // straight-line, six barriers against our ten -- which is the whole of
+        // what nb5 buys it at this tile: not a fifth buffer (four tiles have
+        // nothing to put in one) but a region the scheduler can see end to end.
+        // ...and when that straight line is exactly the PF tiles the prefill
+        // already issued, it fetches nothing more. The rolled step issues tile
+        // k+PF, which past the end issue_b_lds clamps to loops-1 rather than
+        // skipping -- the static vmcnt accounting needs the instruction count
+        // constant -- so four steps re-fetch tile 3's whole 8 KiB B slot four
+        // times over. Unrolled, each step's wait is a compile-time constant and
+        // the fetches can simply go away: after the prefill tiles 0..3 are in
+        // flight in order, so tile k+1 has landed once vmcnt is down to
+        // (2-k)*CP.
+        auto step_nf = [&](auto k_c, auto set_c) {
+            constexpr int k = decltype(k_c)::value;
+            constexpr int s = decltype(set_c)::value;
+            s_waitcnt_lgkmcnt(0_I);
+            s_waitcnt_vmcnt(number<(k < 2 ? (2 - k) * CP : 0)>{});
+            __builtin_amdgcn_s_barrier();
+            if constexpr (k + 1 < 4) read_tile(k + 1, number<s ^ 1>{});
+            mma_mxscale_wave8_accum<T, decltype(mma), 0, false>(
+                v_a2[s], v_b2[s], v_sfa2[s], v_sfb2[s], v_c);
+            sched_mfma_interleave<T::mma_insts,
+                                  T::a_ds_read_insts + T::b_ds_read_insts, CP>();
+        };
+        if (loops == 4 && PF == 4) {
+            step_nf(number<0>{}, number<0>{});
+            step_nf(number<1>{}, number<1>{});
+            step_nf(number<2>{}, number<0>{});
+            step_nf(number<3>{}, number<1>{});
+        } else if (loops == 4) {
+            step(0, number<0>{});
+            step(1, number<1>{});
+            step(2, number<0>{});
+            step(3, number<1>{});
+        } else {
+            int k = 0;
+            for (; k + 1 < loops; k += 2) {
+                step(k, number<0>{});
+                step(k + 1, number<1>{});
+            }
+            if (k < loops) step(k, number<0>{});
         }
-        if (k < loops) step(k, number<0>{});
     } else {
         opus::static_for<PF - 1>([&](auto p_c) {
             issue_a_tile(decltype(p_c)::value);
@@ -1517,7 +1582,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         seq<T::W_M, T::W_N, T::W_K>{}, mfma_adaptor_swap_ab{});
     auto u_gc2 = partition_layout_c<T::VEC_C>(mma_c2,
         opus::make_tuple(stride_c_main, 1_I), p_coord_c1);
-    auto store_c = [&](auto& g) {
+    // store_c's body, with the source vector, the layout and the row stride made
+    // parameters so the fused reduce tail below can reuse the index math rather
+    // than restate it against a second stride. store_c is the original call.
+    auto store_c_from = [&](auto& g, auto const& src, auto const& u, int stride) {
         // The accumulator nests m-repeat outside n-repeat (i_tile_c =
         // im*COM_REP_N + in), so this walks it in order and only has to add the
         // m-repeat's row offset, which u_gc2 no longer carries. Two things about
@@ -1543,7 +1611,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 typename decltype(mma_c2)::vtype_c vj;
                 opus::static_for<C_LEN>([&](auto e_c) {
                     constexpr int e = decltype(e_c)::value;
-                    vj[e] = v_c[(im * T::COM_REP_N + j) * C_LEN + e];
+                    vj[e] = src[(im * T::COM_REP_N + j) * C_LEN + e];
                 });
                 // Both arms spelled out whole rather than sharing a named offset
                 // term.
@@ -1552,15 +1620,56 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                         (im / T::T_M) * T::T_M * T::T_M * T::W_M
                         + (im % T::T_M) * T::W_M;
                     store<T::VEC_C>(g, vj,
-                                    u_gc2 + (wp_im_row
-                                             + wave_id_m * (T::T_M - 1) * T::W_M)
-                                                * stride_c_main,
+                                    u + (wp_im_row
+                                         + wave_id_m * (T::T_M - 1) * T::W_M)
+                                            * stride,
                                     (wave_id_n * T::COM_REP_N + j) * T::W_N);
                 } else {
                     store<T::VEC_C>(g, vj,
-                                    u_gc2 + im * T::T_M * T::W_M * stride_c_main,
+                                    u + im * T::T_M * T::W_M * stride,
                                     (wave_id_n * T::COM_REP_N + j) * T::W_N);
                 }
+            });
+        });
+    };
+    auto store_c = [&](auto& g) { store_c_from(g, v_c, u_gc2, stride_c_main); };
+    // The mirror of store_c_from: same offsets, load instead of store. One vector load per (m-repeat, n-repeat) rather than the scalar
+    // per-element loop the agent-scope tail further down uses.
+    //
+    // Cache policy 1 -- sc0 alone, not the sc0 sc1 the flatmm pipeline's copy
+    // uses. sc0 is the part that is needed: the partials were written by other
+    // CUs of this XCD and this CU's L1 may still hold a line from an earlier
+    // launch at the same address, which a plain load would return. sc1 on top
+    // would also read past the XCD's L2, which is the one cache that is
+    // guaranteed to have them -- correct only because the store beat the load
+    // to memory as well. It measured 5.48us -> 5.40us hot, 6.96 -> 6.72 cold on
+    // kid8460 b1/m1/n1024/k4096 sk4 to drop it.
+    auto load_c_into = [&](auto& g, auto& dst, auto const& u, int stride) {
+        opus::static_for<T::COM_REP_M>([&](auto im_c) {
+            constexpr int im = decltype(im_c)::value;
+            opus::static_for<T::COM_REP_N>([&](auto j_c) {
+                constexpr int j = decltype(j_c)::value;
+                typename decltype(mma_c2)::vtype_c vj;
+                if constexpr (SF_WPAIR) {
+                    constexpr int wp_im_row =
+                        (im / T::T_M) * T::T_M * T::T_M * T::W_M
+                        + (im % T::T_M) * T::W_M;
+                    vj = load<T::VEC_C>(g,
+                                        u + (wp_im_row
+                                             + wave_id_m * (T::T_M - 1) * T::W_M)
+                                                * stride,
+                                        (wave_id_n * T::COM_REP_N + j) * T::W_N,
+                                        opus::number<1>{});
+                } else {
+                    vj = load<T::VEC_C>(g,
+                                        u + im * T::T_M * T::W_M * stride,
+                                        (wave_id_n * T::COM_REP_N + j) * T::W_N,
+                                        opus::number<1>{});
+                }
+                opus::static_for<C_LEN>([&](auto e_c) {
+                    constexpr int e = decltype(e_c)::value;
+                    dst[(im * T::COM_REP_N + j) * C_LEN + e] = vj[e];
+                });
             });
         });
     };
@@ -1583,11 +1692,137 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                       + (size_t)col;
         auto g_c = make_gmem(ws_c_ptr);
         store_c(g_c);
+        // if constexpr, not a plain if: D_OUT is void on the workspace-only
+        // specialization, where the tail's `D_OUT* out_ptr + offset` is pointer
+        // arithmetic on void and does not parse. xcd_fused is already false
+        // there (XCD_FUSE carries !is_void_v<D_OUT>), but that is a value, and
+        // a value does not stop the body being compiled.
+        if constexpr (!std::is_void_v<D_OUT>) {
+        if (xcd_fused) {
+            // All of this tile's splits ran on this XCD, so their partials meet
+            // in its L2: draining this workgroup's stores and a workgroup-scope
+            // arrival count publish them, with none of the L2 writeback /
+            // invalidate an agent-scope fence emits. The last to arrive sums
+            // every split in split order -- the same order whichever split that
+            // is -- and re-arms the counter for the next launch.
+            //
+            // This is the tail that pays, as against the agent-scope one below.
+            // kid8460 at b1/m1/n1024/k4096 sk4, kernel time: unfused 4.20us main
+            // plus a 3.84us opus_bmm_splitk_reduce launch, fused here 5.24us and
+            // no second launch. Wall 5.9us -> 5.5us.
+            //
+            // What the tail costs, by ablation on this block (hot / cold):
+            //   main loop + the workspace store, no tail   4.04 / 4.24
+            //   + this arrival (drain, atomic, barriers)   4.92 / 5.56
+            //   + the reduce below                         5.24 / 5.92
+            // So the arrival is the larger half and it is pure latency: every
+            // workgroup drains its partial store and takes an L2 round trip on
+            // the atomic, and the one that arrives last does that before it may
+            // start reading. The reference flydsl kernel runs the identical
+            // protocol instruction for instruction -- buffer_store, vmcnt(0),
+            // s_barrier, global_atomic_add sc0, ds_write, s_barrier, re-arm --
+            // so its 4.04us total is not a cheaper tail. It is a faster main
+            // loop with the same tail on top, and that, not this block, is what
+            // is left to find.
+            __shared__ int xcd_last;
+            const bool lead = wave_id == 0 && lane_id == 0;
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            int* counter = kargs.ptr_xcd_counters + batch_id * tiles_per_batch + wgid;
+            if (lead) {
+                xcd_last = __hip_atomic_fetch_add(counter, 1, __ATOMIC_RELAXED,
+                                                  __HIP_MEMORY_SCOPE_WORKGROUP)
+                           == kargs.split_k - 1;
+            }
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            if (xcd_last) {
+                const size_t split_stride =
+                    (size_t)kargs.batch * (size_t)kargs.stride_ws_batch;
+                D_C* tile_ws = ws_c_ptr - (size_t)split_id * split_stride;
+                typename decltype(mma)::vtype_c acc;
+                opus::static_for<decltype(mma)::mma_c_len * T::COM_REP_M
+                                 * T::COM_REP_N>([&](auto e_c) {
+                    acc[decltype(e_c)::value] = 0.0f;
+                });
+                // SPLITS_PER_PASS partials in flight at once, not one L2
+                // round trip per split. The loads of a pass are issued before
+                // any of them is waited on, so the pass costs one L2 latency
+                // instead of split_k of them -- which is how the reference
+                // flydsl kernel writes the same reduce (four buffer_loads,
+                // then s_waitcnt vmcnt(3), vmcnt(2), ... with the adds
+                // interleaved). A slot past split_k re-reads the last split,
+                // an L2 hit, and adds nothing. The pass holds SPLITS_PER_PASS
+                // whole partials live at once, so it is sized to 64 VGPRs of
+                // them.
+                constexpr int C_ELEMS = decltype(mma)::mma_c_len
+                                      * T::COM_REP_M * T::COM_REP_N;
+                constexpr int SPLITS_PER_PASS =
+                    C_ELEMS >= 64 ? 1 : (64 / C_ELEMS > 4 ? 4 : 64 / C_ELEMS);
+                for (int sp0 = 0; sp0 < kargs.split_k; sp0 += SPLITS_PER_PASS) {
+                    typename decltype(mma)::vtype_c part[SPLITS_PER_PASS];
+                    opus::static_for<SPLITS_PER_PASS>([&](auto j_c) {
+                        constexpr int j = decltype(j_c)::value;
+                        const int sp = sp0 + j < kargs.split_k ? sp0 + j
+                                                               : kargs.split_k - 1;
+                        auto g_s = make_gmem(tile_ws + (size_t)sp * split_stride);
+                        load_c_into(g_s, part[j], u_gc2, kargs.stride_ws);
+                    });
+                    opus::static_for<SPLITS_PER_PASS>([&](auto j_c) {
+                        constexpr int j = decltype(j_c)::value;
+                        const bool in = sp0 + j < kargs.split_k;
+                        opus::static_for<C_ELEMS>([&](auto e_c) {
+                            constexpr int e = decltype(e_c)::value;
+                            acc[e] += in ? part[j][e] : 0.0f;
+                        });
+                    });
+                }
+                D_OUT* out_ptr = reinterpret_cast<D_OUT*>(kargs.ptr_c)
+                               + (size_t)batch_id * kargs.stride_c_batch
+                               + (size_t)row * kargs.stride_c
+                               + (size_t)col;
+                auto g_out = make_gmem(out_ptr,
+                    (unsigned int)rows_avail * (unsigned int)kargs.stride_c
+                        * sizeof(D_OUT));
+                auto u_gc2_o = partition_layout_c<T::VEC_C>(mma_c2,
+                    opus::make_tuple(kargs.stride_c, 1_I), p_coord_c1);
+                store_c_from(g_out, acc, u_gc2_o, kargs.stride_c);
+                if (lead)
+                    __hip_atomic_store(counter, 0, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+            }
+            return;
+        }
+        }
     }
 
     // Fused reduce tail: the last workgroup to finish a tile sums the split-K
     // workspace slices into Y itself, so the split_k>1 path needs no second
     // launch. Only compiled for the D_OUT (Y-typed) instantiations.
+    //
+    // Dead on every kid of this pipeline today, and measured before being left
+    // that way. The split-K launcher gen_instances_gfx950.py emits picks
+    // D_OUT=void for splitK>1, so this block compiles out and a separate
+    // opus_bmm_splitk_reduce_kernel launches behind the main one; wiring the
+    // launcher to the Y-typed instantiation instead (workspace sized with the
+    // arrival counters, counter_offset_bytes set, no reduce launch) does remove
+    // that second kernel and costs more than it saves. On kid8460 at
+    // b1/m1/n1024/k4096 sk4 the main kernel goes 4.20us -> 9.88us and wall
+    // 5.9 -> 11.5us, against 4.20 + a 3.84us reduce unfused.
+    //
+    // Two reasons, both in the code below. The agent-scope release fence writes
+    // back and invalidates L2 across all eight XCDs, which is exactly what the
+    // flatmm pipeline's xcd_fused tail exists to avoid (workgroup-scope atomic,
+    // partials meeting in one XCD's L2); and the sum is a scalar per-element
+    // loop over split_k where that one issues SPLITS_PER_PASS vector loads.
+    // So the fused tail worth having here is the XCD one, and it is the one
+    // above: the grid decode near the top of this kernel now reads (tile,
+    // split, batch) when ptr_xcd_counters is non-null, and that path returns
+    // before reaching this block. What is left here runs only for a kid whose
+    // traits set XCD_FUSE false -- B_M > 64, where the reducing workgroup's
+    // extra tile of partials pushes the scaled MFMA's scale operand into an
+    // AGPR and the backend rejects it -- and the launcher does not pick the
+    // Y-typed instantiation for any of those, so it is still dead.
     if constexpr (!std::is_void_v<D_OUT>) {
         if (kargs.split_k == 1) return;
 
