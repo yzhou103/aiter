@@ -2238,8 +2238,18 @@ struct smem {
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
+    //
+    // c_os is an extra element offset added to every address, and it is there to
+    // be a compile-time constant. A caller walking a ring of LDS slots has the
+    // choice of putting the slot's displacement in the pointer this smem<> was
+    // built from or in c_os, and the two compile very differently: in the
+    // pointer it is an opaque value, so the address becomes
+    // (base + slot) + lane and costs a VALU per load per slot; in c_os it stays
+    // separable, so the backend hoists base + lane out as loop-invariant and
+    // folds the slot into the ds_read immediate offset, which reaches 64 KiB and
+    // is free. Same addresses either way -- only the instruction count differs.
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load(const Layout& u)
+    OPUS_D auto load(const Layout& u, int c_os = 0)
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
@@ -2248,13 +2258,13 @@ struct smem {
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         for (index_t i = 0; i < r_elem.value; i++) {
-            auto tmp = load<vec>(offsets[i]);
+            auto tmp = load<vec>(offsets[i] + c_os);
             for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
         }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i] + c_os);
         return r;
 #endif
     }

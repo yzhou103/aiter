@@ -1221,7 +1221,18 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             // A byte per (MFMA K rep, M subtile): MFMA ik's scale is K scale
             // ik*SF_PER_MFMA_K + sf_lane_k of the tile (sf_lane_k is 0 at 128).
             auto sm_a = make_smem(s_sfa_ptr + sfa_lane_off);
-            if constexpr (T::SF_PER_MFMA_K == 1 && T::COM_REP_K == 2) {
+            // Reading the adjacent pair as one u16 halves the ds_read count but
+            // costs two VALU to split it back apart (v_and 0xff on the low byte,
+            // v_lshrrev_b16 8 on the high one), and the MFMA scale operand wants
+            // each byte zero-extended in its own register anyway. That trade is
+            // only worth it when LDS issue is the bottleneck; in the unrolled
+            // straight line it is not, and the two extracts land between the
+            // MFMAs where the reference kernel has nothing at all -- it reads
+            // every scale byte with its own ds_read_u8 (offset d and d+1 off one
+            // base) and feeds the register straight in. Left switchable because
+            // at a wide COM_REP_M the halved issue count can win again.
+            constexpr bool SF_PAIR_U16 = false;
+            if constexpr (SF_PAIR_U16 && T::SF_PER_MFMA_K == 1 && T::COM_REP_K == 2) {
                 // The tile's two scales are adjacent and, scale_base being even,
                 // inside one dword: one u16 per subtile.
                 int d = (scale_base >> 2) + sfa_lane_rot;
@@ -1257,10 +1268,12 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
                 auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_pitch + scale_base);
-                auto sfb = load<T::SCALES_PER_BK>(sm_b, 0);
+                // One byte load per scale, same reasoning as the A side above:
+                // a SCALES_PER_BK-wide load here would have to be sliced back
+                // into one register per byte with a VALU each.
                 opus::static_for<T::SCALES_PER_BK>([&](auto kg_c) {
                     constexpr int kg = decltype(kg_c)::value;
-                    v_sfb[ng * T::SCALES_PER_BK + kg] = sfb[kg];
+                    v_sfb[ng * T::SCALES_PER_BK + kg] = load<1>(sm_b, kg)[0];
                 });
             });
         }
@@ -1426,13 +1439,38 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         typename decltype(mma)::vtype_b v_b2[2];
         vtype_sfa v_sfa2[2];
         vtype_sfb v_sfb2[2];
-        auto read_tile = [&](int kt, auto set_c) {
+        // kt arrives as a runtime int from the rolled loop, where the clamp
+        // against the runtime loops count has to stay, and as an opus::number
+        // from the straight line, where the caller has already proved
+        // kt < loops. Letting the number through the clamp untouched is the
+        // whole point: everything below indexes LDS by kk % PF, and with kk a
+        // literal those addresses fold into ds_read immediate offsets instead
+        // of being recomputed with v_add3_u32 on every tile. One runtime
+        // `loops` in the ternary was enough to keep all of it in the loop body.
+        auto read_tile = [&](auto kt, auto set_c) {
             constexpr int s = decltype(set_c)::value;
-            const int kk = kt < loops ? kt : loops - 1;
-            auto sa = make_smem(smem_a_at(kk % PF, 0, 0));
+            const auto kk = [&] {
+                if constexpr (std::is_integral_v<decltype(kt)>)
+                    return kt < loops ? kt : loops - 1;
+                else
+                    return kt;
+            }();
+            // Slot 0's pointer, with the slot's displacement handed to the
+            // load as a separate element offset rather than folded into the
+            // pointer. With kk a literal that offset is a constant, and the
+            // backend then hoists the lane part of the address out of the
+            // straight line and spends a ds_read immediate on the slot instead
+            // of a v_add3_u32 per load per tile. The slot stride is 4224 bytes
+            // and the ring is four deep, so the largest offset in play is well
+            // inside the 64 KiB the immediate reaches.
+            constexpr int A_SLOT_ELEMS =
+                T::NUM_LOAD_GROUPS_PER_BM * T::NUM_LOAD_GROUPS_PER_BK
+                * T::smem_per_group_load_size / sizeof(D_A);
+            const int a_slot_os = (kk % PF) * A_SLOT_ELEMS;
+            auto sa = make_smem(smem_a_at(0, 0, 0));
             if constexpr (A_SWZ) {
-                auto a0 = load<T::VEC_A>(sa, u_ra_h0);
-                auto a1 = load<T::VEC_A>(sa, u_ra_h1);
+                auto a0 = load<T::VEC_A>(sa, u_ra_h0, a_slot_os);
+                auto a1 = load<T::VEC_A>(sa, u_ra_h1, a_slot_os);
                 constexpr int A_PIECES = T::COM_REP_M * T::NUM_LOAD_GROUPS_PER_BK;
                 opus::static_for<A_PIECES>([&](auto p_c) {
                     constexpr int p = decltype(p_c)::value;
@@ -1448,10 +1486,11 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                         opus::number<(2 * p + 2) * T::VEC_A>{});
                 });
             } else {
-                v_a2[s] = load<T::VEC_A>(sa, u_ra);
+                v_a2[s] = load<T::VEC_A>(sa, u_ra, a_slot_os);
             }
-            auto sb = make_smem(reinterpret_cast<D_B*>(smem_b + (kk % PF) * T::b_lds_slot_bytes));
-            v_b2[s] = load<T::VEC_B>(sb, u_rb_lds);
+            auto sb = make_smem(reinterpret_cast<D_B*>(smem_b));
+            v_b2[s] = load<T::VEC_B>(
+                sb, u_rb_lds, (kk % PF) * (int)(T::b_lds_slot_bytes / sizeof(D_B)));
             read_scales(kk, v_sfa2[s], v_sfb2[s]);
         };
         auto step = [&](int k, auto set_c) {
@@ -1469,7 +1508,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         };
         s_waitcnt_vmcnt(number<(PF - 1) * CP>{});
         __builtin_amdgcn_s_barrier();
-        read_tile(0, number<0>{});
+        read_tile(number<0>{}, number<0>{});
         // A short split runs as one straight line, no backward branch. The
         // decode shapes put four K tiles in a split (K=4096, B_K=256, sk4), and
         // round the ring that is two trips carrying a barrier pair each, with
@@ -1493,7 +1532,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             s_waitcnt_lgkmcnt(0_I);
             s_waitcnt_vmcnt(number<(k < 2 ? (2 - k) * CP : 0)>{});
             __builtin_amdgcn_s_barrier();
-            if constexpr (k + 1 < 4) read_tile(k + 1, number<s ^ 1>{});
+            if constexpr (k + 1 < 4) read_tile(number<k + 1>{}, number<s ^ 1>{});
             mma_mxscale_wave8_accum<T, decltype(mma), 0, false>(
                 v_a2[s], v_b2[s], v_sfa2[s], v_sfb2[s], v_c);
             sched_mfma_interleave<T::mma_insts,
