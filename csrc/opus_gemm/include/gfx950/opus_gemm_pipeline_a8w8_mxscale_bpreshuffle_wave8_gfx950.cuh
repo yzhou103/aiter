@@ -1798,6 +1798,21 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                                       * T::COM_REP_M * T::COM_REP_N;
                 constexpr int SPLITS_PER_PASS =
                     C_ELEMS >= 64 ? 1 : (64 / C_ELEMS > 4 ? 4 : 64 / C_ELEMS);
+                // The `in ? part : 0.0f` below is not free and it is not a bug:
+                // `in` is not a constant, so the zero stays in the instruction
+                // stream and the select breaks the accumulator pairs apart --
+                // this reduce comes out as 2 v_pk_add_f32 plus 20 scalar
+                // v_add_f32 where the reference kernel's is 8 packed adds and
+                // nothing else. Peeling the full passes into an unguarded loop
+                // with a one-split remainder does produce exactly those 8
+                // packed adds, and measured *slower*: 4.68us hot against 4.60
+                // on kid8460 sk4 over two alternating A/B pairs, cold a wash.
+                // The loads are already batched and the adds hide behind them;
+                // what the peeled version adds is a second loop and 34 lines of
+                // code in a tail the last-arriving workgroup runs on the
+                // critical path. The reduce arithmetic is not where this tail's
+                // time goes -- the arrival atomic is (0.60us hot, measured by
+                // removing it), and the reference pays that one too.
                 for (int sp0 = 0; sp0 < kargs.split_k; sp0 += SPLITS_PER_PASS) {
                     typename decltype(mma)::vtype_c part[SPLITS_PER_PASS];
                     opus::static_for<SPLITS_PER_PASS>([&](auto j_c) {
