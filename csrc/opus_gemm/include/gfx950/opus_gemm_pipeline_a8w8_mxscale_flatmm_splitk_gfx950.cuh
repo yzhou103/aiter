@@ -115,39 +115,11 @@ inline constexpr int b_preshuffle_k_chunks_mxsk =
 template<typename T>
 inline constexpr int b_preshuffle_n_blocks_mxsk = T::LOAD_GROUP_N / 16;
 
-// Keeping the row-major thread -> (n, k) mapping (above) costs L1 read tag
-// conflicts: a wave issue takes 16 B out of each of 16 cache lines instead of
-// filling 8 of them, so the same bytes cost 4x the line touches per
-// instruction. Measured on kid325 -> kid177 at n=1024,k=4096,g=16,m=256:
-// identical instruction mix, VGPR/LDS/occupancy, TA cycles and L2 traffic (L2
-// hit rate 31.6% either way), but TCP_READ_TAGCONFLICT_STALL_CYCLES goes
-// 0 -> 1.05M and TA_ADDR_STALLED_BY_TC_CYCLES +166%, for -14% end to end.
-//
-// So stage the preshuffle order verbatim instead: each issue becomes one
-// contiguous warp_size*VEC_B run, the same shape B_DIRECT_REG already fetches.
-// LDS then holds B in preshuffle rather than row-major order, which the
-// matching consumer layout absorbs.
-//
-// ALL_WAVE stages with four waves instead of the producer's 1 or 2, so the wave
-// index can outrun the k chunks and has to spill into the n blocks. That is the
-// WAVE_SPLITS_N branch below, and it is the whole reason ALL_WAVE was shut out
-// of this layout before: it read the preshuffle through the row-major mapping
-// at 40.5 cache-line touches per VMEM issue, against the 15.9 of a filled line
-// (blds, same pipeline and same scale ring, manages 19.3). The condition it
-// needs is only that the two splits divide, which is asserted in the layout and
-// mirrored here so a tile that cannot be split falls back to staged rather than
-// failing the build.
-//
-// tileN (T_N=2 without ALL_WAVE) is in, and had to be added: the B_M=16 tiles are
-// all tileN, so while this also required T_N==1 they were the one part of the
-// family reading preshuffled bytes through the row-major mapping, at 8-93% behind
-// their own plain kids. Nothing here is actually T_N-dependent. The producer
-// layout describes one load group and the group index arrives through
-// b_gmem_group_offset_mxsk either way; a tileN consumer owns a contiguous run of
-// COM_REP_N*W_N/LOAD_GROUP_N groups from nbc, which is the same base and the same
-// n-group stride the staged layout reads from. With LOAD_GROUP_N == W_N there,
-// n_blocks and tiles_per_block_n are both 1, so the two layouts also enumerate n
-// subtiles in the same order and the scale-side indexing by subtile is unaffected.
+// Stage preshuffled B verbatim with contiguous warp_size*VEC_B issues.
+// The consumer layout reads the matching order from LDS. WAVE_SPLITS_N
+// maps extra staging waves across N blocks when they exceed the K chunks.
+// The split divisibility checks select this path; otherwise use staged mapping.
+// The mapping also supports tileN consumers through their contiguous N-group base.
 template<typename T>
 inline constexpr bool b_preshuffle_contig_mxsk =
     T::B_PRESHUFFLE && !T::B_DIRECT_REG
@@ -315,24 +287,6 @@ inline __device__ int b_direct_iter_offset_mxsk(int loop_k_idx) {
     return loop_k_idx * T::B_K * 16;
 }
 
-// An L2/XCD-aware workgroup -> tile mapping was built here and measured; it is
-// not kept because it made things slower. For the record, since the memory-side
-// result was the opposite of the runtime one: undoing the dispatcher's
-// round-robin over the eight XCDs (each XCD taking a contiguous run of logical
-// tiles) and then walking those tiles in bands of 4 row tiles x every column
-// tile -- so the co-resident workgroups share A rows as well as B columns --
-// took kid188's L2 hit rate from 70.1% to 84.3% and its HBM traffic from
-// 10.25 GB to 5.39 GB at g16 n1024 k4096 M=32768, better on both counts than
-// FlyDSL's 81.2% / 7.48 GB on the same shape. It ran 6% *slower* (3818us against
-// 3599us). kid188 moves 10 GB in 3.6 ms, i.e. under 3 TB/s against a ~8 TB/s
-// part, so it was never bandwidth-bound and halving the traffic buys it nothing.
-// See the kid 188 notes in opus_gemm_common.py.
-//
-// That last part is about kid188, not about the mapping: read it as "a pipeline
-// this far from the matrix pipe cannot spend a cheaper memory system", because
-// the same mapping is worth 5-10% to kid205, whose only difference is a schedule
-// good enough to feel it (48% MfmaUtil against kid188's 24%). It lives in the
-// wave8 pipeline as XCD_WGM; see _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_XCD_TILES.
 
 // Per-(K iter, n group, k group) offset from that origin.
 template<typename T>
@@ -873,12 +827,8 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
                              + T::SF_GEOM::KD_OF(decltype(ik_c)::value)];
             });
     } else if constexpr (MODE == mxscale_pack::opsel) {
-        // One word per M-subtile / N-scale-group holding the COM_REP_K K-group
-        // e8m0 bytes; the subtile loop picks byte ik via scale_op_sel == ik.
-        // NOTE: reference path only. With the vec-wide (dword) scale load below,
-        // the shift/or here folds away, but op_sel packing still measures on par
-        // with or slightly slower than preload's broadcast pack across the tuned
-        // shapes, so preload stays the default. Kept for experimentation.
+        // Reference scale path: each word holds COM_REP_K E8M0 bytes per M subtile
+        // or N scale group. The subtile loop selects byte ik with scale_op_sel.
         opus::vector_t<int, T::COM_REP_M> packed_sfa;
         opus::vector_t<int, T::SFB_GROUPS> packed_sfb;
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
@@ -1137,35 +1087,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr bool SF_PANEL = PRELOAD_SF_LDS && (T::SF_PER_MFMA_K == 1 || T::SF_PANEL_FITS);
     static_assert(!(PRELOAD_SF_LDS && !SF_PANEL && !T::SF_USE_RING),
                   "a GROUP_K=32 preload kid needs the panel or the ring, and neither fits");
-    // The ring is no longer tied to PRELOAD_SF_LDS, because at GROUP_K=32 the
-    // global path it replaces is worse for every kid, not only for the ones
-    // that had opted into a panel.
-    //
-    // A lane's scale bytes are contiguous at GROUP_K=128 -- one MFMA spans one
-    // block, so COM_REP_K consecutive MFMAs want COM_REP_K consecutive bytes,
-    // and SF_LANE_LOAD_VEC reads them in one b32. At 32 an MFMA spans four
-    // blocks and the four go to four lane quarters, so a lane wants every
-    // SF_PER_MFMA_K'th byte and the run stops vectorising: one ubyte load per
-    // MFMA per scale. Measured over this catalogue, 42 of the 46 non-ring
-    // twins issue more scale loads per K tile than their own 128 mirror, up to
-    // 4x (kid9179: 2 -> 8; kid9138/9233: 3 -> 12).
-    //
-    // The ring sidesteps that stride: the producer stages a slot with
-    // SF_RING_VEC-wide chunked copies and the consumer reads LDS. Its LDS is
-    // already paid for -- prefetch_k_iter subtracts SF_RING_SLOT whenever
-    // SF_USE_RING, which is every GROUP_K=32 kid whose dword-wide slot fits at
-    // depth 3 -- so the kids this turns on have been carrying the cost without
-    // the benefit.
-    //
-    // SHUFFLE_SCALE reads its own pre-laid-out words and never the ring, and
-    // DIRECT_ONLY has its own staging schedule that the ring fill is not part
-    // of; both keep the path they had.
-    //
-    // At GROUP_K=128 the non-preload kids take it too: their per-tile global
-    // scale load is waited on right before the MFMAs and is exposed there --
-    // kid8137's ATT puts 22% of its cycles on that one wait, and its 32 twin,
-    // on the ring, runs in 0.79x the time. The traits only allow it where the
-    // slot leaves the A/B prefetch depth where it was.
+    // The scale ring decouples scale loading from PRELOAD_SF_LDS.
+    // GROUP_K=32 lanes consume strided scale bytes; the producer stages wide
+    // chunks and the consumer reads them from LDS. The traits budget a scale
+    // slot alongside every A/B prefetch slot.
+    // SHUFFLE_SCALE reads its packed words and DIRECT_ONLY uses its separate
+    // staging schedule. Group128 may use the ring where it preserves A/B depth.
     constexpr bool SF_RING = T::SF_USE_RING && !SF_PANEL && !SHUFFLE_SCALE && !DIRECT_ONLY;
     // Where the scales come from, which is what the waits below turn on. Keyed
     // on this rather than on PRELOAD_SF_LDS: a ring kid reads its scales out of
@@ -2326,10 +2253,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             mma_mxscale_flatmm_accum<T>(mma, v_a0, v_b0, v_sfa0, v_sfb0, v_c);
         }
         } else {
-        // Direct B goes global -> registers and owes the stage-0 barrier
-        // nothing, so its first tile is issued before it: the consumer would
-        // otherwise idle there behind the producers' prologue and then wait a
-        // full B round trip after it. 2-4% at m<=64 on the 16x32x512 tile.
+        // Direct B needs no stage-0 LDS barrier, so issue its first tile before
+        // that barrier to overlap the producer prologue.
         if constexpr (T::B_DIRECT_REG) issue_b_direct(v_b0, 0);
         stage_barrier(0);
         {
@@ -2463,19 +2388,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             opus::make_tuple(stride_c_main, 1_I), p_coord_c1);
         auto store_c_v = [&](auto& g, const auto& vc, const auto& ug, const auto& ug1) {
             if constexpr (SPLIT_N_STORE) {
-                // The accumulator nests m-repeat outside n-repeat (i_tile_c =
-                // im*COM_REP_N + in), so one n-repeat's tiles sit COM_REP_N*C_LEN
-                // apart rather than contiguously. Gather them into the layout
-                // mma_c1 expects; with COM_REP_M==1 this is the identity, which is
-                // why a plain prefix slice held up for tileN.
-                //
-                // At COM_REP_M>1 this order also costs DRAM write bandwidth: one
-                // store covers only 32 bytes of each row, so the two halves of a
-                // 64B line come from n-repeats j and j+1 and this leaves COM_REP_M
-                // stores between them. The wave8 pipeline's copy of this loop
-                // measured 1.30x the necessary DRAM writes and fixed it by making
-                // the n-repeat innermost; the same is available here, on a kid
-                // not fast enough to be worth the churn yet.
+                // The accumulator index is im*COM_REP_N+in. Gather each N repeat's
+                // strided M tiles into mma_c1's expected layout. For COM_REP_M=1 this
+                // is the identity mapping.
                 opus::static_for<T::COM_REP_N>([&](auto j_c) {
                     constexpr int j = decltype(j_c)::value;
                     typename decltype(mma_c1)::vtype_c vj;

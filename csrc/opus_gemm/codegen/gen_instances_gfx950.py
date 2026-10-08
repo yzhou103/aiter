@@ -17,6 +17,7 @@ from codegen.common import (
 # ---------------- gfx950 arch-override maps ----------------
 
 PIPELINE_HEADER_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
@@ -54,6 +55,7 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 }
 
 TRAITS_HEADER_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
@@ -82,6 +84,7 @@ TRAITS_HEADER_MAP = {
 }
 
 KERNEL_FUNC_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
@@ -117,6 +120,7 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 }
 
 TRAITS_NAME_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_traits_gfx950",
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8_mxscale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
@@ -145,6 +149,7 @@ TRAITS_NAME_MAP = {
 }
 
 KARGS_NAME_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
@@ -2336,7 +2341,14 @@ def _emit_bmm_specialized(
     specializations already emitted by the mouter family -- emitting them again
     under a different alias name would be a duplicate-symbol ODR violation).
     """
-    traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
+    if k.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+        traits_aliases = (
+            f"using {k.name}_Traits = {traits_name}<"
+            f"{k.B_M}, {k.B_N}, {k.B_K}, {k.T_M}, {k.T_N}, {k.num_slots}, "
+            f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}>;"
+        )
+    else:
+        traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
@@ -2414,6 +2426,108 @@ _BMM_SPEC_KARGS = r"""
   kargs.stride_c = (int)Y.stride(0);
   kargs.stride_c_batch = (int)Y.stride(1);
 """
+
+
+# Compact family: fixed fast path plus a bounded, segmented general N/K path.
+_BMM_COMPACT_LAUNCHER_BODY = (
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + r"""  AITER_CHECK(splitK == 0 || splitK == 1, "@@NAME@@ requires splitK <= 1");
+  const int64_t M = O.size(0), batch = O.size(1), N = wo_a.size(1), K = O.size(2);
+  AITER_CHECK(M > 0 && M < 2048 && batch > 0 && batch <= 16 && N > 0 && N <= 2147483647 && K > 0 && K <= 2147483647,
+              "@@NAME@@ requires M in [1,2047], batch in [1,16], positive int32 N and K");
+  AITER_CHECK(N % 128 == 0 && N % Traits::B_N == 0 && K % Traits::B_K == 0,
+              "@@NAME@@ requires N aligned to 128 and B_N, and K aligned to B_K");
+  const int64_t output_bytes = Y.dtype() == AITER_DTYPE_bf16 ? 2 : 4;
+  AITER_CHECK(M*batch*K <= 2147483647 && N*K <= 2147483647 &&
+              M*batch*N*output_bytes <= 2147483647,
+              "@@NAME@@ requires A, each B batch, and Y byte spans to fit signed int32");
+  const int64_t scale_k = K / 128;
+  // Size-one dimensions do not contribute to addresses; contiguous PyTorch
+  // views may retain arbitrary strides on those axes after transpose/clone.
+  AITER_CHECK((M == 1 || O.stride(0) == batch*K) && (batch == 1 || O.stride(1) == K) &&
+              (batch == 1 || wo_a.stride(0) == N*K) && wo_a.stride(1) == K &&
+              (M == 1 || Y.stride(0) == batch*N) && (batch == 1 || Y.stride(1) == N) &&
+              (M == 1 || x_scale.stride(0) == batch*scale_k) && (batch == 1 || x_scale.stride(1) == scale_k) &&
+              (batch == 1 || w_scale.stride(0) == (N/128)*scale_k) && w_scale.stride(1) == scale_k,
+              "@@NAME@@ requires contiguous token-major A/scales/Y and contiguous preshuffled B");
+  AITER_CHECK(reinterpret_cast<uintptr_t>(O.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(wo_a.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(x_scale.data_ptr()) % 4 == 0 &&
+              reinterpret_cast<uintptr_t>(w_scale.data_ptr()) % 4 == 0,
+              "@@NAME@@ requires 16-byte A/B/Y alignment and 4-byte scale alignment");
+"""
+    + _BMM_SPEC_KARGS
+    + r"""
+  const int tiles = (M + Traits::B_M - 1) / Traits::B_M * (N / Traits::B_N);
+  dim3 grid_main((tiles * batch + 7) / 8 * 8);
+  dim3 block_main(Traits::BLOCK_SIZE);
+  if (Y.dtype() == AITER_DTYPE_bf16) {
+    if (N == 1024 && K == 4096)
+      @@KERNEL@@<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
+    else
+      @@KERNEL@@_general<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
+  } else {
+    if (N == 1024 && K == 4096)
+      @@KERNEL@@<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
+    else
+      @@KERNEL@@_general<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
+  }
+}
+#endif
+"""
+)
+
+
+def gen_bmm_mxscale_compact_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    **_unused,
+):
+    _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
+    launcher = _BMM_COMPACT_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
+        "@@KERNEL@@", kernel_func
+    )
+    device_begin = len(cg._device_instantiations)
+    _emit_bmm_specialized(
+        cg,
+        k,
+        kernel_func,
+        traits_name,
+        kargs_name,
+        da,
+        db,
+        instance_impl_preamble(),
+        instance_impl_host_tu_split(
+            traits_header, pipeline_header, tpl, kernel_func, fn
+        )
+        + (
+            f"\n#ifdef OPUS_FUSED_HOST_TU\n"
+            f"template<typename Traits, typename D_OUT>\n"
+            f"__global__ void {kernel_func}_general({kargs_name} kargs);\n"
+            f"#endif\n"
+        ),
+        launcher,
+        "",
+    )
+    # Emit both bodies in each compact dtype TU, retaining the fast symbol.
+    for record in cg._device_instantiations[device_begin:]:
+        d_out = "__bf16" if record["dtype"] == "bf16" else "float"
+        record["device_decl"] += (
+            f"template __global__ void {kernel_func}_general<\n"
+            f"    {k.name}_Traits, {d_out}>({kargs_name});\n"
+        )
+
 
 # ---- wave8n2 (kid 132) ----
 _BMM_WAVE8N2_LAUNCHER_BODY = (
@@ -3193,4 +3307,8 @@ _register_bmm_emit(
 _register_bmm_emit("a8w8_mxscale_bmm_wave8n2", gen_bmm_mxscale_wave8n2_instance, 1)
 _register_bmm_emit(
     "a8w8_mxscale_bmm_wave4m2_selfload", gen_bmm_mxscale_wave4m2_selfload_instance, 2
+)
+
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_compact", gen_bmm_mxscale_compact_instance, 0
 )

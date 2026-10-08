@@ -667,6 +667,25 @@ def _build_a8w8_mxscale_bmm_plan(
             f"got {requested_split_k}"
         )
     abi_split_k = max(1, requested_split_k)
+    if tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+        if not (
+            0 < M < 2048
+            and 0 < batch <= 16
+            and 0 < N <= (1 << 31) - 1
+            and 0 < K <= (1 << 31) - 1
+        ):
+            raise ValueError(
+                f"OPUS compact kid {resolved_kid} requires M in [1,2047], "
+                "batch in [1,16], positive int32 N and K"
+            )
+        if N % 128:
+            raise ValueError(f"OPUS compact kid {resolved_kid} requires N % 128 == 0")
+        output_bytes = 2 if output_dtype == torch.bfloat16 else 4
+        if max(M * batch * K, N * K, M * batch * N * output_bytes) > (1 << 31) - 1:
+            raise ValueError(
+                f"OPUS compact kid {resolved_kid} requires byte spans to fit signed int32"
+            )
+
     if min(M, batch, N, K) <= 0:
         raise ValueError(
             "OPUS BMM requires positive M, batch, N and K; "

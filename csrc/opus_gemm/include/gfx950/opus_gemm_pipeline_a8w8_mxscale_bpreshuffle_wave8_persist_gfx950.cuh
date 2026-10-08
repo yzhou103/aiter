@@ -1,85 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 fp8/e8m0 mxscale pipeline: the wave8 schedule with an M-outer tile loop
-// and a software-pipelined tile boundary. Fork of
-// opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh; the K-tile body,
-// the traits contract and every scale arm below are that file's, unchanged.
-// A fork rather than a PERSIST_M template arm on the original because the
-// restructuring moves declarations across the K loop, and the two kids this
-// exists to beat (kid203/205, 250-254 VGPR; kid194/346, already spilling 10)
-// have no register headroom for an allocation shift that was meant to be inert.
-//
-// WHY: over the 40-cell target retune, every K=1024 cell runs at 0.63-0.65x the
-// efficiency the same (b, m) reaches at K=4096 -- uniformly, from b=2/m=256 to
-// b=16/m=16384. Solving eff(K) = K/(K+r) against the b=16/m=16384 pair (8 vs 32
-// K-tiles, 65% vs 101% of the 2184 TFLOPS ceiling) puts the per-workgroup
-// non-K-loop cost at r ~= 7 K-tiles. At K=1024's 8 tiles that is near half the
-// workgroup's life. It is fully exposed because every winner at m >= 512 is
-// wgpcu1: one workgroup resident per CU, so consecutive workgroups cannot
-// overlap, and the exposure is paid once per output tile.
-//
-// WHAT IS DIFFERENT FROM THE bf16 PERSISTENT PIPELINE: that one
-// (opus_gemm_pipeline_a16w16_persistent_gfx950.cuh) is explicit that its tile
-// boundary is vmcnt(0) + s_barrier, "fully serial -- no overlap between current
-// iter's store and next iter's prologue load". It therefore still pays r per
-// tile and would not move this number. The boundary here issues tile t+1's
-// panel refill, A ring and B(0) *before* tile t's C store, so the store's drain
-// and the next tile's global-load latency are concurrent: cost becomes max(),
-// not sum(). See the tile loop for the ordering and why it is the only one the
-// vmcnt/v_c dependencies allow.
-//
-// WHAT IT CANNOT DO: v_c is 128 of the ~250 VGPRs in use, so there is no second
-// accumulator and tile t+1's *math* cannot start under tile t's store -- only
-// its loads. The exposure is halved, not removed.
-//
-// The schedule below is written against T::WAVES rather than a fixed eight, so
-// the traits can also aim it at a 4-wave grid on a half-height tile; the argument
-// that follows is the 8-wave one it was designed for.
-//
-// "wave8" in this file's name, in gemm_a8w8_mxscale_bpreshuffle_wave8_kernel, in
-// mma_mxscale_wave8_accum and in the base traits struct is therefore historical,
-// not a wave count: T::WAVES follows BLOCK_SIZE, and the fastest kid this file
-// has -- kid205 on the wavetm1 traits -- runs four waves on a 1x4 grid at
-// BLOCK_SIZE=256. Nothing a caller sees says wave8 any more. The tag it was named
-// after is gone with kid192 (see opus_gemm_common.py), and the two that remain
-// name the grid rather than a count and are honest about it: wave8n4 is T_N=4 on
-// eight waves, wavetm1 is T_M=1 on either eight or four. Both are aliases of the
-// one base traits struct below, which is the schedule; what parameterizes it is
-// the wave grid, T_N = WAVES / T_M.
-//
-// The 4-wave schedules in this directory all run 64 MFMA per workgroup per K
-// tile: two of the four waves compute, 32 MFMA each. The hand-written f4gemm
-// assembly runs 256, and every attempt to close that gap without changing the
-// wave count has failed for the same reason -- the tile cannot grow. A 128x256
-// tile (4 waves, all computing, 128 MFMA) measured +4% at M=8192 and -75% at
-// M=1024, and the two constraints that stop it there are hard:
-//
-//   * Registers. The fp32 accumulator for a BxB tile is B*B/64 registers per
-//     lane-slot however many waves hold it; 256x256 is 1024, half of the CU's
-//     4 SIMDs x 512. Four waves would need 256 accumulator + 256 of double
-//     buffered fp8 fragments per wave -- the entire per-wave file, with nothing
-//     left for addressing. (The f4gemm assembly fits the same tile in 4 waves
-//     only because fp4 halves every fragment.)
-//   * LDS. Staging B costs (B_M + B_N)/32 * 4224 bytes per K tile per slot; at
-//     three slots and a scale panel that caps B_M + B_N at 384.
-//
-// So this file breaks both: eight waves, which cuts the accumulator to 128 per
-// wave and makes 2 waves/SIMD mandatory (hence the 256-register ceiling every
-// choice below answers to), and direct-to-register B, which removes B from LDS
-// entirely and leaves the A ring three slots deep.
-//
-// What that costs, and why the schedule looks like it does: at 256 registers a
-// wave can hold 128 accumulator + 96 of fragments, so neither A nor B is double
-// buffered. B's global latency therefore lands inside the K tile it feeds. That
-// turned out not to matter -- the second wave on the SIMD covers it, and
-// B_STAGED_WAIT below, which waits on B one n-repeat at a time so all but the
-// first hide behind MFMAs already issued, measured identical to the single
-// conservative wait at both M=8192 and M=32768.
-//
-// What does matter is that direct B has no LDS to share through, so each of B's
-// bytes crosses L1 once per M-wave. The traits pick the wave grid on that basis;
-// see the T_M note there.
+// gfx950 FP8/E8M0 BMM with an M-outer tile loop and a software-pipelined
+// tile boundary. This variant shares the wave8 K-tile schedule, scale layouts
+// and traits contract. Workgroups reuse their staging state across M tiles.
 #pragma once
 
 // Layout helpers (make_layout_*_mxsk), pack_e8m0x4 and the split-K reduce kernel
@@ -251,16 +175,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_persist_kernel(opus_gemm_scale_splitk_k
     const int tile_m_hi  = min(num_tiles_m, tile_m_lo + m_per_wg);
     if (tile_m_lo >= num_tiles_m) return;
     int row = tile_m_lo * T::B_M;
-    // The non-persistent kernel's XCD_WGM rasterization is gone, not ported. It
-    // reorders a 1-tile-per-workgroup grid into bands so that co-resident
-    // workgroups share A rows and B columns; here the M-outer loop already gives
-    // a workgroup a contiguous A run at one fixed B stripe, which is the same
-    // locality by construction. Re-deriving (row, col) from wgid on top of the
-    // stripe assignment would only fight it, and `col` is const for a reason.
-    //
-    // Kept as a hard error rather than ignored: kid205 and kid346 are the xcd4
-    // variants of kid203/kid194, so the pool's fastest names carry XCD_WGM=4 and
-    // a silently dropped swizzle would look like the tile loop had underperformed.
+    // The M-outer schedule assigns each workgroup a contiguous A stripe at a
+    // fixed B column. Reject XCD_WGM remapping because it would conflict with
+    // that stripe assignment.
     static_assert(XCD_WGM == 0,
                   "the persistent schedule supplies its own tile locality; emit "
                   "these kids with xcd_wgm=0 rather than layering the band map "
@@ -319,27 +236,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_persist_kernel(opus_gemm_scale_splitk_k
     constexpr int A_MB = T::a_buffer_load_insts;
     constexpr int B_MB = T::b_direct_load_insts;
 
-    // Shuffled scale words are prefetched one K tile pair ahead, so they are in flight
-    // across a whole tile's MFMAs and every wait between has to leave them alone.
-    // SF_PF is that many vmcnt entries -- what read_scales_shuf issues -- and it is
-    // what the thresholds below add on top of the A and B groups.
-    //
-    // Only the paired loop (COM_REP_K == 1) prefetches. At COM_REP_K == 2 a tile
-    // owns its own word, so the rotate into the consumed register would land while
-    // the load is still in flight, and the waitcnt that would fix it is the very
-    // exposure the prefetch exists to remove.
-    //
-    // And only where the wave has the registers for the second set of words,
-    // which the register-tile count alone does not decide. Measured over four
-    // shapes at K=16384/32768: 128x256 on the 2x4 grid (16 tiles, 152 VGPR with
-    // the prefetch, no spill) gains 5-12%, and the same tile on the 1x4 grid (32
-    // tiles, and the same five words to hold) goes from 250 to 254 VGPR without
-    // spilling and gains 1.5-6%. But 256x256, also 32 tiles and also five words,
-    // is already at 256 with 10 spilled before the prefetch: it loses 11-16%, and
-    // still 3% when its scale addresses are made cheap enough to bring the
-    // prefetched build down to 8 spills. Nothing in the traits separates the two
-    // 32-tile shapes -- they agree on every REP -- so the bound carries B_M:
-    // past 128 rows per workgroup the wave has no room left.
+    // Prefetch shuffled scale words one K-tile pair ahead and include SF_PF
+    // in the vmcnt thresholds. Only the COM_REP_K=1 paired loop uses this path;
+    // the B_M bound reserves registers for the second set of words.
     constexpr bool SF_PREFETCH = !SF_SHUF_IN_LDS && SHUFFLE_SCALE && T::COM_REP_K == 1
                                  && (T::COM_REP_M * T::COM_REP_N <= 16
                                      || (T::COM_REP_M * T::COM_REP_N <= 32
@@ -453,31 +352,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_persist_kernel(opus_gemm_scale_splitk_k
                     load<VEC>(g_sfb, r * kargs.stride_sfb + kt), idx);
             }
         };
-        // SFA goes in M-packed: row r of the logical panel is subtile r/SFA_MB of
-        // the lane at row r%SFA_MB, so storing it as [r%SFA_MB][k][r/SFA_MB] puts
-        // the COM_REP_M bytes one lane needs for a K group in COM_REP_M adjacent
-        // slots, naturally aligned for a single dword read.
-        //
-        // The subtile index being the fastest destination axis is what makes the
-        // fill awkward: adjacent destination bytes come from rows SFA_MB apart. A
-        // thread therefore takes SFA_PACK such rows rather than one, which puts
-        // SFA_PACK adjacent panel bytes in its registers and lets the panel land
-        // in dword stores instead of one ds_write_b8 per byte. Lanes still walk K
-        // within a row, so the global reads stay as wide and as coalesced as they
-        // were, and the instruction count moves on the LDS side only.
-        //
-        // Worth 2-3% at large K on every kid that runs this fill, and nothing at
-        // K=1024 (g16/m8192/n1024, dword against byte stores: 0.98 / 0.97 / 0.99 /
-        // 0.97 / 1.00 / 0.99 / 0.98 for kid168/175/192/194/202/203/205 at K=4096,
-        // and 0.99 / 0.97 / 0.99 / 0.98 / 0.97 / 0.98 / 0.98 at K=8192, against
-        // 1.00 +-0.006 across all seven at K=1024).
-        //
-        // That K profile is the panel's own: sf_k_scales is loops*SCALES_PER_BK,
-        // so the panel and its fill grow with K and this is a reduction in cost
-        // per unit K, not in the fixed part. Worth keeping straight because the
-        // panel's *fixed* cost is a separate quantity and kid208 is what measures
-        // it -- removing the panel outright buys ~18 us of it and pays 6.9% per
-        // unit K back, i.e. exactly the term this store width is what sets.
+        // Store SFA as [row%SFA_MB][k][row/SFA_MB] so each lane's COM_REP_M bytes
+        // are adjacent. Each thread gathers SFA_PACK rows for dword LDS stores,
+        // while lanes traverse K to keep global reads coalesced.
         constexpr int SFA_PACK = (T::COM_REP_M % 4 == 0) ? 4
                                : ((T::COM_REP_M % 2 == 0) ? 2 : 1);
         constexpr int SFA_PACK_GROUPS = T::COM_REP_M / SFA_PACK;

@@ -1,29 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 fp8/e8m0 BMM, one wave per workgroup, for decode.
+// gfx950 FP8/E8M0 BMM with one wave per workgroup for decode.
 //
-// The 4-wave kernels split a workgroup into producer and consumer waves that
-// meet at an s_barrier every K tile, and their consumers wait out the producers'
-// whole prologue at the first one. At m <= 64 a split is only 4-8 K tiles, so
-// that rendezvous is most of the kernel: ATT on kid8179 at b1/m1 puts ~2000
-// cycles on the stage-0 barrier and ~580 of every ~680-cycle K tile outside
-// the MFMAs. Here one wave does everything, with nothing to wait for but its
-// own loads:
+// A, preshuffled B and scales load directly into a register ring. The pipeline
+// uses no LDS staging or inter-wave barriers. Unrolling by RING assigns each
+// stage a compile-time register set. Clamped tail loads keep wait counts fixed;
+// MFMAs skip those tail tiles. N subtiles are traversed innermost.
 //
-//   * A, the preshuffled B, and both scale sets go global -> registers, one K
-//     tile per stage of a RING-deep register ring. No LDS, no barrier.
-//   * The ring is unrolled by RING, so each stage is a compile-time register
-//     set, and it is kept full past the split's end with clamped re-reads whose
-//     MFMAs are skipped: every step issues one tile and consumes one, so the
-//     in-flight count the compiler waits against is the same on every step.
-//   * The MFMAs of a K step walk the N subtiles innermost, so consecutive MFMAs
-//     accumulate into different registers rather than chaining on one.
-//
-// Split-K follows the flatmm kernel: a D_OUT launch with counters is the
-// same-XCD fused form (grid (tiles padded to 8 * split_k, 1, batch); the tile's
-// last split sums the partials and writes Y), a D_OUT=void launch writes the
-// fp32 workspace for the standalone reduce.
+// With counters, D_OUT launches use same-XCD fused split-K reduction.
+// D_OUT=void launches write FP32 partials for the standalone reducer.
 #pragma once
 #ifndef OPUS_WAVE1_TIMING
 #define OPUS_WAVE1_TIMING 0  // TEMP: remove after the split-K timing probe

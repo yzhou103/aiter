@@ -1,56 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx950 fp8/e8m0 mxscale split-K pipeline: all-compute waves on a 256x256 tile,
-// direct-to-register preshuffled B.
+// gfx950 FP8/E8M0 BMM with all-compute waves and preshuffled B.
 //
-// The schedule below is written against T::WAVES rather than a fixed eight, so
-// the traits can also aim it at a 4-wave grid on a half-height tile; the argument
-// that follows is the 8-wave one it was designed for.
-//
-// "wave8" in this file's name, in gemm_a8w8_mxscale_bpreshuffle_wave8_kernel, in
-// mma_mxscale_wave8_accum and in the base traits struct is therefore historical,
-// not a wave count: T::WAVES follows BLOCK_SIZE, and the fastest kid this file
-// has -- kid205 on the wavetm1 traits -- runs four waves on a 1x4 grid at
-// BLOCK_SIZE=256. Nothing a caller sees says wave8 any more. The tag it was named
-// after is gone with kid192 (see opus_gemm_common.py), and the two that remain
-// name the grid rather than a count and are honest about it: wave8n4 is T_N=4 on
-// eight waves, wavetm1 is T_M=1 on either eight or four. Both are aliases of the
-// one base traits struct below, which is the schedule; what parameterizes it is
-// the wave grid, T_N = WAVES / T_M.
-//
-// The 4-wave schedules in this directory all run 64 MFMA per workgroup per K
-// tile: two of the four waves compute, 32 MFMA each. The hand-written f4gemm
-// assembly runs 256, and every attempt to close that gap without changing the
-// wave count has failed for the same reason -- the tile cannot grow. A 128x256
-// tile (4 waves, all computing, 128 MFMA) measured +4% at M=8192 and -75% at
-// M=1024, and the two constraints that stop it there are hard:
-//
-//   * Registers. The fp32 accumulator for a BxB tile is B*B/64 registers per
-//     lane-slot however many waves hold it; 256x256 is 1024, half of the CU's
-//     4 SIMDs x 512. Four waves would need 256 accumulator + 256 of double
-//     buffered fp8 fragments per wave -- the entire per-wave file, with nothing
-//     left for addressing. (The f4gemm assembly fits the same tile in 4 waves
-//     only because fp4 halves every fragment.)
-//   * LDS. Staging B costs (B_M + B_N)/32 * 4224 bytes per K tile per slot; at
-//     three slots and a scale panel that caps B_M + B_N at 384.
-//
-// So this file breaks both: eight waves, which cuts the accumulator to 128 per
-// wave and makes 2 waves/SIMD mandatory (hence the 256-register ceiling every
-// choice below answers to), and direct-to-register B, which removes B from LDS
-// entirely and leaves the A ring three slots deep.
-//
-// What that costs, and why the schedule looks like it does: at 256 registers a
-// wave can hold 128 accumulator + 96 of fragments, so neither A nor B is double
-// buffered. B's global latency therefore lands inside the K tile it feeds. That
-// turned out not to matter -- the second wave on the SIMD covers it, and
-// B_STAGED_WAIT below, which waits on B one n-repeat at a time so all but the
-// first hide behind MFMAs already issued, measured identical to the single
-// conservative wait at both M=8192 and M=32768.
-//
-// What does matter is that direct B has no LDS to share through, so each of B's
-// bytes crosses L1 once per M-wave. The traits pick the wave grid on that basis;
-// see the T_M note there.
+// T::WAVES follows BLOCK_SIZE; T_M and T_N define the compute-wave grid.
+// Direct-B variants stage A in LDS and load B into registers. The staged-B
+// variants share the LDS ring across both operands. Wave count, tile geometry
+// and fragment buffering are constrained by register and LDS budgets.
+// B_STAGED_WAIT can consume direct-B loads one N repeat at a time.
 #pragma once
 
 // Layout helpers (make_layout_*_mxsk), pack_e8m0x4 and the split-K reduce kernel
@@ -169,14 +126,8 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
             constexpr int ng = decltype(ng_c)::value;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
-                // Byte 0, not a broadcast into all four. op_sel_b below is 0 on
-                // this path for every (im, ik), so the upper three bytes are
-                // never selected -- and pack_e8m0x4's own comment says it is for
-                // callers that read byte 0 and nothing else. Building them cost
-                // a v_and plus a v_mul_lo_u32 per B scale, landing immediately
-                // above the MFMA that reads the result, which is the VALU-write
-                // -> MFMA-scale-read hazard: ATT on kid8408 counts 495 s_nops
-                // against flydsl's 8.
+                // Only byte 0 is selected by op_sel_b on this path.
+                // The upper bytes are unused, so broadcasting the scale is unnecessary.
                 packed_sfb[ng * T::COM_REP_K + ik] =
                     static_cast<int>(v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik]) & 0xFF;
             });
@@ -279,20 +230,9 @@ inline __device__ auto make_layout_gmem_b_direct_nrep_mxsk(int lane_id, int stri
     return u_gb;
 }
 
-// A's LDS swizzle. A load group's slot holds 8 rows of 128 bytes, a group's
-// rows alternate between slots, and slots sit 1056 bytes apart, so the rows a
-// ds_read_b128 fragment read puts in one LDS pass land on the same banks: PMC
-// puts 78% of kid8408's bank conflicts (and 65% of kid8205's) on the A read,
-// flydsl's same tile has almost none. The DMA writes lane l at l*16 and cannot
-// permute its destination, so the swizzle is on the source: position (slot s,
-// row r, 16-byte chunk c) holds global chunk c ^ f(s, r), and the reader
-// fetches chunk c from position c ^ f(s, r). Bit 2 of f flips the fragment
-// half, which no y stride expresses, so the read issues each half on its own.
-//
-// f was picked against every LDS pass model that reproduces the measurements
-// (the unswizzled layout conflicts, a swizzle on row bits 1-2 alone changes
-// nothing, flydsl's row % 16 XOR is clean): it is within 2 cycles of ideal on
-// all of them at both T_M=1 and T_M=2.
+// A LDS swizzle: slot s, row r, chunk c stores source chunk c ^ f(s,r).
+// The reader applies the same XOR. Bit 2 exchanges fragment halves, so each
+// half is read separately. DMA destinations retain their contiguous lane order.
 #ifdef __HIP_DEVICE_COMPILE__
 OPUS_D int a_lds_swz_mxsk(int s, int r) {
     return ((s & 1) ? 1 : 0) ^ ((r & 1) ? 5 : 0) ^ ((r & 2) ? 5 : 0) ^ ((r & 4) ? 4 : 0);
@@ -552,27 +492,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr int A_MB = T::a_buffer_load_insts;
     constexpr int B_MB = T::B_LDS ? T::b_lds_copy_insts : T::b_direct_load_insts;
 
-    // Shuffled scale words are prefetched one K tile pair ahead, so they are in flight
-    // across a whole tile's MFMAs and every wait between has to leave them alone.
-    // SF_PF is that many vmcnt entries -- what read_scales_shuf issues -- and it is
-    // what the thresholds below add on top of the A and B groups.
-    //
-    // Only the paired loop (COM_REP_K == 1) prefetches. At COM_REP_K == 2 a tile
-    // owns its own word, so the rotate into the consumed register would land while
-    // the load is still in flight, and the waitcnt that would fix it is the very
-    // exposure the prefetch exists to remove.
-    //
-    // And only where the wave has the registers for the second set of words,
-    // which the register-tile count alone does not decide. Measured over four
-    // shapes at K=16384/32768: 128x256 on the 2x4 grid (16 tiles, 152 VGPR with
-    // the prefetch, no spill) gains 5-12%, and the same tile on the 1x4 grid (32
-    // tiles, and the same five words to hold) goes from 250 to 254 VGPR without
-    // spilling and gains 1.5-6%. But 256x256, also 32 tiles and also five words,
-    // is already at 256 with 10 spilled before the prefetch: it loses 11-16%, and
-    // still 3% when its scale addresses are made cheap enough to bring the
-    // prefetched build down to 8 spills. Nothing in the traits separates the two
-    // 32-tile shapes -- they agree on every REP -- so the bound carries B_M:
-    // past 128 rows per workgroup the wave has no room left.
+    // Prefetch shuffled scale words one K-tile pair ahead. SF_PF accounts for
+    // these outstanding loads in every vmcnt threshold. Only COM_REP_K=1 uses
+    // the paired loop; COM_REP_K=2 consumes its word within one tile.
+    // The B_M bound reserves registers for the second set of scale words.
     constexpr bool SF_PREFETCH = !SF_SHUF_IN_LDS && SHUFFLE_SCALE && T::COM_REP_K == 1
                                  && (T::COM_REP_M * T::COM_REP_N <= 16
                                      || (T::COM_REP_M * T::COM_REP_N <= 32
@@ -634,12 +557,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // (kid8408 0.96x) and a loss at 8 (kid8406 1.10x, kid8205 1.04x).
     constexpr bool SF_A_DMA = SF_LDS_A && T::COM_REP_M <= 4;
     constexpr bool SF_A_MPACK = SF_LDS_A && !SF_A_DMA;
-    // Pad per M-packed lane row. GROUP_K=32: a row is COM_REP_M*K/32 bytes, 128
-    // dwords at K=4096, so a wave's 16 lanes all hit one bank (PMC: 4.2x the 128
-    // kid's conflicts on kid9348); the pad moves rows four banks apart. 128: a
-    // row is read one K tile's COM_REP_M*SCALES_PER_BK bytes at a time and is
-    // 128 bytes unpadded at K=4096, so those 16 rows stack on the same banks
-    // (31% of kid8205's conflicts); one read's width of pad separates them.
+    // Pad each M-packed lane row to separate its LDS banks.
+    // The padding follows the scale group and each read's byte width.
     constexpr int SF_A_PAD = !SF_A_MPACK ? 0
                            : (T::SF_PER_MFMA_K > 1 ? T::SF_PANEL_PAD : T::SF_PANEL_PAD_128);
     constexpr int SF_ROW_MAX = (SF_SCALES_MAX + 3) / 4 * 4;
@@ -706,24 +625,11 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     if constexpr (SF_LDS_A || SF_LDS_B) {
         if (loops > SFA_K_TILES_MAX) return;
     }
-    // One-shot cooperative fill of both panels, issued ahead of the A ring and
-    // B prefill. It goes by async DMA, a dword per lane straight into LDS, so
-    // there is no register round trip, no wait and no rendezvous of its own:
-    // the copies are older than A(0), tile 0's barrier wait retires them with
-    // it and tile 0's barrier publishes them. ATT on kid8408 had ~1.7k cycles of
-    // vmcnt and ~2k of barrier per wave on the register fill this replaces,
-    // which flydsl's same tile, filling by DMA, does not pay. OOB rows of a
-    // partial M tile read 0 through g_sfa's bound and are never consumed.
-    //
-    // The DMA needs every row to start on a dword; strides that do not fall
-    // back to a byte fill into the same layout.
-    // M-packed A panel fill: row r of the logical panel is subtile r/SFA_MB of
-    // the lane at row r%SFA_MB, stored as [r%SFA_MB][k][r/SFA_MB], so the
-    // COM_REP_M bytes one lane needs for a K group sit in adjacent slots. A
-    // thread takes SFA_PACK such rows at once so the panel lands in dword stores
-    // rather than one ds_write_b8 per byte; lanes still walk K within a row, so
-    // the global reads stay wide and coalesced. It runs ahead of the B panel's
-    // DMA, whose copies its register waits would otherwise also drain.
+    // Cooperatively fill both scale panels before A/B prefill. Aligned rows use
+    // dword DMA; tile 0's wait and barrier retire and publish those copies.
+    // Other row strides use byte loads into the same panel layout. OOB M rows
+    // are never consumed. The M-packed destination is [row%SFA_MB][k][row/SFA_MB];
+    // SFA_PACK groups rows for dword stores while lanes traverse K.
     auto fill_sfa_mpack = [&]() {
         const int tid = opus::thread_id_x();
         auto sm_sfa = make_smem(s_sfa_ptr);
@@ -1142,28 +1048,12 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     };
     // The consumer side: the direct-B fragment layout over the slot.
     auto u_rb_lds = make_layout_gmem_b_direct_mxsk<T>(lane_id, T::B_K, wave_id_n * T::COM_REP_N);
-    // B single-buffered is what made the next tile's B wait for this tile's
-    // last MFMA: ATT on kid8194/8205 puts 6-7% of cycles on that load's issue
-    // and another 8% on the first MFMA after it. The MMA loop is n-repeat
-    // outermost, so n-repeat j's slice of v_b is dead once its MFMAs are, and
-    // the next tile's slice j can go then, behind the remaining n-repeats. Same
-    // registers, same vmcnt order as the whole-tile issue at the end -- only
-    // earlier. Plain staged kids only: the shuffled and prefetching schedules
-    // count their own loads into the same stream.
-    // Where it measures: against the end-of-tile issue, graph replay, best of two builds on one
-    // GPU, over six shapes, the 1x4 T_M=1 kids (8203/8205 and twins) came in at
-    // 0.94-1.00 on every shape and the 128x128 2x4 ones (8348/8349) at 0.94-1.05,
-    // mostly under 1. The 256-wide 2x4 tiles (8194/8346, 8168/8175) and the 1x8
-    // grid were a wash either way, so they keep the end-of-tile issue.
-    //
-    // B_BUFS > 1 replaces that with a register ring: tile k consumes buffer
-    // k % B_BUFS and issues B(k + B_BUFS - 1) into the buffer tile k-1 freed,
-    // right after its A batch, so a B load has B_BUFS - 1 whole tiles to land
-    // rather than the barrier and A read between its issue and its use. ATT on
-    // kid8408 (64x64x256) put ~4.5k cycles per wave on the single buffer's
-    // staged wait, against none on flydsl's same tile. Every tile, and each
-    // prefill step, issues one A batch then one B batch, which is what the
-    // vmcnt thresholds below are counted against.
+    // For single-buffered B, reuse an N slice after its final MFMA to issue the
+    // next tile's slice. Restrict this schedule to plain staged-scale variants
+    // whose wait accounting includes those loads.
+    // B_BUFS > 1 uses a register ring: consume k%B_BUFS and refill the slot
+    // released by tile k-1. Every tile issues its A batch before its B batch;
+    // vmcnt thresholds preserve that ordering.
     constexpr int B_BUFS = (B_STAGED_WAIT && !SHUFFLE_SCALE) ? T::B_DIRECT_BUFS : 1;
     static_assert(B_BUFS == 1 || B_BUFS >= PF,
                   "the prefill issues B(p + B_BUFS - PF) beside A(p); a shallower "
@@ -1416,20 +1306,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             issue_b_buf(p + B_BUFS - PF, number<(p + B_BUFS - PF) % B_BUFS>{});
         });
     } else if constexpr (T::B_LDS) {
-        // Staged-B schedule, its own loop. k_tile's single fragment set leans
-        // on a second wave per SIMD for overlap, and the 1x4 grid has none: ATT
-        // on kid8454 serialises every tile into barrier, ~300 cycles of ds_read
-        // issue, ~300 of copy issue, then 512 of MFMA. Here the fragments are
-        // double buffered and tile k+1's reads, and tile k+PF's copies, issue
-        // between tile k's MFMAs:
-        //
-        //   lgkmcnt(0)        -- this wave's reads of tile k are in registers
-        //   vmcnt, barrier    -- tile k+1 has landed, every wave is done with tile
-        //                        k, so its slot takes tile k+PF
-        //   copies of k+PF, reads of k+1, MFMAs of k -- one interleaved region
-        //
-        // All PF slots are filled up front. At tile k the copies of k+2 .. k+PF-1
-        // are the ones allowed outstanding.
+        // Staged-B loop with double-buffered fragments.
+        // Wait for tile k's LDS reads, then wait/barrier for tile k+1's copies.
+        // Interleave copies of k+PF and reads of k+1 with tile k's MFMAs.
+        // All PF slots are prefilled; copies of k+2 through k+PF-1 may stay pending.
         constexpr int CP = A_MB + B_MB;
         opus::static_for<PF>([&](auto p_c) {
             issue_a_tile(decltype(p_c)::value);
@@ -1672,17 +1552,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         });
     };
     auto store_c = [&](auto& g) { store_c_from(g, v_c, u_gc2, stride_c_main); };
-    // The mirror of store_c_from: same offsets, load instead of store. One vector load per (m-repeat, n-repeat) rather than the scalar
-    // per-element loop the agent-scope tail further down uses.
-    //
-    // Cache policy 1 -- sc0 alone, not the sc0 sc1 the flatmm pipeline's copy
-    // uses. sc0 is the part that is needed: the partials were written by other
-    // CUs of this XCD and this CU's L1 may still hold a line from an earlier
-    // launch at the same address, which a plain load would return. sc1 on top
-    // would also read past the XCD's L2, which is the one cache that is
-    // guaranteed to have them -- correct only because the store beat the load
-    // to memory as well. It measured 5.48us -> 5.40us hot, 6.96 -> 6.72 cold on
-    // kid8460 b1/m1/n1024/k4096 sk4 to drop it.
+    // Load partials with the same vector layout used by store_c_from.
+    // Cache policy sc0 bypasses stale L1 data from other workgroups on this XCD
+    // while retaining access to their shared L2.
     auto load_c_into = [&](auto& g, auto& dst, auto const& u, int stride) {
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
             constexpr int im = decltype(im_c)::value;
@@ -1738,31 +1610,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         // a value does not stop the body being compiled.
         if constexpr (!std::is_void_v<D_OUT>) {
         if (xcd_fused) {
-            // All of this tile's splits ran on this XCD, so their partials meet
-            // in its L2: draining this workgroup's stores and a workgroup-scope
-            // arrival count publish them, with none of the L2 writeback /
-            // invalidate an agent-scope fence emits. The last to arrive sums
-            // every split in split order -- the same order whichever split that
-            // is -- and re-arms the counter for the next launch.
-            //
-            // This is the tail that pays, as against the agent-scope one below.
-            // kid8460 at b1/m1/n1024/k4096 sk4, kernel time: unfused 4.20us main
-            // plus a 3.84us opus_bmm_splitk_reduce launch, fused here 5.24us and
-            // no second launch. Wall 5.9us -> 5.5us.
-            //
-            // What the tail costs, by ablation on this block (hot / cold):
-            //   main loop + the workspace store, no tail   4.04 / 4.24
-            //   + this arrival (drain, atomic, barriers)   4.92 / 5.56
-            //   + the reduce below                         5.24 / 5.92
-            // So the arrival is the larger half and it is pure latency: every
-            // workgroup drains its partial store and takes an L2 round trip on
-            // the atomic, and the one that arrives last does that before it may
-            // start reading. The reference flydsl kernel runs the identical
-            // protocol instruction for instruction -- buffer_store, vmcnt(0),
-            // s_barrier, global_atomic_add sc0, ds_write, s_barrier, re-arm --
-            // so its 4.04us total is not a cheaper tail. It is a faster main
-            // loop with the same tail on top, and that, not this block, is what
-            // is left to find.
+            // All splits of this tile run on one XCD. Drain partial stores and publish
+            // arrival with the workgroup-scope counter. The last arrival sums partials
+            // in split order, writes Y and resets the counter for the next launch.
             __shared__ int xcd_last;
             const bool lead = wave_id == 0 && lane_id == 0;
             s_waitcnt_vmcnt(0_I);
@@ -1798,21 +1648,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                                       * T::COM_REP_M * T::COM_REP_N;
                 constexpr int SPLITS_PER_PASS =
                     C_ELEMS >= 64 ? 1 : (64 / C_ELEMS > 4 ? 4 : 64 / C_ELEMS);
-                // The `in ? part : 0.0f` below is not free and it is not a bug:
-                // `in` is not a constant, so the zero stays in the instruction
-                // stream and the select breaks the accumulator pairs apart --
-                // this reduce comes out as 2 v_pk_add_f32 plus 20 scalar
-                // v_add_f32 where the reference kernel's is 8 packed adds and
-                // nothing else. Peeling the full passes into an unguarded loop
-                // with a one-split remainder does produce exactly those 8
-                // packed adds, and measured *slower*: 4.68us hot against 4.60
-                // on kid8460 sk4 over two alternating A/B pairs, cold a wash.
-                // The loads are already batched and the adds hide behind them;
-                // what the peeled version adds is a second loop and 34 lines of
-                // code in a tail the last-arriving workgroup runs on the
-                // critical path. The reduce arithmetic is not where this tail's
-                // time goes -- the arrival atomic is (0.60us hot, measured by
-                // removing it), and the reference pays that one too.
+                // Inactive split lanes contribute zero to the batched partial reduction.
                 for (int sp0 = 0; sp0 < kargs.split_k; sp0 += SPLITS_PER_PASS) {
                     typename decltype(mma)::vtype_c part[SPLITS_PER_PASS];
                     opus::static_for<SPLITS_PER_PASS>([&](auto j_c) {
@@ -1850,33 +1686,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         }
     }
 
-    // Fused reduce tail: the last workgroup to finish a tile sums the split-K
-    // workspace slices into Y itself, so the split_k>1 path needs no second
-    // launch. Only compiled for the D_OUT (Y-typed) instantiations.
-    //
-    // Dead on every kid of this pipeline today, and measured before being left
-    // that way. The split-K launcher gen_instances_gfx950.py emits picks
-    // D_OUT=void for splitK>1, so this block compiles out and a separate
-    // opus_bmm_splitk_reduce_kernel launches behind the main one; wiring the
-    // launcher to the Y-typed instantiation instead (workspace sized with the
-    // arrival counters, counter_offset_bytes set, no reduce launch) does remove
-    // that second kernel and costs more than it saves. On kid8460 at
-    // b1/m1/n1024/k4096 sk4 the main kernel goes 4.20us -> 9.88us and wall
-    // 5.9 -> 11.5us, against 4.20 + a 3.84us reduce unfused.
-    //
-    // Two reasons, both in the code below. The agent-scope release fence writes
-    // back and invalidates L2 across all eight XCDs, which is exactly what the
-    // flatmm pipeline's xcd_fused tail exists to avoid (workgroup-scope atomic,
-    // partials meeting in one XCD's L2); and the sum is a scalar per-element
-    // loop over split_k where that one issues SPLITS_PER_PASS vector loads.
-    // So the fused tail worth having here is the XCD one, and it is the one
-    // above: the grid decode near the top of this kernel now reads (tile,
-    // split, batch) when ptr_xcd_counters is non-null, and that path returns
-    // before reaching this block. What is left here runs only for a kid whose
-    // traits set XCD_FUSE false -- B_M > 64, where the reducing workgroup's
-    // extra tile of partials pushes the scaled MFMA's scale operand into an
-    // AGPR and the backend rejects it -- and the launcher does not pick the
-    // Y-typed instantiation for any of those, so it is still dead.
+    // Agent-scope fused reduction for Y-typed, non-XCD-fused instantiations.
+    // The last workgroup sums the split-K partials into Y. Normal non-XCD
+    // split-K launches use D_OUT=void followed by the standalone reducer;
+    // XCD-fused launches return through the earlier reduction path.
     if constexpr (!std::is_void_v<D_OUT>) {
         if (kargs.split_k == 1) return;
 

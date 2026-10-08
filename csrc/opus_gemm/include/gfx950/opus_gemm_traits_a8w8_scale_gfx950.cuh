@@ -211,31 +211,10 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     static constexpr int sfa_buffer_load_insts = E_M * (B_K / GROUP_K);
     static constexpr int sfb_buffer_load_insts = SFB_GROUPS_PER_HALF * (B_K / GROUP_K);
 
-    // Largest K the preload-scale pipelines accept. They stage the whole A-scale
-    // panel in LDS, and that panel is (B_M/GROUP_M) rows by (K/B_K) bytes, so it
-    // grows with K while the A/B staging already holds 2*(B_M+B_N)*B_K. At
-    // B_M=B_N=256, B_K=128 the compiled kernel reports 151,680 of the 163,840
-    // bytes a CU has: 11.9 KiB spare against the 16 KiB another 8192 of K would
-    // cost. Going higher needs the panel refilled in K chunks, not a bigger
-    // buffer. Both the device guard and the launcher check against this, so an
-    // unsupported K raises instead of running a kernel that writes nothing.
-    //
-    // That arithmetic is this traits' -- the 151,680 is kid158/196, and the
-    // 2*(B_M+B_N)*B_K staging it turns on is this pipeline's double buffer. The
-    // two traits below copy the constant, and for them it is loose rather than
-    // tight: their staging is different and the panel scales with B_M, so a
-    // B_M=128 wave8 kid measures ~59,000 bytes at K=8192 and has room for
-    // ~111,000 of per-split K. Measured per kid by reading
-    // .group_segment_fixed_size out of the built code objects. Raising it there is
-    // what would let a panel kid run at split_k=1 on large-K machine-filling
-    // shapes, worth 17-25% over the shuffle_scale kid that owns that column
-    // today -- but the panel array is sized from this constant and not from the
-    // runtime K, so a raise costs LDS at every K.
-    // It is free only where the CU was not going to give the kernel a second
-    // workgroup anyway -- WG_PER_CU==1 is the declaration, not the answer, and a
-    // 256-thread workgroup that fits twice loses a fifth of its throughput at
-    // machine-filling M when the panel pushes it past half the CU's LDS. The
-    // wave8 traits below budgets against that residency for exactly this reason.
+    // Largest K accepted by the preload-scale pipeline. Its whole-split scale
+    // panels grow with K beside the fixed A/B staging allocation. Both device
+    // and launcher guards enforce this limit. Larger K requires split-K or a
+    // pipeline that refills scales in bounded segments.
     static constexpr int SF_PRELOAD_K_MAX = 8192;
 
     // B source layout: row-major [N, K] (false) vs shuffle_weight(w, (16,16))
@@ -385,29 +364,11 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(std::is_same_v<D_ACC, fp32_t>, "mxscale flatmm splitK accumulates in fp32");
     static_assert(std::is_same_v<D_SF, unsigned char>, "mxscale flatmm splitK consumes e8m0 uint8 scales");
 
-    // 4 waves per WG: 2 producer waves + 2 consumer waves.
-    //
-    // Two consumer-wave layouts, selected at compile time from B_M:
-    //   tileM (B_M >= 32): consumers split M (T_M=2, T_N=1). Default; used by
-    //     all pre-existing kids (64/128 rows). Bit-identical to the original.
-    //   tileN (B_M == 16): consumers split N (T_M=1, T_N=2). A 16-row A tile
-    //     maps to a single MFMA M-wave, so small-M / decode BMM shapes stop
-    //     over-computing a fat B_M tile (the ~10 us floor on kid320=64x32 for
-    //     M<=32 came from computing 64 rows for 8 valid ones). The two consumer
-    //     waves instead each own half of B_N.
-    //
-    // ALL_WAVE drops the split entirely: all four waves stage the tile and all
-    // four compute it, as a 2x2 (M,N) grid of waves. Two consumer waves cap the
-    // tile at ~128x128 -- that fp32 accumulator is already 128 VGPRs per wave and
-    // doubling the tile doubles it on top of the A/B double buffers -- so
-    // spreading the accumulator over four waves is what lifts the cap.
-    //
-    // The split is 2x2 rather than 4x1 because the A fragment layout ties T_M to
-    // the load group: make_layout_ra_mxsk gives the T_M dimension a stride that
-    // has the T_M waves divide one LOAD_GROUP_M of rows, so T_M*W_M must equal
-    // LOAD_GROUP_M. With W_M=16 and LOAD_GROUP_M=32 that fixes T_M at 2; T_M=4
-    // hands each wave 8 rows where the MFMA needs 16 and the upper two waves
-    // read misaligned fragments.
+    // Four-wave producer/consumer layout: two waves stage and two compute.
+    // TileM uses T_M=2,T_N=1; a 16-row tile uses T_M=1,T_N=2.
+    // ALL_WAVE assigns all four waves to staging and compute on a 2x2 grid.
+    // The A fragment layout requires T_M*W_M=LOAD_GROUP_M; with W_M=16 and
+    // LOAD_GROUP_M=32, ALL_WAVE therefore uses T_M=2.
     static constexpr bool ALL_WAVE = ALL_WAVE_;
     // B_M == 16 still selects tileN on its own -- it has no other legal grid, and
     // keeping the implication makes TILE_N_ inert for every kid built before it.
@@ -436,22 +397,15 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int GROUP_M = opus::get<0>(GROUP{});
     static constexpr int GROUP_N = opus::get<1>(GROUP{});
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
-    // A and B quantise on the same block: DSv4's 128, or MX's 32, on both axes.
+    // A uses per-row K groups; B uses N/K blocks of 32 or 128.
     static_assert(GROUP_M == 1);
     static_assert(GROUP_N == 128 || GROUP_N == 32);
     static_assert(GROUP_K == 128 || GROUP_K == 32);
     static_assert(B_K % GROUP_K == 0,
                   "flatmm K tile must contain whole scale blocks");
-    // MX blocks inside one MFMA's K extent, and the reason GROUP_K=32 costs no
-    // extra scale instruction: a 16x16x128 fragment hands each lane
-    // W_M*W_K/warp_size == 32 elements, which is exactly one MX block, and the
-    // lane supplies its own scale byte. So the SF_PER_MFMA_K blocks of one MFMA
-    // are told apart by lane_id / W_M in the scale *address*, not by
-    // scale_op_sel -- that selects one byte per MFMA for the whole wave (see
-    // pack_e8m0x4's note). Measured, not assumed: a probe feeding the four
-    // quarters 2^0..2^3 on an all-ones 16x16x128 reads back 32*(1+2+4+8), not
-    // the 128 a shared byte would give. At GROUP_K=128 this is 1, every lane
-    // term below folds away, and the 128 path stays bit-identical.
+    // GROUP_K=32 divides one MFMA's K extent into four scale groups.
+    // The lane_id/W_M term selects the group's address; scale_op_sel chooses
+    // a byte for the whole wave. At GROUP_K=128 the lane group term is zero.
     static_assert(W_K % GROUP_K == 0);
     static constexpr int SF_PER_MFMA_K = W_K / GROUP_K;
     // One MFMA fragment splits its K over warp_size / W_M lane quarters, each
@@ -531,58 +485,20 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // quarter would make them adjacent again.
     static constexpr int SF_LANE_LOAD_VEC = SF_PER_MFMA_K == 1 ? SF_LANE_SCALES_PER_BK : 1;
     static constexpr int N_SCALE_GROUPS = (B_N + GROUP_N - 1) / GROUP_N;
-    // Largest per-split K the LDS scale panels hold, mirroring the pipeline's
-    // SFA_K_MAX. The kernel returns without writing anything past it, which a
-    // caller cannot distinguish from a GEMM that produced zeros, so launchers
-    // check the same bound and raise instead. Split-K raises the reach: the
-    // panel only has to cover one split's iterations.
-    //
-    // Inherited, not derived from this traits' own budget, and loose for most of
-    // it: prefetch_k_iter below already spends max_lds_size_per_wg on staging,
-    // so the panel lives in that floor division's remainder, which varies with
-    // B_M and B_K. Measured, kid324/326 have 1.7-3.5 KiB spare (the bound is
-    // real for them) while kid336/342 have 52-109 KiB (it is 13-27x loose). See
-    // the base traits' SF_PRELOAD_K_MAX note. Defined below prefetch_k_iter,
-    // because at GROUP_K=32 it is derived from what the staging leaves.
-    // B scale groups spanned by one N-wave's columns. The consumer N-waves read
-    // blocked column ranges (nbc, and the matching SPLIT_N_STORE), so wave w owns
-    // the contiguous COM_REP_N*W_N columns at w*COM_REP_N*W_N and therefore its
-    // own slice of the tile's scale groups. Only ALL_WAVE opts into loading that
-    // slice instead of the whole tile's groups -- for every T_N==1 kid the slice
-    // is the whole thing and the base is 0, so they are unaffected.
-    // The per-wave group *stride* and *count* differ when a wave is narrower than
-    // GROUP_N: several N-waves then share one group, so the stride is 0 while the
-    // count is still 1. Using the clamped count as the stride walks waves off the
-    // end of the tile's groups.
-    // N subtiles sharing one B scale group: GROUP_N columns per group over W_N
-    // per subtile. T_N is deliberately absent. It used to be in this denominator
-    // and does not belong -- T_N partitions subtiles across consumer waves, it
-    // does not widen a subtile -- and the error was invisible while a tile held
-    // one group, because both forms then floor to 0.
+    // Per-split scale capacity is checked by the launcher. GROUP_K=32 derives
+    // its capacity after the A/B staging budget is known.
+    // Each N wave owns COM_REP_N*W_N contiguous columns. Its B-scale group
+    // stride and count differ when a wave is narrower than GROUP_N: stride is
+    // zero but count remains one. T_N partitions subtiles across waves and
+    // does not change the scale groups spanned by one subtile.
     static_assert(GROUP_N % W_N == 0, "a B scale group must be whole subtiles");
     static constexpr int SFB_REP_N = GROUP_N / W_N;
     static_assert(COM_REP_N % SFB_REP_N == 0 || SFB_REP_N % COM_REP_N == 0,
                   "an N-wave must not straddle a partial B scale group");
-    // Per-wave B scale groups, and no longer optional.
-    //
-    // It used to be SFB_PER_WAVE = ALL_WAVE, with every other kid loading the
-    // whole tile's groups and indexing them by the wave-local subtile -- which
-    // is only right while a wave's columns sit inside one group, because then
-    // every candidate index floors to 0. GROUP_N=32 breaks that premise: a tile
-    // spans several groups and the tilen families run T_N=2, so wave 1 would
-    // read wave 0's scales. That combination, and only that combination, is
-    // what failed on the plain branch (kids 9312/9313 at 0.49 and 0.36 relative
-    // error while the other 20 twins passed).
-    //
-    // Making it unconditional costs the T_N==1 kids nothing -- one wave owns the
-    // tile's whole N extent, so the slice is the whole thing and the base is 0 --
-    // and makes the T_N==2 kids both correct and cheaper, since v_sfb now holds
-    // half as many groups.
-    //
-    // STRIDE and the group count are kept apart because they differ when a wave
-    // is narrower than GROUP_N: several N-waves then share one group, so the
-    // stride is 0 while the count is still 1, and using the clamped count as the
-    // stride walks waves off the end of the tile's groups.
+    // Each N-wave loads only its own B scale groups. Scale indices within
+    // v_sfb are local to that wave; the global load applies the wave offset.
+    // Keep stride and count separate: several waves can share one scale group,
+    // giving a group stride of zero while the group count remains one.
     static constexpr bool SFB_PER_WAVE = true;
     static constexpr int SFB_GROUP_STRIDE = COM_REP_N * W_N / GROUP_N;
     static constexpr int SFB_GROUPS_PER_WAVE =
@@ -612,10 +528,7 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
-    // B_DIRECT_REG stages no B, so only the A groups are budgeted. That headroom
-    // is what lets the wider/taller direct-B tiles keep 3 prefetch slots at
-    // WG_PER_CU=2; it is deliberately not spent on more slots, since 4 measured
-    // ~25% slower than 3 (occupancy here is VGPR-bound, not LDS-bound).
+    // B_DIRECT_REG stages only A, so B contributes no LDS load groups.
     static constexpr int per_block_iter_lds_size =
         (NUM_LOAD_GROUPS_PER_BM + (B_DIRECT_REG_ ? 0 : NUM_LOAD_GROUPS_PER_BN))
         * NUM_LOAD_GROUPS_PER_BK * smem_per_group_load_size;
@@ -652,12 +565,8 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // on exactly that).
     static constexpr int SF_RING_VEC = SF_PER_MFMA_K > 1 ? 4 : 1;
     static constexpr int SF_RING_ESTRIDE = 4 / SF_RING_VEC;
-    // One wave's copy, not the producer pair's: the pair splits the slot's
-    // wave-sized chunks between them, so a small side costs one wave's
-    // instruction rather than both waves'. With a pair-wide chunk the 32x32
-    // tile issued two 512-byte copies per wave per tile to move 256 bytes of A
-    // and 8 of B (PMC on kid9398: +24% VMEM reads, +35% TCP accesses against
-    // its 128 twin); per wave it is one.
+    // Count copies per wave: the producer pair divides wave-sized chunks.
+    // A small operand therefore requires one wave's copy instruction.
     static constexpr int SF_RING_CHUNK = opus::get_warp_size() * SF_RING_VEC;
     static constexpr int SF_RING_A_CHUNKS =
         (B_M / GROUP_M * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK;
@@ -718,24 +627,9 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // there is a race, not a wrong number.
     static constexpr int sf_ring_load_insts = SF_RING_CHUNKS / 2;
 
-    // A scale ring slot is charged to every prefetch slot, so the depth is
-    // solved against their sum rather than the ring being added afterwards.
-    // Added afterwards is exactly how the whole-split panel overran a CU:
-    // this division is integer, so the A/B staging already claims the whole
-    // budget and the slack it leaves can be nothing. SF_RING_SLOT does not
-    // depend on the depth, so there is no circularity.
-    // B_DIRECT_REG stages no B, so only the A groups are budgeted (see
-    // per_block_iter_lds_size). The headroom is real -- the 64x256 tiles could
-    // hold ten slots -- and deliberately not spent, but not for the reason this
-    // used to give ("4 measured ~25% slower than 3"). Raising the cap to 4 and
-    // sweeping eleven of these kids at b2/m512/n1024/k4096 is a wash: nine move
-    // under 0.3%, kid8408 loses 0.8%, and only kid8184 gains anything (28.58 ->
-    // 28.04, -1.9%), against allwave controls that reproduce to 0.7%. The depth
-    // is simply not the lever here, so it stays where the rest of the pipeline's
-    // vmcnt arithmetic was tuned. It is also not the cover for the barrier: a
-    // wave reaches it gated on its own B direct loads, which are per-wave
-    // addresses under one in-order vmcnt, and more slots do not make those
-    // uniform across the four waves.
+    // Budget each A/B prefetch slot together with its scale-ring slot.
+    // SF_RING_SLOT is independent of depth. Direct-B variants stage only A;
+    // the chosen depth and copy count must match the pipeline's vmcnt bounds.
     static constexpr int prefetch_k_iter_budget = SF_USE_RING
         ? (max_lds_size_per_wg - SF_RING_SLOT) / (per_block_iter_lds_size + SF_RING_SLOT)
         : max_lds_size_per_wg / per_block_iter_lds_size;
@@ -745,17 +639,9 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
                   "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
     static constexpr int SF_RING_SLOTS = prefetch_k_iter + 1;
     static constexpr int SF_RING_LDS = SF_RING_SLOTS * SF_RING_SLOT;
-    // Whether a GROUP_K=32 preload kid can keep the whole-split panel after
-    // all. The panel is what the large tiles cannot hold (168-185 KiB at 8192
-    // of K), but a small one can: 32 rows and one B group is 8.4 KiB. Those
-    // are exactly the tiles whose 128 mirror wins by its panel -- kid8398 took
-    // m32-128 at K=4096 from kid9398's ring by 13-20% -- so they keep it at 32
-    // too, and only the rest go to the ring. The pipeline makes the choice.
-    //
-    // At 32 the reach is what fits beside the staging, capped at the 128
-    // kids' 8192 and floored at 4096 (the K of every DSV4 row; split-K goes
-    // past it). A tile that cannot reach 4096 takes the ring and keeps 8192,
-    // which is then only the launcher's per-split bound, as it was.
+    // Use a whole-split group32 panel only when it fits beside A/B staging.
+    // Panel capacity is capped at 8192 and must cover at least 4096 K;
+    // otherwise select the bounded ring. Split-K extends the supported total K.
     static constexpr int SF_PANEL_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
     // Bytes the pipeline pads each 32 panel row by (see SF_PANEL_PAD there);
     // budgeted whether or not a given kid ends up using it.
@@ -969,44 +855,12 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_tilen_traits_gfx
                   "tilen traits must land on the T_M=1 consumer grid");
 };
 
-// 8-wave all-compute traits for direct-to-register preshuffled B.
-//
-// Standalone rather than a flag on the traits above, because the two constants
-// that have to move -- BLOCK_SIZE and LOAD_GROUP_M -- are what every other
-// member there is derived from, and the 4-wave kids must keep their exact
-// geometry.
-//
-// Why 8 waves. The per-CU register file is the binding constraint on tile area:
-// a 256x256 fp32 accumulator is 65536 floats == 1024 registers per lane-slot,
-// i.e. half of the 4 SIMDs x 512 the CU has, however many waves it is spread
-// over. Four waves cannot hold it (256 accumulator + double-buffered fp8
-// fragments is 512 per wave, the whole per-wave file, leaving nothing for
-// addressing), so the 256x256 tile needs the accumulator spread over eight
-// waves at 128 each. Eight waves on 4 SIMDs is 2 waves/SIMD, which caps every
-// wave at 256 registers -- affordable here (128 accumulator + 96 of
-// single-buffered fragments) and the reason the fragments below are not double
-// buffered: the latency hiding comes from the second wave on the SIMD instead.
-//
-// Why T_M picks the wave grid. LOAD_GROUP_M is T_M*W_M (the T_M waves sharing an
-// N range are exactly the ones that split one A load group's rows), and the wave
-// grid it implies is what sets how many waves read the same B. Direct-B has no
-// LDS to share through, so B's bytes cross L1 once per M-wave: T_M is the read
-// amplification on the one operand that is not staged, and 4 vs 2 there is the
-// difference between 160KB and 96KB of L1 traffic per K tile against a ~2048
-// cycle MFMA budget. Measured at 256x256, M=32768: T_M=4 runs 2.06x the L1
-// accesses of the LDS-B kid on the same tile, its L1 return path 93% busy and
-// its matrix pipe only 74%; T_M=2 is 1.37x, 84% and 90%, and 16% faster. The
-// floor for direct B is 2x on whichever operand it is, since T_M=1 would need
-// the whole 256-row A fragment resident (128 registers on top of a 128-register
-// accumulator) and does not fit.
-//
-// T_M also decides how the async copies divide. A group splits across LOAD_WAVES
-// waves as slots/LOAD_WAVES, and slots == LOAD_GROUP_M/smem_sub == LOAD_GROUP_M/8
-// is 8 at T_M=4 but only 4 at T_M=2, too few for eight staging waves. The extra
-// factor comes from M instead: at T_M=2 there are twice as many A load groups, so
-// LOAD_M_SPLIT waves take alternate groups and LOAD_WAVES split the slots within
-// one. Every wave still issues the same number of copies either way, which is
-// what keeps the pipeline's vmcnt immediates wave-invariant.
+// All-compute traits for direct-to-register preshuffled B.
+// The wave grid distributes the accumulator and fragment register footprint.
+// LOAD_GROUP_M=T_M*W_M; T_M also counts the waves that independently load
+// the same B range. LOAD_M_SPLIT assigns alternate A groups, while
+// LOAD_WAVES divides slots within each group. Every wave issues the same
+// number of copies so vmcnt thresholds remain wave-invariant.
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -1173,16 +1027,9 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
-    // B_LDS: B is staged too, as a verbatim copy of its preshuffled bytes. A 16-column
-    // block of one K tile is B_K*16 contiguous bytes in the preshuffle and stays so
-    // in the slot, so the consumer reads it with the direct-B fragment layout at a
-    // B_K row stride, conflict-free (a wave's 64 lanes read 1 KiB contiguous). The
-    // copy is 1 KiB per wave instruction, the tile's chunks dealt round the waves.
-    //
-    // Why: ATT at b2/m2048 has kid410's direct-B dwordx4 issue stalling 31 cycles
-    // each against 5 for flydsl's same-shaped loads -- one wave keeps too many
-    // register-destined loads in flight for the VMEM queue -- while flydsl stages
-    // B on this tile. Staged, B also leaves vmcnt to the ring alone.
+    // B_LDS stages preshuffled B verbatim. Each 16-column block contains
+    // B_K*16 contiguous bytes, and consumers use the direct-B fragment layout
+    // with a B_K row stride. Tile chunks are distributed across staging waves.
     static constexpr bool B_LDS = B_LDS_;
     static constexpr int b_lds_slot_bytes = B_LDS ? B_N * B_K : 0;
     static constexpr int b_lds_chunks = B_N * B_K / (opus::get_warp_size() * 16);
@@ -1203,54 +1050,12 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
         prefetch_k_iter_budget > PREFETCH_CAP ? PREFETCH_CAP : prefetch_k_iter_budget;
     static_assert(prefetch_k_iter >= 3, "the pipeline requires at least 3 LDS prefetch slots");
 
-    // Largest per-split K the LDS scale panels cover. Past it the kernel returns
-    // without writing anything, which a caller cannot tell apart from a GEMM that
-    // produced zeros, so the launcher checks the same bound and raises. Split-K
-    // extends the reach: a panel only has to hold one split's iterations.
-    //
-    // Derived from this traits' own budget instead of the flat 8192 it used to
-    // copy from the base traits. That 8192 is justified by a 151,680-of-163,840
-    // measurement on kid158/196, whose staging is a 2*(B_M+B_N)*B_K double buffer
-    // -- a family this constant does not describe. Here the staging is
-    // prefetch_k_iter A slots, and the panel gets what that leaves: measured,
-    // kid205 sits at 59,012 bytes with room for ~111,000 of per-split K, so the
-    // flat bound was 13x short and kept it out of the split_k=1 column, which at
-    // K=16384 on a machine-filling shape is where the fastest kernel runs (the
-    // panel kids beat the shuffle_scale kid that owns that column today by
-    // 17-25% at every split_k they share).
-    //
-    // Rows are the worst case over the kernel's template parameters, which the
-    // traits cannot see: SHUFFLE_SCALE stages no panel at all and SFA_MPACK_GLOBAL
-    // stages only the SFB rows, so both get a bound computed for more than they
-    // use, which is safe in the direction that matters. The panel is
-    // SF_PANEL_ROWS * K / GROUP_K bytes, linear in K, hence the plain division.
-    //
-    // Capped, because the array is sized from this constant and not from the
-    // runtime K: without a cap a kid with a small panel would spend every spare
-    // byte of LDS on reach it will never be asked for. 32768 covers the largest K
-    // in the tuned table with room to spare.
-    // Reserve, because this arithmetic is not the allocator's. The panel array is
-    // alignas(16) after the staging array, and comparing this model against
-    // .group_segment_fixed_size in the built objects leaves it a few bytes short
-    // (58,960 modelled against 58,948 real on kid338). Without a reserve B_M=256
-    // lands at 163,812 of 163,840 and a byte of padding would overflow it.
-    //
-    // Budgeted against the residency the kernel already had rather than against
-    // max_lds_size_per_wg, because WG_PER_CU_ is a declared attribute and not
-    // what the CU schedules. kid203/kid205 are 256-thread workgroups at 246 VGPR,
-    // so two of them fit a CU on waves (2*246 <= 512) and LDS was the binding
-    // term: at the flat panel they sat at 59,012 bytes and got two, and spending
-    // the spare half on reach took them to 83,972, where 2*83,972 > 163,840 and
-    // only one is resident. Measured A/B over the 133-cell table, that costs
-    // 1.19x on kid203 and 1.20x on kid205 at m>=1536 -- and nothing at small M,
-    // where there are too few workgroups for the second slot to matter. The
-    // 512-thread kids are unaffected either way (kid168/kid202 1.011x, kid194 and
-    // kid175 1.000x): their footprint was already over half the CU, so the panel
-    // spends LDS no second workgroup was going to use.
-    //
-    // Preserving that residency still leaves most of the reach the derivation is
-    // for: kid205 lands at 30,464 of per-split K instead of 32,768, kid194 keeps
-    // its 30,848 because it was single-resident to begin with.
+    // Derive per-split scale-panel capacity from the remaining LDS budget.
+    // SF_PANEL_ROWS*K/GROUP_K bounds the worst-case panel allocation, including
+    // variants that stage fewer panels. Cap capacity and reserve alignment space
+    // because arrays are sized at compile time. Preserve the workgroup residency
+    // budget when assigning spare LDS to scale capacity; launcher and device
+    // guards must enforce the same bound.
     static constexpr int SF_PANEL_LDS_RESERVE = 256;
     static constexpr int SF_PANEL_ROWS = B_M / GROUP_M + N_SCALE_GROUPS;
     static constexpr int SF_PANEL_STAGING_LDS =
@@ -1378,15 +1183,9 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
         est_acc_vgpr + est_a_vgpr + 3 * est_b_vgpr <= 224 ? 3 : 1;
 };
 
-// The same 8-wave direct-B schedule on a 2x4 wave grid instead of 4x2.
-//
-// Only two waves now share an N range, so each of B's bytes crosses L1 twice per
-// K tile instead of four times -- the fix for the measured L1 return-path
-// saturation that keeps the 4x2 grid's matrix pipe at 74%. The register cost is
-// a wash: the per-wave tile turns from 64x128 into 128x64, which trades 32
-// registers of B fragment for 32 of A. What it does cost is LDS reads, since A
-// is now read by four waves rather than two, and instruction-wise a wave's eight
-// M subtiles need two op_sel dwords of A scale rather than one.
+// Direct-B schedule on a 2x4 wave grid. Two M waves share each N range.
+// The grid changes the A/B fragment and scale-word distribution while
+// retaining the same output tile.
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -1397,25 +1196,9 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8n4_traits_gfx950
     : opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950<
           BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, 2> {};
 
-// T_M=1: no wave shares an N range, so each of B's bytes crosses L1 exactly once
-// and direct-B finally matches what staging B through LDS costs there. This is
-// the far end of the T_M sweep and the fastest thing in the family.
-//
-// It only exists at B_M=128, because the price of T_M=1 lands on the other
-// operand: one wave owns all B_M rows, so at B_M=256 its A fragment is 128
-// registers -- as big as the accumulator -- and with B does not fit the 256 a
-// 2-waves/SIMD kernel gets. Halving B_M halves it to 64, which does fit, and the
-// choice of which operand is redundant then lands the way it does in the
-// reference flydsl kernel: the operand every wave shares (A) goes through LDS
-// once, and the operand each wave owns alone (B) comes straight from global.
-//
-// B_M=256 was tried the other way, streaming A from LDS instead of holding it
-// (kid195, removed) -- see the kid195 note in opus_gemm_common.py for why the
-// schedule that took is this one.
-//
-// WAVES follows BLOCK_SIZE, so this alias covers both grids that T_M=1 admits:
-// 512 threads give 1x8, 256 give the 1x4 that no ALL_WAVE family can express,
-// since ALL_WAVE derives its own 2x2 grid (see the assert on IS_TILE_N above).
+// T_M=1 assigns each N range to one wave. Its A fragments span the tile's
+// M range, so B_M is constrained by the fragment and accumulator register
+// footprint. BLOCK_SIZE determines the number of N waves.
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -1451,18 +1234,9 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_blds_traits_gfx950
                   "to B_M=128");
 };
 
-// B-preshuffle sibling with no producer waves: all four waves stage the tile
-// and all four compute it (T_M=4).
-//
-// B stays in LDS here, deliberately. Direct-to-register B and the deep A
-// prefetch cannot share one wave: vmcnt is a single in-order counter, and B's
-// register double buffer is only one K tile deep while A's LDS pipeline is
-// prefetch_k_iter deep, so waiting for B(k) would also drain the A prefetch.
-// Keeping the two roles in separate waves is exactly what let the producer count
-// only its async copies and the consumer only its B loads. Direct B is worth
-// nothing here anyway once the scale panels are preloaded (measured: kid184 vs
-// kid325 land within 2% of each other), whereas the fourfold accumulator split
-// is what buys the larger tile.
+// All-compute variant with B staged in LDS. A and B share the prefetch
+// ring, allowing one vmcnt bound to cover both operands. Direct B would
+// require a different wait schedule because its register buffering is shallower.
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -1480,10 +1254,8 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_allwave_traits_gfx950
     static_assert(base::COM_REP_N * base::W_N % base::GROUP_N == 0
                   || base::COM_REP_N * base::W_N < base::GROUP_N,
                   "an all-wave N-wave must not straddle a partial B scale group");
-    // B_N=256 was measured and rejected: no real gain, plus one accumulator
-    // register reads back as 0 through the split-K workspace (see the note next
-    // to the all-wave tiles in opus_gemm_common.py). Keep new tiles off that path
-    // until that is understood.
+    // Restrict B_N to one scale group: wider all-wave tiles have an unresolved
+    // accumulator issue when writing through split-K workspace.
     static_assert(base::B_N <= base::GROUP_N,
                   "all-wave B_N>128 is unresolved under split_k>1");
     // The shared pipeline derives one vmcnt bound per tile, and that single bound

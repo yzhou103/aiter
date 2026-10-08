@@ -1,41 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tune the gfx950 preshuffled-B MXFP8 BMM across opus and flydsl in one sweep.
+"""Tune preshuffled-weight MXFP8 BMM with OPUS and FlyDSL on gfx950.
 
-    python3 csrc/bmm_a8w8_mxscale/bmm_a8w8_mxscale_bpreshuffle_tune.py \\
-        --libtype all --groupSize 128,32 -g 2,8 -m 1,16,1024 --mp 8
+Both backends use the same operands, timing settings and correctness checks.
+OPUS candidates come from the default policy or all registered compatible
+kernels. FlyDSL candidates combine shipped configurations with the heuristic
+choice, filtered by shape compatibility and requested candidate scope.
 
-Both backends read the same operands -- a (16, 16)-preshuffled weight and
-row-major e8m0 scales -- so one shape's candidates from both run in the same
-mp_tuner pass, under the same timing mode, and the fastest names the row's
-libtype. That is the only way the two can be ranked: their own tuners time
-differently, and a row picked across two measurement modes is a coin flip at
-the few-percent gaps that separate them.
-
-Candidates:
-  * opus: every preshuffled-B kid of the row's group size the launch plan
-    accepts (the opus tuner's pool "preb").
-  * flydsl: the configs the preshuffle table already ships for this (batch,
-    w_scale block) at M within a factor of two, each at its own split and the
-    neighbouring powers of two, plus the heuristic's pick for the shape;
-    ``--flydsl_candidates all`` takes every config the table ships at any M.
-    A config is kept only where check_bmm_config accepts the shape.
-
-Output schema is the preshuffle table's:
-    gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-with kernelId -1 and kernelName the config on flydsl rows.
+The output records one backend/kernel selection per shape and scale group.
+See README.md for CSV templates and the shared GEMM tuning workflow.
 """
 
 import csv
 import os
 import sys
+from typing import ClassVar
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "opus_gemm"))
 
 import opus_bmm_mxscale_tune as opus_tune
 
-from aiter import dtypes, logger
+from aiter import dtypes
 from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     bmm_kernel_name,
@@ -43,27 +29,18 @@ from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     parse_bmm_kernel_name,
     pick_bmm_kernel_name,
 )
-from aiter.utility.mp_tuner import mp_tuner
 
 FLYDSL_KERNEL_ID = -1
 _SPLITS = (1, 2, 4, 8, 16)
 # The preshuffled kids each group's flydsl operands are generated with. Any
 # plain-scale preshuffled kid of the group gives the same tensors; these are
 # just ones every build has.
-_DATA_KID = {128: 8179, 32: 9179}
+_DATA_KID = opus_tune.BMM_DATA_KIDS
 
 
 # --- mp_tuner hooks (module level so the spawned workers import them) -------
 def gen_flydsl_bmm_data(b, m, n, k, seed, out_dtype, group, device="cuda"):
-    """(x, w, x_scale, w_scale, y, ref): the opus tuner's operands, which the
-    generator already hands out token-major and contiguous -- the layout the
-    flydsl entry requires and the one opus is now timed on too.
-
-    This used to re-lay A out here, because the generator emitted it batch-first
-    and opus reached the launcher through a transpose view. flydsl cannot run on
-    that view (its entry rejects non-contiguous XQ), so the copy was mandatory --
-    and it made the two backends' numbers, which this tuner exists to compare,
-    measurements of different physical layouts."""
+    """Generate shared token-major operands and a preshuffled weight."""
     data = opus_tune.gen_bmm_mxscale_data(
         b, m, n, k, seed, out_dtype, _DATA_KID[group], 1, device=device
     )
@@ -86,7 +63,7 @@ def _runs(b, n, k, group, cfg):
 
 
 class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict] = {
         **opus_tune.OpusBmmMxscaleTuner.ARG_DEFAULTS,
         "tune_file": "",
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
@@ -100,20 +77,18 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             help="comma list of backends to tune: opus, flydsl, or all",
         )
         self.parser.add_argument(
+            "--opus_candidates",
+            choices=("policy", "all"),
+            default="policy",
+            help="Opus policy candidates, or all registered plain-scale "
+            "preshuffled-B kids (off-policy kids use splitK=1)",
+        )
+        self.parser.add_argument(
             "--flydsl_candidates",
             choices=("near", "all"),
             default="near",
             help="flydsl configs to try per shape: the shipped table's at M "
             "within 2x (near), or every config it ships (all)",
-        )
-
-    def _shapes_from_shipped(self):
-        return sorted(
-            {
-                (int(r["b"]), int(r["m"]), int(r["n"]), int(r["k"]))
-                for r in csv.DictReader(open(opus_tune.BPRESHUFFLE_CSV))
-                if r["gfx"] == "gfx950"
-            }
         )
 
     def pre_process(self, args):
@@ -125,7 +100,9 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
         # Seed flydsl from the table before tuning rewrites it.
         self.fly_seed = {}
         if os.path.exists(opus_tune.BPRESHUFFLE_CSV):
-            for r in csv.DictReader(open(opus_tune.BPRESHUFFLE_CSV)):
+            with open(opus_tune.BPRESHUFFLE_CSV) as source:
+                seed_rows = list(csv.DictReader(source))
+            for r in seed_rows:
                 if r["gfx"] != "gfx950" or r["libtype"] != "flydsl":
                     continue
                 if parse_bmm_kernel_name(r["kernelName"]) is None:
@@ -134,6 +111,17 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
                 self.fly_seed.setdefault(key, []).append((int(r["m"]), r["kernelName"]))
         args.bpreshuffle = True
         super().pre_process(args)
+        if args.opus_candidates == "all":
+            if args.pool != "preb":
+                raise ValueError("--opus_candidates all requires --pool preb")
+            self.opus_policy = {
+                kid: opus_tune._TUNE_POLICY.get(kid, [1])
+                for family in opus_tune.a8w8_mxscale_bmm_kernel_lists
+                for kid, inst in family.items()
+                if inst.needs_preshuffled_b
+                and inst.needs_shuffle_scale is None
+                and inst.needs_mpacked_sfa is None
+            }
 
     def _flydsl_names(self, b, m, n, k, block, how):
         group = int(block.split("x")[1])
@@ -161,91 +149,54 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
         df.loc[fly, "libtype"] = "flydsl"
         return df
 
-    def tune(self, untunedf, tunedf, args):
-        gfx = self.get_gfx()
-        out_dtype = dtypes.bf16
-        base_perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
-        graph_m_max = int(getattr(args, "graph_m_max", 0) or 0)
+    def _saved_benchmark(self, row, seed):
+        if str(row["libtype"]).lower() == "opus":
+            kid = int(row["kernelId"])
+            if kid not in opus_tune._CODEGEN_BMM:
+                kid = opus_tune.bmm_mxscale_global_kid(kid)
+            inst = opus_tune._CODEGEN_BMM.get(kid)
+            if inst is None or not inst.needs_preshuffled_b:
+                raise ValueError(f"Kid {kid} does not read preshuffled B")
+            return super()._saved_benchmark(row, seed)
+        if str(row["libtype"]).lower() != "flydsl":
+            raise ValueError(f"Unsupported BMM backend {row['libtype']!r}")
+        b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+        group = int(row["w_scale_block"].split("x")[0])
+        name = str(row["kernelName"])
+        cfg = parse_bmm_kernel_name(name)
+        if cfg is None or not _runs(b, n, k, group, cfg):
+            raise ValueError(f"FlyDSL config {name!r} cannot run this shape")
+        if int(row["splitK"]) != cfg["splits"]:
+            raise ValueError("FlyDSL splitK does not match kernelName")
+        data = gen_flydsl_bmm_data(b, m, n, k, seed, dtypes.bf16, group)
+        data[4].fill_(float("nan"))
+        return run_flydsl_bmm_bench, data[:5] + (name,), data[5]
 
-        task, tasks_data = [], []
-        for seed, i in enumerate(range(len(untunedf)), start=1):
-            b, m, n, k = (int(untunedf.loc[i, c]) for c in ("b", "m", "n", "k"))
-            block = str(untunedf.loc[i, "w_scale_block"])
-            group = int(block.split("x")[1])
-            info_keys = (gfx, b, m, n, k, block)
-            # One timing mode per shape, for every candidate of both backends.
-            perf_kwargs = (
-                {**base_perf_kwargs, "testGraph": True}
-                if graph_m_max and m <= graph_m_max
-                else base_perf_kwargs
+    def _iter_tuning_tasks(self, row, seed, args):
+        if "opus" in self.libs:
+            yield from self._iter_opus_tasks(row, seed, args)
+        if "flydsl" not in self.libs:
+            return
+        b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+        block = row["w_scale_block"]
+        group = int(block.split("x")[0])
+        for name in self._flydsl_names(b, m, n, k, block, args.flydsl_candidates):
+            splits = parse_bmm_kernel_name(name)["splits"]
+            yield opus_tune.make_bmm_tuning_task(
+                (
+                    tuple(row[name] for name in self.keys),
+                    FLYDSL_KERNEL_ID,
+                    splits,
+                    name,
+                ),
+                gen_flydsl_bmm_data,
+                (b, m, n, k, seed, dtypes.bf16, group),
+                run_flydsl_bmm_bench,
+                ((0, 1, 2, 3, 4), name),
+                self._perf_kwargs(args, m),
+                ref_index=5,
+                output_index=4,
             )
-            n_cand = 0
-            if "opus" in self.libs:
-                for kid in opus_tune._CANDIDATE_KIDS:
-                    if opus_tune._kid_group(kid) != group:
-                        continue
-                    for sk in opus_tune._applicable(kid, b, m, n, k, args.pool):
-                        task.append(
-                            (
-                                (info_keys, kid, sk, ""),
-                                opus_tune.gen_bmm_mxscale_data,
-                                (b, m, n, k, seed, out_dtype, kid, sk),
-                                opus_tune.run_bmm_mxscale_bench,
-                                ([0, 1, 2, 3, 4, 5, 7, 8, 9], kid, sk),
-                                perf_kwargs,
-                                opus_tune._bmm_ref_passthrough,
-                                ([6],),
-                                {},
-                                None,
-                                1e-2,
-                                1e-2,
-                                None,
-                                None,
-                                [2],
-                            )
-                        )
-                        n_cand += 1
-            if "flydsl" in self.libs:
-                for name in self._flydsl_names(
-                    b, m, n, k, block, args.flydsl_candidates
-                ):
-                    splits = parse_bmm_kernel_name(name)["splits"]
-                    task.append(
-                        (
-                            (info_keys, FLYDSL_KERNEL_ID, splits, name),
-                            gen_flydsl_bmm_data,
-                            (b, m, n, k, seed, out_dtype, group),
-                            run_flydsl_bmm_bench,
-                            ([0, 1, 2, 3, 4], name),
-                            perf_kwargs,
-                            opus_tune._bmm_ref_passthrough,
-                            ([5],),
-                            {},
-                            None,
-                            1e-2,
-                            1e-2,
-                            None,
-                            None,
-                            [4],
-                        )
-                    )
-                    n_cand += 1
-            if args.verbose:
-                logger.info("B:%s M:%s %s: %d candidates", b, m, block, n_cand)
-            tasks_data.append((n_cand, ()))
-
-        if not task:
-            return []
-        return mp_tuner(
-            task,
-            tasks_data,
-            args.mp,
-            False,
-            args.shape_grouped,
-            args.errRatio,
-            timeout=args.timeout,
-            verbose=args.verbose,
-        )
 
 
 if __name__ == "__main__":

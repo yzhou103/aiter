@@ -133,10 +133,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
     const int tiles_per_group = GROUP_M * num_tiles_n;
 
-    // A batch swizzle here (advance batch once per panel, spreading the C drain
-    // over more memory channels) was 15% faster in isolation but 1.5% slower in
-    // DPA serving: it pays for those channels with the GROUP_M reuse above, and a
-    // real step arrives with L2 contended. See opus_bmm.md.
+    // Keep GROUP_M panels within a batch to retain operand reuse.
     const int group_id = wgid / tiles_per_group;
     const int first_m = group_id * GROUP_M;
     const int local = wgid - group_id * tiles_per_group;
@@ -725,11 +722,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a8w8_scale_k1024_l
 #endif // __HIP_DEVICE_COMPILE__
 }
 
-// EXPERIMENTAL (kid158): kid150 + both the A (per-token) and B (block) scale panels preloaded into
-// LDS, so the steady-state loop reads both SFA and SFB from LDS (ds_read) and the
-// per-K-tile SFA/SFB global buffer_loads are removed from the vmcnt gate entirely.
-// Supports any K<=8192 (K%B_K==0); LDS panels sized for the compile-time upper
-// bound, packed K-tile count resolved at runtime.
+// kid158 preloads both A and B scale panels into LDS.
+// The steady-state loop reads SFA/SFB from LDS instead of global memory.
+// Supports K <= 8192 with K % B_K == 0; panel storage uses the compile-time
+// bound and the packed K-tile count is resolved at runtime.
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
 void gemm_a8w8_scale_preload_sf_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
