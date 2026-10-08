@@ -2566,12 +2566,17 @@ _bmm_bpre_wavetm1_local.update({
 # the host M-packed A panel are 128-block layouts, and the pipeline rejects them
 # at 32. The panel keeps its mirror's LDS bytes, so at 32 it reaches a quarter
 # of the mirror's per-split K -- SF_PRELOAD_K_MAX, which the launcher checks.
-def _mx32_wave8_twins(local, ctor, *lead, skip=frozenset()):
+def _mx32_wave8_twins(local, ctor, *lead, skip=frozenset(), **ctor_kwargs):
+    # ctor_kwargs is not decoration. This builds the twin from the mirror's
+    # *tile* attributes only, so any ctor flag that is not one of those -- blds
+    # being the one that exists today -- is silently lost and the twin comes out
+    # as a different kernel wearing the twin's id. It has to be passed back in
+    # here, by the caller, the same way the mirror's own dict passes it.
     return {
         kid + MX32_KID_STRIDE: ctor(
             *[getattr(inst, a) for a in lead],
             inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
-            xcd_wgm=inst.xcd_wgm, quant_block=32,
+            xcd_wgm=inst.xcd_wgm, quant_block=32, **ctor_kwargs,
         )
         for kid, inst in local.items()
         if kid not in skip
@@ -2591,6 +2596,22 @@ _bmm_bpre_wavetm1_local.update(
     # LDS leaves the panel short the same way.
     _mx32_wave8_twins(_bmm_bpre_wavetm1_local, _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
                       "BLOCK_SIZE", skip=frozenset({407, 411, 453}))
+)
+_bmm_bpre_wavetm1_blds_local.update(
+    # This family had no GROUP_K=32 twin at all until now, which was an omission
+    # and not a decision: the shipped table is 340 rows of 32x32 against 360 of
+    # 128x128, so a 128-only family is a family that can win at most half the
+    # table. blds=True has to be repeated here -- see _mx32_wave8_twins.
+    #
+    # 457 is the B_N=256 tile. blds stages B in LDS, so doubling B_N doubles that
+    # staging, and what is left over for the scale panel no longer reaches the
+    # 4096 of per-split K a GROUP_K=32 panel needs: the traits' SF_PRELOAD_K_MAX
+    # static_assert rejects it at compile time. Same shape of failure as 407/411
+    # above, arriving through B_N here instead of through residency. The other
+    # four twins build.
+    _mx32_wave8_twins(_bmm_bpre_wavetm1_blds_local,
+                      _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
+                      "BLOCK_SIZE", skip=frozenset({457}), blds=True)
 )
 
 
