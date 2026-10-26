@@ -6,14 +6,35 @@
 #include <hip/hip_runtime.h>
 
 #include "config.h"
-#include "global_load.hpp"
-#include "params.h"
+#include "kernel.h"
 #include <bit>
 #include <opus/opus.hpp>
 
 using opus::operator""_I;
 
 namespace fused_norm_rope_attn_rope_cast_fwd {
+
+// Use 64-bit global addresses for scattered KV rows. The caller synchronizes
+// the asynchronous LDS writes before other waves consume the tile.
+__device__ void llvm_amdgcn_global_load_lds(__attribute__((address_space(1))) void* gptr,
+                                            OPUS_LDS_ADDR void* lptr,
+                                            unsigned size,
+                                            unsigned offset,
+                                            unsigned aux) __asm("llvm.amdgcn.global.load.lds");
+
+template <opus::index_t VEC, int M0_IMM, int G_IMM, class D, class S>
+__device__ inline void global_load_lds(const D* src, const S* lds_base)
+{
+    constexpr unsigned BYTES = VEC * sizeof(D);
+    static_assert((BYTES == 16 || BYTES == 12 || BYTES == 4 || BYTES == 2 || BYTES == 1) &&
+                  G_IMM >= 0 && G_IMM < 4096 && G_IMM % 4 == 0 && M0_IMM >= 0 && M0_IMM % 4 == 0);
+    llvm_amdgcn_global_load_lds(
+        (__attribute__((address_space(1))) void*)(const_cast<D*>(src)),
+        (OPUS_LDS_ADDR void*)(reinterpret_cast<__UINTPTR_TYPE__>(lds_base) + M0_IMM),
+        BYTES,
+        G_IMM,
+        0);
+}
 
 template <int Heads>
 __device__ __forceinline__ void specialize_heads(FusedNormRopeAttnRopeCastParams& a)
@@ -87,7 +108,6 @@ using v_o_t = opus::vector_t<typename T::D_ACC, O_ELEMS<T>>;
 
 constexpr int K_DEPTH       = 3;
 constexpr int V_DEPTH       = 2;
-constexpr int V_SLOTS       = V_DEPTH + 1;
 constexpr int PV_TAIL_STEPS = V_DEPTH;
 constexpr int SM_RED_OPS    = 3;
 
@@ -1101,7 +1121,16 @@ __device__ inline void softmax_op(VS& v_s,
     if constexpr(OP < RED)
     {
         const D_ACC m2 = max(v_s[2 * OP], v_s[2 * OP + 1]);
-        st.row_max     = OP == 0 ? m2 : max(st.row_max, m2);
+        if constexpr(T::BOUNDED_PREFILL && OP > 0)
+        {
+            D_ACC m;
+            asm("v_max3_f32 %0, %1, %2, %3"
+                : "=v"(m)
+                : "v"(st.row_max), "v"(v_s[2 * OP]), "v"(v_s[2 * OP + 1]));
+            st.row_max = m;
+        }
+        else
+            st.row_max = OP == 0 ? m2 : max(st.row_max, m2);
     }
     else if constexpr(OP == RED)
     {
@@ -1127,11 +1156,12 @@ __device__ inline void softmax_op(VS& v_s,
 
         if constexpr(k > 0)
         {
-            v_s[k - 1] = __builtin_amdgcn_exp2f(v_s[k - 1]);
-            if constexpr(k == 1)
-                st.sum_acc[0] = v_s[k - 1];
+            v_s[k - 1]           = __builtin_amdgcn_exp2f(v_s[k - 1]);
+            constexpr int chains = T::BOUNDED_PREFILL ? ACC_PER_TILE<T> : 1;
+            if constexpr(k <= chains)
+                st.sum_acc[(k - 1) % chains] = v_s[k - 1];
             else
-                st.sum_acc[0] += v_s[k - 1];
+                st.sum_acc[(k - 1) % chains] += v_s[k - 1];
         }
         if constexpr(k < S_ELEMS<T>)
         {
@@ -1151,7 +1181,11 @@ __device__ inline void softmax_op(VS& v_s,
     {
         auto sum = [](D_ACC x, D_ACC y) { return x + y; };
         if constexpr(OP == SM_SUM_OP<T>)
+        {
+            if constexpr(T::BOUNDED_PREFILL)
+                st.sum_acc[0] = (st.sum_acc[0] + st.sum_acc[1]) + (st.sum_acc[2] + st.sum_acc[3]);
             st.sum_acc[0] = lane_swap_reduce<32>(st.sum_acc[0], sum);
+        }
         else
             st.sum_acc[0] = lane_swap_reduce<16>(st.sum_acc[0], sum);
     }
@@ -1322,10 +1356,23 @@ __device__ __forceinline__ int prepare_q_direct(
             }
             vector_t<float, 16> f;
             float am = 1e-30f;
-            static_for<16>([&](auto i) {
-                f[i.value] = bf32(x[i.value]);
-                am         = fmaxf(am, fabsf(f[i.value]));
-            });
+            if constexpr(T::PACKED_PREFILL)
+            {
+                // Four independent maxima shorten Q quantization's dependency chain.
+                float maxima[4] = {1e-30f, 1e-30f, 1e-30f, 1e-30f};
+                static_for<16>([&](auto i) {
+                    f[i.value]          = bf32(x[i.value]);
+                    maxima[i.value % 4] = fmaxf(maxima[i.value % 4], fabsf(f[i.value]));
+                });
+                am = fmaxf(fmaxf(maxima[0], maxima[1]), fmaxf(maxima[2], maxima[3]));
+            }
+            else
+            {
+                static_for<16>([&](auto i) {
+                    f[i.value] = bf32(x[i.value]);
+                    am         = fmaxf(am, fabsf(f[i.value]));
+                });
+            }
             const unsigned other =
                 __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, std::bit_cast<unsigned>(am));
             am                  = fmaxf(am, std::bit_cast<float>(other));
@@ -1345,6 +1392,21 @@ __device__ __forceinline__ int prepare_q_direct(
     // The lane-group exchange above matches the four contiguous scale
     // bytes selected by MFMA's per-step scale selector.
     return static_cast<int>(step_codes);
+}
+
+template <class V>
+__device__ __forceinline__ V pack_output_lanes(V value)
+{
+    using namespace opus;
+    auto* words        = reinterpret_cast<u32_t*>(&value);
+    constexpr int half = sizeof(V) / (2 * sizeof(u32_t));
+    static_for<half>([&](auto i) {
+        auto pair =
+            __builtin_amdgcn_permlane16_swap(words[i.value], words[i.value + half], false, true);
+        words[i.value]        = pair[0];
+        words[i.value + half] = pair[1];
+    });
+    return value;
 }
 
 template <class T, class VO, bool OneGroup = false>
@@ -1372,36 +1434,45 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
         vector_t<float, 4> rope_cos, rope_sin;
         if(warp == 3 && c.value >= 2)
         {
-            const int ri = (d - 448) / 2;
-            if(((reinterpret_cast<uintptr_t>(cs) | reinterpret_cast<uintptr_t>(sn)) & 7) == 0)
+            if constexpr(T::BOUNDED_PREFILL)
             {
-                rope_cos = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(cs + ri));
-                rope_sin = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(sn + ri));
+                // Before lane exchange, the two four-element fragments are 16 columns apart.
+                const int ri = (warp * 128 + c.value * 32 + (lane / 16) * 4 - 448) / 2;
+                static_for<4>([&](auto i) {
+                    const int idx     = ri + (i.value / 2) * 8 + i.value % 2;
+                    rope_cos[i.value] = bf32(cs[idx]);
+                    rope_sin[i.value] = bf32(sn[idx]);
+                });
             }
             else
             {
-                static_for<4>([&](auto i) {
-                    rope_cos[i.value] = bf32(cs[ri + i.value]);
-                    rope_sin[i.value] = bf32(sn[ri + i.value]);
-                });
+                const int ri = (d - 448) / 2;
+                if(((reinterpret_cast<uintptr_t>(cs) | reinterpret_cast<uintptr_t>(sn)) & 7) == 0)
+                {
+                    rope_cos = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(cs + ri));
+                    rope_sin = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(sn + ri));
+                }
+                else
+                {
+                    static_for<4>([&](auto i) {
+                        rope_cos[i.value] = bf32(cs[ri + i.value]);
+                        rope_sin[i.value] = bf32(sn[ri + i.value]);
+                    });
+                }
             }
         }
         static_for<OneGroup ? 1 : PV_GROUPS<T>>([&](auto r) {
-            const int head_off   = OneGroup ? 0 : (warp + r.value) % PV_GROUPS<T> * 16 * 512;
-            constexpr int base   = (r.value * NC + c.value) * VEC;
-            auto buf             = cast<bf16_t>(slice(v_o, number<base>{}, number<base + VEC>{}));
-            auto* p              = reinterpret_cast<u32_t*>(&buf);
-            auto r0              = __builtin_amdgcn_permlane16_swap(p[0], p[2], false, true);
-            auto r1              = __builtin_amdgcn_permlane16_swap(p[1], p[3], false, true);
-            p[0]                 = r0[0];
-            p[2]                 = r0[1];
-            p[1]                 = r1[0];
-            p[3]                 = r1[1];
+            const int head_off = OneGroup ? 0 : (warp + r.value) % PV_GROUPS<T> * 16 * 512;
+            constexpr int base = (r.value * NC + c.value) * VEC;
+            auto buf           = cast<bf16_t>(slice(v_o, number<base>{}, number<base + VEC>{}));
+            if constexpr(!T::BOUNDED_PREFILL)
+                buf = pack_output_lanes(buf);
             const int off        = offsets[c.value] + head_off;
             const int64_t global = (int64_t(token) * a.H + h_start) * 512 + off;
             if(a.out_ptr)
                 *reinterpret_cast<vector_t<bf16_t, 8>*>(reinterpret_cast<bf16_t*>(a.out_ptr) +
-                                                        global) = buf;
+                                                        global) =
+                    T::BOUNDED_PREFILL ? pack_output_lanes(buf) : buf;
             vector_t<float, 8> x;
             static_for<8>([&](auto i) { x[i.value] = bf32(buf[i.value]); });
             if(warp == 3 && c.value >= 2)
@@ -1424,10 +1495,13 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
             const int e         = int((bits - 1) >> 23) + 1 - 127;
             const float mul     = std::bit_cast<float>(uint32_t(127 - e) << 23);
             auto q              = cast<opus::fp8_t>(x * mul);
+            if constexpr(T::BOUNDED_PREFILL)
+                q = pack_output_lanes(q);
             *reinterpret_cast<uint64_t*>(a.output_q_ptr + global) = __builtin_bit_cast(uint64_t, q);
             scale_words[r.value] |= uint32_t(uint8_t(e + 127)) << (c.value * 8);
             if(a.debug_ptr)
-                *reinterpret_cast<vector_t<float, 8>*>(a.debug_ptr + global) = x;
+                *reinterpret_cast<vector_t<float, 8>*>(a.debug_ptr + global) =
+                    T::BOUNDED_PREFILL ? pack_output_lanes(x) : x;
         });
     });
     // Each warp owns four adjacent scale bytes per head. Pack them before
@@ -1504,7 +1578,7 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
                                                   const QI& issue_q,
                                                   const QR& read_q,
                                                   const v_q_t<T>& v_q,
-                                                  int scale_q,
+                                                  const int& scale_q,
                                                   v_o_t<T>& v_o,
                                                   typename T::D_ACC& m_row,
                                                   typename T::D_ACC& l_row,
@@ -1676,6 +1750,16 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
                                                           : kargs.stride_kv_scale_page));
                 if constexpr(CHECKED)
                     live = id >= 0 && id < (Extend ? kargs.total_tokens : kargs.total_pages);
+            }
+            if constexpr(T::BOUNDED_PREFILL && T::CACHE_MODE == 0)
+            {
+                data_off = uint32_t(id) * uint32_t(merge_sources ? current_stride
+                                                                 : (Extend ? kargs.stride_kv_extend
+                                                                           : kargs.stride_kv_page));
+                scale_off =
+                    uint32_t(id) * uint32_t(merge_sources ? current_scale_stride
+                                                          : (Extend ? kargs.stride_kv_scale_extend
+                                                                    : kargs.stride_kv_scale_page));
             }
             const auto* dp =
                 live ? data_base + data_off : reinterpret_cast<const D_ATTN*>(safe_kv.data);
@@ -1851,7 +1935,6 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
 #pragma clang loop unroll(disable)
     for(; tile_idx + 1 < num_kv_tiles; tile_idx += 2)
     {
-
         run_stage(1_I, tile_idx, true_type{});
         run_stage(0_I, tile_idx + 1, true_type{});
     }
@@ -1897,16 +1980,10 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
         make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_scale_ptr) + q_scale_gmem_offset,
                   (kargs.H - h_block_start) * kargs.stride_q_scale_h * sizeof(D_ATTN));
     v_q_t<T> v_q;
-    const int scale_q = [&] {
+    int scale_q = [&] {
         if constexpr(T::DIRECT_Q)
         {
-            return prepare_q_direct<T>(
-                kargs,
-                v_q,
-                (PV_GROUPS<T> == T::NUM_WARPS ? warp_id : warp_id % PV_GROUPS<T>),
-                lane_id,
-                q_token_idx,
-                h_block_start);
+            return 0;
         }
         else if constexpr(T::RAW_Q)
         {
@@ -1926,8 +2003,22 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
 
     // Q is loaded by the first non-empty segment, behind its first page-index load: vmcnt
     // retires in order, so an earlier Q would stall that wait.
-    bool q_pending = !T::DIRECT_Q;
+    bool q_pending = true;
     auto issue_q   = [&] {
+        if constexpr(T::DIRECT_Q)
+        {
+            if(!q_pending)
+                return;
+            scale_q = prepare_q_direct<T>(
+                kargs,
+                v_q,
+                (PV_GROUPS<T> == T::NUM_WARPS ? warp_id : warp_id % PV_GROUPS<T>),
+                lane_id,
+                q_token_idx,
+                h_block_start);
+            q_pending = false;
+            return;
+        }
         if constexpr(T::RAW_Q)
             return;
         if(!q_pending)
@@ -1939,6 +2030,8 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     };
     // Q must leave its slot before the first QK DMA refills it.
     auto read_q = [&] {
+        if constexpr(T::DIRECT_Q)
+            return;
         if(!q_pending)
             return;
         v_q = load_q<T>(smem,

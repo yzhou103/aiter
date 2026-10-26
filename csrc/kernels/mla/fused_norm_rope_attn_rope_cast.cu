@@ -3,11 +3,12 @@
 #include "fused_norm_rope_attn_rope_cast/cache_pipeline.hpp"
 #include "fused_norm_rope_attn_rope_cast/decode_fp8_qk.hpp"
 #include "fused_norm_rope_attn_rope_cast/decode_prefetch.hpp"
-#include <cmath>
-#include <hip/hip_runtime.h>
-using B = opus::dtypes::bf16;
+#include "fused_norm_rope_attn_rope_cast/dispatch_policy.hpp"
 #include "fused_norm_rope_attn_rope_cast/kernel_args.hpp"
 #include "fused_norm_rope_attn_rope_cast/q_norm.hpp"
+#include <cmath>
+#include <hip/hip_runtime.h>
+
 using B8 = opus::vector_t<B, 8>;
 using F4 = opus::vector_t<float, 4>;
 
@@ -609,27 +610,37 @@ template <bool RotateQ,
           bool PreparedQ   = false,
           bool H64Schedule = false,
           bool QNorm       = false,
-          bool TwoSources  = false>
-__global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_decode_64(
+          bool TwoSources  = false,
+          int HeadTile     = 64>
+__global__ __launch_bounds__(HeadTile * 4, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_decode_64(
     FusedNormRopeAttnRopeCastArgs a)
 {
 #if defined(__gfx950__)
     using T = opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 4>;
     using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
     const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, group = lane / 16;
-    const int hl = wave * 16 + lane % 16, h = blockIdx.y * 64 + hl, t = blockIdx.x;
+    const int hl = wave * 16 + lane % 16, h = blockIdx.y * HeadTile + hl, t = blockIdx.x;
     const int hload = min(h, a.heads - 1);
     static_assert(!QNorm || (RotateQ && !PreparedQ));
     float q_inv = 1.0f;
     if constexpr(QNorm)
         q_inv = fused_q_norm::inv_rms<4, 16>(
             a.q + (int64_t(t) * a.heads + hload) * 512, group, true, a.norm_eps);
-    __shared__ __align__(16) B kv_tile[T::smem_kv_tile_elems];
+    static_assert(HeadTile == 64 || HeadTile == 128);
+    // Paired waves share V across head groups for raw and prepared Q.
+    constexpr int PVReuse       = HeadTile == 128 ? 2 : 1;
+    constexpr int RawPitch      = PVReuse > 1 ? 544 : 528;
+    constexpr int PVSlices      = 16 / PVReuse;
+    constexpr int STAGING_ELEMS = HeadTile * 528 / sizeof(B);
+    constexpr int LDS_ELEMS =
+        T::smem_kv_tile_elems > STAGING_ELEMS ? T::smem_kv_tile_elems : STAGING_ELEMS;
+    static_assert(PVReuse == 1 || LDS_ELEMS >= T::smem_kv_tile_elems + 8 * 64 * 8 + 128 * 2);
+    __shared__ __align__(16) B kv_tile[LDS_ELEMS];
     const int64_t pos = a.positions64 ? static_cast<const int64_t*>(a.positions)[t]
                                       : static_cast<const int*>(a.positions)[t];
     const B* cs       = a.cos + pos * 32;
     const B* sn       = a.sin + pos * 32;
-    __shared__ __align__(32) uint8_t raw_k[2 * (32 * 528 + 128)];
+    __shared__ __align__(32) uint8_t raw_k[2 * (32 * RawPitch + 128)];
     opus::vector_t<opus::fp8_t, 32> q[4];
     int q_scales[4];
     opus::vector_t<float, 8> o[16];
@@ -699,7 +710,7 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
     });
     constexpr float log2e = 1.4426950408889634f;
     float m = -__FLT_MAX__, actual_max = -INFINITY, l = 0;
-    if constexpr(PageSize == -3 && TwoSources)
+    if constexpr(PageSize == -3 && TwoSources && PVReuse == 1)
     {
         const int begin  = max(0, min(a.prefix_capacity, a.prefix_indptr[t]));
         const int end    = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
@@ -724,18 +735,19 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
                                       a.extend_rows,
                                       a.extend_cache}};
             Fp8QkTwoSource64 src{{}, prefix, extend, prefix_tiles};
-            fp8_qk_decode_accum64<T, H64Schedule>(src,
-                                                  end - begin + extend_end - extend_begin,
-                                                  tiles,
-                                                  reinterpret_cast<char*>(kv_tile),
-                                                  q,
-                                                  q_scales,
-                                                  raw_k,
-                                                  o,
-                                                  actual_max,
-                                                  m,
-                                                  l,
-                                                  a.softmax_scale * log2e);
+            fp8_qk_decode_accum64<T, H64Schedule, HeadTile / 64, PVReuse>(
+                src,
+                end - begin + extend_end - extend_begin,
+                tiles,
+                reinterpret_cast<char*>(kv_tile),
+                q,
+                q_scales,
+                raw_k,
+                o,
+                actual_max,
+                m,
+                l,
+                a.softmax_scale * log2e);
         }
     }
     else
@@ -744,25 +756,28 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
         int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
         if(end > begin)
         {
-            Fp8QkSource64<PageSize> src{{a.pool,
-                                         a.prefix_at<PageSize>(begin),
-                                         end - begin,
-                                         (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
-                                         a.cache}};
-            fp8_qk_decode_accum64<T, H64Schedule>(src,
-                                                  end - begin,
-                                                  (end - begin + 31) / 32,
-                                                  reinterpret_cast<char*>(kv_tile),
-                                                  q,
-                                                  q_scales,
-                                                  raw_k,
-                                                  o,
-                                                  actual_max,
-                                                  m,
-                                                  l,
-                                                  a.softmax_scale * log2e);
+            Fp8QkSource64<PageSize, RawPitch> src{
+                {a.pool,
+                 a.prefix_at<PageSize>(begin),
+                 end - begin,
+                 (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+                 a.cache}};
+            fp8_qk_decode_accum64<T, H64Schedule, HeadTile / 64, PVReuse>(
+                src,
+                end - begin,
+                (end - begin + 31) / 32,
+                reinterpret_cast<char*>(kv_tile),
+                q,
+                q_scales,
+                raw_k,
+                o,
+                actual_max,
+                m,
+                l,
+                a.softmax_scale * log2e);
         }
-        // Both sources contribute to one online softmax; normalize only after the second.
+        // Both sources contribute to one online softmax; normalize only after the
+        // second.
         if constexpr(PageSize == -3)
         {
             if(a.extend_indptr)
@@ -771,88 +786,164 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
                 end   = max(begin, min(a.extend_capacity, a.extend_indptr[t + 1]));
                 if(end > begin)
                 {
-                    Fp8QkSource64<-3> src{{reinterpret_cast<const uint8_t*>(a.extend_kv),
-                                           a.extend + begin,
-                                           end - begin,
-                                           a.extend_rows,
-                                           a.extend_cache}};
-                    fp8_qk_decode_accum64<T, H64Schedule>(src,
-                                                          end - begin,
-                                                          (end - begin + 31) / 32,
-                                                          reinterpret_cast<char*>(kv_tile),
-                                                          q,
-                                                          q_scales,
-                                                          raw_k,
-                                                          o,
-                                                          actual_max,
-                                                          m,
-                                                          l,
-                                                          a.softmax_scale * log2e);
+                    Fp8QkSource64<-3, RawPitch> src{{reinterpret_cast<const uint8_t*>(a.extend_kv),
+                                                     a.extend + begin,
+                                                     end - begin,
+                                                     a.extend_rows,
+                                                     a.extend_cache}};
+                    fp8_qk_decode_accum64<T, H64Schedule, HeadTile / 64, PVReuse>(
+                        src,
+                        end - begin,
+                        (end - begin + 31) / 32,
+                        reinterpret_cast<char*>(kv_tile),
+                        q,
+                        q_scales,
+                        raw_k,
+                        o,
+                        actual_max,
+                        m,
+                        l,
+                        a.softmax_scale * log2e);
                 }
             }
         }
     }
-    __syncthreads();
-    auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
-    if(h < a.heads)
+    if constexpr(PVReuse == 1)
     {
+        __syncthreads();
+        auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
+        if(h < a.heads)
+        {
+            const float sink    = a.sink ? a.sink[h] * log2e : -INFINITY;
+            const float final_m = fmaxf(m, sink);
+            const float rescale = __builtin_amdgcn_exp2f(m - final_m);
+            const float denom   = l * rescale + __builtin_amdgcn_exp2f(sink - final_m);
+            const float inv     = denom > 0 ? rescale / denom : 0;
+            if(group == 0)
+            {
+                if(a.lse)
+                    a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+                if(a.max_logits)
+                    a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            }
+            opus::static_for<16>([&](auto chunk) {
+                F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),
+                           opus::slice(o[int(chunk)], opus::number<4>{}, opus::number<8>{})};
+                // ATOM's attention returns BF16 before inverse_rope_group_quant.
+                opus::static_for<2>([&](auto n) {
+                    opus::static_for<4>([&](auto i) {
+                        x[int(n)][int(i)] = f32(static_cast<B>(x[int(n)][int(i)] * inv));
+                    });
+                    if constexpr(int(chunk) >= 14)
+                    {
+                        opus::static_for<2>([&](auto pair) {
+                            int i   = int(pair) * 2,
+                                ri  = (int(chunk) * 32 + int(n) * 16 + group * 4 + i - 448) / 2;
+                            float c = f32(cs[ri]), s = f32(sn[ri]), x0 = x[int(n)][i],
+                                  x1         = x[int(n)][i + 1];
+                            x[int(n)][i]     = x0 * c + x1 * s;
+                            x[int(n)][i + 1] = x1 * c - x0 * s;
+                        });
+                    }
+                });
+                float amax = 0;
+                opus::static_for<2>([&](auto n) {
+                    opus::static_for<4>(
+                        [&](auto i) { amax = fmaxf(amax, fabsf(x[int(n)][int(i)])); });
+                });
+                amax          = fmaxf(packed_row_max(amax), 1e-8f);
+                unsigned bits = __float_as_uint(amax / 448.0f);
+                int exponent  = int((bits - 1) >> 23) + 1 - 127;
+                float mul     = __uint_as_float(uint32_t(127 - exponent) << 23);
+                if(group == 0)
+                    a.scales[(int64_t(t) * a.heads + h) * 16 + int(chunk)] = exponent + 127;
+                opus::static_for<2>([&](auto n) {
+                    int d      = int(chunk) * 32 + int(n) * 16 + group * 4;
+                    auto quant = opus::cast<opus::fp8_t>(x[int(n)] * mul);
+                    *reinterpret_cast<uint32_t*>(staging + hl * 528 + d) =
+                        __builtin_bit_cast(uint32_t, quant);
+                    if(a.debug_out)
+                        *reinterpret_cast<F4*>(a.debug_out + (int64_t(t) * a.heads + h) * 512 + d) =
+                            x[int(n)];
+                });
+            });
+        }
+    }
+    else
+    {
+        // Raw K is dead after the final PV barrier. Use it for normalization
+        // factors while kv_tile becomes the packed-output staging buffer.
+        auto* inv_lds       = reinterpret_cast<float*>(raw_k);
         const float sink    = a.sink ? a.sink[h] * log2e : -INFINITY;
         const float final_m = fmaxf(m, sink);
         const float rescale = __builtin_amdgcn_exp2f(m - final_m);
         const float denom   = l * rescale + __builtin_amdgcn_exp2f(sink - final_m);
-        const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0)
         {
+            inv_lds[hl] = denom > 0 ? rescale / denom : 0;
             if(a.lse)
                 a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
             if(a.max_logits)
                 a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
-        opus::static_for<16>([&](auto chunk) {
-            F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),
-                       opus::slice(o[int(chunk)], opus::number<4>{}, opus::number<8>{})};
-            // ATOM's attention returns BF16 before inverse_rope_group_quant.
-            opus::static_for<2>([&](auto n) {
-                opus::static_for<4>([&](auto i) {
-                    x[int(n)][int(i)] = f32(static_cast<B>(x[int(n)][int(i)] * inv));
-                });
-                if constexpr(int(chunk) >= 14)
-                {
-                    opus::static_for<2>([&](auto pair) {
-                        int i   = int(pair) * 2,
-                            ri  = (int(chunk) * 32 + int(n) * 16 + group * 4 + i - 448) / 2;
-                        float c = f32(cs[ri]), s = f32(sn[ri]), x0 = x[int(n)][i],
-                              x1         = x[int(n)][i + 1];
-                        x[int(n)][i]     = x0 * c + x1 * s;
-                        x[int(n)][i + 1] = x1 * c - x0 * s;
+        __syncthreads();
+        auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
+        opus::static_for<PVReuse>([&](auto hg) {
+            const int hl    = ((wave / PVReuse) * PVReuse + int(hg)) * 16 + lane % 16;
+            const int h     = blockIdx.y * HeadTile + hl;
+            const float inv = inv_lds[hl];
+            opus::static_for<PVSlices>([&](auto ds) {
+                constexpr int index = int(hg) * PVSlices + int(ds);
+                const int chunk     = (wave % PVReuse) * PVSlices + int(ds);
+                F4 x[2]             = {opus::slice(o[index], opus::number<0>{}, opus::number<4>{}),
+                                       opus::slice(o[index], opus::number<4>{}, opus::number<8>{})};
+                // ATOM's attention returns BF16 before inverse_rope_group_quant.
+                opus::static_for<2>([&](auto n) {
+                    opus::static_for<4>([&](auto i) {
+                        x[int(n)][int(i)] = f32(static_cast<B>(x[int(n)][int(i)] * inv));
                     });
-                }
-            });
-            float amax = 0;
-            opus::static_for<2>([&](auto n) {
-                opus::static_for<4>([&](auto i) { amax = fmaxf(amax, fabsf(x[int(n)][int(i)])); });
-            });
-            amax          = fmaxf(packed_row_max(amax), 1e-8f);
-            unsigned bits = __float_as_uint(amax / 448.0f);
-            int exponent  = int((bits - 1) >> 23) + 1 - 127;
-            float mul     = __uint_as_float(uint32_t(127 - exponent) << 23);
-            if(group == 0)
-                a.scales[(int64_t(t) * a.heads + h) * 16 + int(chunk)] = exponent + 127;
-            opus::static_for<2>([&](auto n) {
-                int d      = int(chunk) * 32 + int(n) * 16 + group * 4;
-                auto quant = opus::cast<opus::fp8_t>(x[int(n)] * mul);
-                *reinterpret_cast<uint32_t*>(staging + hl * 528 + d) =
-                    __builtin_bit_cast(uint32_t, quant);
-                if(a.debug_out)
-                    *reinterpret_cast<F4*>(a.debug_out + (int64_t(t) * a.heads + h) * 512 + d) =
-                        x[int(n)];
+                    if(chunk >= 14)
+                    {
+                        opus::static_for<2>([&](auto pair) {
+                            int i   = int(pair) * 2,
+                                ri  = (int(chunk) * 32 + int(n) * 16 + group * 4 + i - 448) / 2;
+                            float c = f32(cs[ri]), s = f32(sn[ri]), x0 = x[int(n)][i],
+                                  x1         = x[int(n)][i + 1];
+                            x[int(n)][i]     = x0 * c + x1 * s;
+                            x[int(n)][i + 1] = x1 * c - x0 * s;
+                        });
+                    }
+                });
+                float amax = 0;
+                opus::static_for<2>([&](auto n) {
+                    opus::static_for<4>(
+                        [&](auto i) { amax = fmaxf(amax, fabsf(x[int(n)][int(i)])); });
+                });
+                amax          = fmaxf(packed_row_max(amax), 1e-8f);
+                unsigned bits = __float_as_uint(amax / 448.0f);
+                int exponent  = int((bits - 1) >> 23) + 1 - 127;
+                float mul     = __uint_as_float(uint32_t(127 - exponent) << 23);
+                if(group == 0)
+                    a.scales[(int64_t(t) * a.heads + h) * 16 + int(chunk)] = exponent + 127;
+                opus::static_for<2>([&](auto n) {
+                    int d      = int(chunk) * 32 + int(n) * 16 + group * 4;
+                    auto quant = opus::cast<opus::fp8_t>(x[int(n)] * mul);
+                    *reinterpret_cast<uint32_t*>(staging + hl * 528 + d) =
+                        __builtin_bit_cast(uint32_t, quant);
+                    if(a.debug_out)
+                        *reinterpret_cast<F4*>(a.debug_out + (int64_t(t) * a.heads + h) * 512 + d) =
+                            x[int(n)];
+                });
             });
         });
     }
+    auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
     __syncthreads();
     using U4 = opus::vector_t<uint32_t, 4>;
-    for(int i = tid; i < min(64, a.heads - int(blockIdx.y) * 64) * 32; i += 256)
-        *reinterpret_cast<U4*>(a.out + (int64_t(t) * a.heads + blockIdx.y * 64) * 512 + i * 16) =
+    for(int i = tid; i < min(HeadTile, a.heads - int(blockIdx.y) * HeadTile) * 32;
+        i += HeadTile * 4)
+        *reinterpret_cast<U4*>(a.out + (int64_t(t) * a.heads + blockIdx.y * HeadTile) * 512 +
+                               i * 16) =
             *reinterpret_cast<const U4*>(staging + (i / 32) * 528 + (i % 32) * 16);
 #endif
 }
@@ -1004,12 +1095,41 @@ template <int PageSize, bool TwoSources = false>
 hipError_t
 launch_cache_mode(const FusedNormRopeAttnRopeCastArgs* a, int rotate_q, hipStream_t stream)
 {
+    namespace policy = fused_norm_rope_attn_rope_cast_policy;
     if(!a->tokens)
         return hipSuccess;
     if constexpr(PageSize != -2)
     {
         if(a->fp8_qk)
         {
+            if constexpr(PageSize == -3)
+            {
+                const int64_t capacity = int64_t(a->prefix_capacity) + a->extend_capacity;
+                if(a->heads == 128 && !a->q_norm && (a->q_scale || rotate_q) &&
+                   policy::prefer_h128_shared_kv(a->tokens, capacity, a->q_scale != nullptr))
+                {
+                    const dim3 head_grid(a->tokens);
+                    if(a->q_scale)
+                        fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false,
+                                                                        -3,
+                                                                        true,
+                                                                        false,
+                                                                        false,
+                                                                        TwoSources,
+                                                                        128>
+                            <<<head_grid, 512, 0, stream>>>(*a);
+                    else
+                        fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
+                                                                        -3,
+                                                                        false,
+                                                                        false,
+                                                                        false,
+                                                                        TwoSources,
+                                                                        128>
+                            <<<head_grid, 512, 0, stream>>>(*a);
+                    return hipGetLastError();
+                }
+            }
             dim3 grid(a->tokens, a->heads / 64);
             // H64 benefits from overlapping V dequantization with the next raw
             // tile fetch. H128 retains the earlier commit to avoid its regression.
@@ -1143,9 +1263,7 @@ launch_cache_mode(const FusedNormRopeAttnRopeCastArgs* a, int rotate_q, hipStrea
     else
     {
         dim3 grid(a->tokens);
-        // H128 early loading wins at T<=1024; the late loader wins at
-        // T2048 and T4096. Keep the unmeasured interval on the original path.
-        if(a->tokens >= 2048)
+        if(policy::prefer_h128_late_bf16_load(a->tokens))
         {
             if(rotate_q)
                 fused_norm_rope_attn_rope_cast_kernel_128<true, true, PageSize>
@@ -1174,7 +1292,8 @@ hipError_t launch_fused_norm_rope_attn_rope_cast(const FusedNormRopeAttnRopeCast
     switch(a->cache.page_size)
     {
     case -3:
-        // Capacities are host metadata; single-source requests keep their original kernel.
+        // Capacities are host metadata; single-source requests keep their original
+        // kernel.
         if(a->prefix_capacity > 0 && a->extend_capacity > 0)
             return launch_cache_mode<-3, true>(a, rotate_q, stream);
         return launch_cache_mode<-3>(a, rotate_q, stream);

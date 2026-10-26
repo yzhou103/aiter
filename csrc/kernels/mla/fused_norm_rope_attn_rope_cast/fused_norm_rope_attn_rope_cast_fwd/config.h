@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <cstdint>
@@ -97,19 +99,23 @@ struct FusedNormRopeAttnRopeCastTraits
 
 template <int CacheMode,
           bool RawQ,
-          bool DirectQ    = false,
-          int FixedSplits = 0,
-          int Heads       = 0,
-          int HeadTile    = 64>
+          bool DirectQ        = false,
+          int FixedSplits     = 0,
+          int Heads           = 0,
+          int HeadTile        = 64,
+          bool BoundedPrefill = false,
+          bool PackedPrefill  = false>
 struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
 {
     static_assert(CacheMode >= 0 && CacheMode <= 2);
-    static constexpr int CACHE_MODE = CacheMode;
-    static constexpr bool RAW_Q     = RawQ;
-    static constexpr bool DIRECT_Q  = DirectQ;
-    static constexpr int NUM_SPLITS = FixedSplits;
-    static constexpr int NUM_HEADS  = Heads;
-    static constexpr int HEAD_TILE  = HeadTile;
+    static constexpr int CACHE_MODE       = CacheMode;
+    static constexpr bool RAW_Q           = RawQ;
+    static constexpr bool DIRECT_Q        = DirectQ;
+    static constexpr int NUM_SPLITS       = FixedSplits;
+    static constexpr int NUM_HEADS        = Heads;
+    static constexpr int HEAD_TILE        = HeadTile;
+    static constexpr bool BOUNDED_PREFILL = BoundedPrefill;
+    static constexpr bool PACKED_PREFILL  = PackedPrefill;
     static_assert(HeadTile == 32 || HeadTile == 64);
     static constexpr int smem_p_bytes = HeadTile * KV_TILE_SIZE * sizeof(D_PV);
     static constexpr int smem_bytes()

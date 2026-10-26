@@ -20,6 +20,9 @@ from aiter import (
     fused_norm_rope_attn_rope_cast_legacy as fused_norm_rope_attn_rope_cast,
 )
 from aiter.ops.fused_norm_rope_attn_rope_cast import (
+    fused_norm_rope_attn_rope_cast_fwd as fused_v41_fwd,
+)
+from aiter.ops.fused_norm_rope_attn_rope_cast import (
     fused_norm_rope_attn_rope_cast_legacy_fwd as fused_norm_rope_attn_rope_cast_fwd,
 )
 from aiter.test_common import perftest
@@ -1465,8 +1468,9 @@ def test_two_source_dense(heads, layout, mode, wide, with_sink, valid_indices):
 
 @pytest.mark.parametrize("heads", [64, 128])
 @pytest.mark.parametrize("empty", ["prefix", "extend", "both", "omitted", "tokens"])
-def test_two_source_empty_and_bounds(heads, empty):
-    tokens = 0 if empty == "tokens" else 3
+@pytest.mark.parametrize("large_grid", [False, True])
+def test_two_source_empty_and_bounds(heads, empty, large_grid):
+    tokens = 0 if empty == "tokens" else 512 if large_grid else 3
     q = torch.zeros(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
     counts = (
         0 if empty in ("prefix", "both") else 2,
@@ -1990,7 +1994,7 @@ def test_two_source_index_storage_offset(heads, mode, offset, valid_indices):
 @pytest.mark.parametrize("heads", [64, 128])
 @pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
 @pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
-@pytest.mark.parametrize("splits", [2, 7])
+@pytest.mark.parametrize("splits", [2, 4, 7])
 @pytest.mark.parametrize("valid_indices", [False, True])
 @pytest.mark.parametrize("with_sink", [False, True])
 def test_fp8_decode_dense(heads, layout, mode, splits, valid_indices, with_sink):
@@ -2014,7 +2018,7 @@ def test_fp8_decode_dense(heads, layout, mode, splits, valid_indices, with_sink)
 
 
 @pytest.mark.parametrize("heads", [64, 128])
-@pytest.mark.parametrize("splits", [1, 3, 32])
+@pytest.mark.parametrize("splits", [1, 3, 4, 32])
 @pytest.mark.parametrize("sources", ["both", "prefix", "extend", "empty"])
 def test_fp8_decode_ring_view(heads, splits, sources):
     q = torch.zeros(1, heads, 512, device="cuda", dtype=torch.float8_e4m3fn)
@@ -2157,7 +2161,8 @@ def test_fp8_decode_contract(bad):
 @pytest.mark.parametrize("heads", [64, 128])
 @pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
 @pytest.mark.parametrize("valid_indices", [False, True])
-def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
+@pytest.mark.parametrize("splits", [4, 32])
+def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices, splits):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, "padded", mode, True, False, valid_indices
     )
@@ -2175,7 +2180,7 @@ def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
     torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
     # More splits than live tiles must overwrite every partial, including empties.
     t = kwargs["q"].shape[0]
-    workspace = torch.full((t, 32, heads, 516), torch.nan, device="cuda")
+    workspace = torch.full((t, splits, heads, 516), torch.nan, device="cuda")
     for ids in (kwargs["kv_indices_prefix"], kwargs["kv_indices_extend"]):
         ids.fill_(-1)
     for sink in (
@@ -2188,7 +2193,7 @@ def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
         out = fused_v41(
             **kwargs,
             is_decode=True,
-            num_splits=32,
+            num_splits=splits,
             workspace=workspace,
             debug_out=debug,
             max_logits=torch.empty_like(mx),
@@ -2204,7 +2209,7 @@ def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
 @pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
 @pytest.mark.parametrize("valid_indices", [False, True])
 @pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
-@pytest.mark.parametrize("splits", [1, 2])
+@pytest.mark.parametrize("splits", [1, 2, 4])
 def test_fp8_decode_large_grid_replay(heads, mode, valid_indices, layout, splits):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, layout, mode, True, True, valid_indices
@@ -2273,3 +2278,269 @@ def test_fp8_decode_large_grid_replay(heads, mode, valid_indices, layout, splits
                 torch.testing.assert_close(
                     actual.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
                 )
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        320,
+        321,
+        384,
+        385,
+        512,
+        513,
+        640,
+        641,
+        768,
+        769,
+        896,
+        897,
+        1024,
+        1025,
+        2048,
+        2049,
+        4096,
+        1536,
+        2047,
+        3072,
+        4095,
+        4097,
+        8192,
+    ],
+)
+@pytest.mark.parametrize("mode", ["raw", "prepared"])
+@pytest.mark.parametrize("valid_indices", [False, True])
+@pytest.mark.parametrize("is_decode", [False, True])
+@pytest.mark.parametrize("heads", [64, 128])
+def test_shared_kv_wave_boundaries(tokens, mode, valid_indices, is_decode, heads):
+    _check_shared_kv_wave_boundary(tokens, mode, valid_indices, is_decode, heads)
+
+
+def _check_shared_kv_wave_boundary(
+    tokens,
+    mode,
+    valid_indices,
+    is_decode,
+    heads,
+    capacity=1200,
+    layout="padded",
+    exercise_common=False,
+):
+    kwargs, (expected, mx, lse) = two_source_inputs(
+        heads, layout, mode, wide=True, valid_indices=valid_indices
+    )
+    selected = (torch.arange(tokens, device="cuda") + 5) % kwargs["q"].shape[0]
+    for key in ("q", "q_scale"):
+        if kwargs[key] is not None:
+            value = kwargs[key]
+            kwargs[key] = (
+                value.view(torch.uint8).index_select(0, selected).view(value.dtype)
+            )
+    kwargs["positions"] = kwargs["positions"].index_select(0, selected)
+    if exercise_common:
+        kwargs["positions"] = kwargs["positions"].int()
+    for source in ("prefix", "extend"):
+        ptr = kwargs[f"kv_indptr_{source}"].tolist()
+        ids = kwargs[f"kv_indices_{source}"]
+        rows = [ids[ptr[i] : ptr[i + 1]] for i in selected.tolist()]
+        new_ids, new_ptr = csr(rows, torch.int32, 2**31 - 1)
+        kwargs[f"kv_indices_{source}"] = new_ids
+        kwargs[f"kv_indptr_{source}"] = new_ptr
+    ids = kwargs["kv_indices_prefix"]
+    total = tokens * capacity - kwargs["kv_indices_extend"].numel()
+    assert total >= ids.numel()
+    padded = torch.full((total,), 2**31 - 1, device="cuda", dtype=torch.int32)
+    padded[: ids.numel()] = ids
+    kwargs["kv_indices_prefix"] = padded
+    expected, mx, lse = [x.index_select(0, selected) for x in (expected, mx, lse)]
+    kwargs.update(
+        is_decode=is_decode,
+        debug_out=torch.empty_like(expected),
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    out = fused_v41(**kwargs)
+    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
+    assert float((kwargs["debug_out"] - expected).norm() / expected.norm()) < 0.005
+    assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
+    # Replay must overwrite every head, including after invalid and empty rows.
+    kwargs["out"], kwargs["out_scale"] = out[:2]
+    outputs = (*out, kwargs["debug_out"])
+    refs = tuple(x.clone() for x in outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_v41(**kwargs)
+    for _ in range(2):
+        for x in outputs:
+            x.view(torch.uint8).fill_(255)
+        graph.replay()
+        for x, ref in zip(outputs, refs):
+            torch.testing.assert_close(
+                x.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+            )
+
+    if exercise_common:
+        # With 32-bit positions, omitted diagnostic outputs must agree with the
+        # general route. Toggle each host guard while retaining identical inputs.
+        for variant in ("common", "positions64", "sinkless", "max", "debug", "no_lse"):
+            call = dict(kwargs)
+            call["max_logits"] = None
+            call["debug_out"] = None
+            if variant == "positions64":
+                call["positions"] = call["positions"].long()
+            elif variant == "sinkless":
+                call["attn_sink"] = None
+            elif variant == "max":
+                call["max_logits"] = torch.empty_like(mx)
+            elif variant == "debug":
+                call["debug_out"] = torch.empty_like(expected)
+            elif variant == "no_lse":
+                call["lse"] = None
+            general = dict(
+                call,
+                debug_out=torch.empty_like(expected),
+                max_logits=torch.empty_like(mx),
+                lse=torch.empty_like(lse),
+            )
+            reference = [x.clone() for x in fused_v41(**general)]
+            actual = fused_v41(**call)
+            for value, ref in zip(actual, reference):
+                if value is not None:
+                    torch.testing.assert_close(
+                        value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+                    )
+            if call["debug_out"] is not None:
+                torch.testing.assert_close(
+                    call["debug_out"], general["debug_out"], rtol=0, atol=0
+                )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fused_v41(**call)
+            for value in actual:
+                if value is not None:
+                    value.view(torch.uint8).fill_(255)
+            graph.replay()
+            for value, ref in zip(actual, reference):
+                if value is not None:
+                    torch.testing.assert_close(
+                        value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+                    )
+
+
+@pytest.mark.parametrize("tokens", [511, 512, 1024, 1025])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "rotated", "norm"])
+@pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_h64_common_prefill_contract(tokens, mode, layout, valid_indices):
+    _check_shared_kv_wave_boundary(
+        tokens, mode, valid_indices, False, 64, layout=layout, exercise_common=True
+    )
+
+
+@pytest.mark.parametrize("tokens", [2048, 4096])
+@pytest.mark.parametrize("capacity", [1023, 1024, 1025])
+@pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
+@pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_h64_large_prefill_capacity(tokens, capacity, mode, layout, valid_indices):
+    # Spare CSR allocation must not turn padding into attended keys at the route boundary.
+    _check_shared_kv_wave_boundary(
+        tokens, mode, valid_indices, False, 64, capacity, layout
+    )
+
+
+@pytest.mark.parametrize("bad_splits", [2**32 + 1, -(2**32) + 1])
+def test_native_split_integer_width_and_error_recovery(bad_splits):
+    kwargs, _ = two_source_inputs(128, "padded", "raw")
+    tokens, heads, _ = kwargs["q"].shape
+    outputs = fused_v41(
+        **kwargs,
+        max_logits=torch.empty((tokens, heads), device="cuda"),
+        lse=torch.empty((tokens, heads), device="cuda"),
+    )
+    references = [x.clone() for x in outputs]
+    native = dict(kwargs)
+    native.update(
+        out=outputs[0],
+        out_scale=outputs[1],
+        max_logits=outputs[2],
+        lse=outputs[3],
+        debug_out=None,
+        q_norm=False,
+        norm_eps=1e-6,
+        softmax_scale=512**-0.5,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Both values would become a valid split count if the FFI narrowed to int32.
+        with pytest.raises(RuntimeError, match="num_splits must be in"):
+            fused_v41_fwd(**native, num_splits=bad_splits)
+        for output in outputs:
+            output.view(torch.uint8).fill_(255)
+        # Default split/workspace values and a fresh call must work after the error.
+        fused_v41_fwd(**native)
+    torch.cuda.current_stream().wait_stream(stream)
+    for output, reference in zip(outputs, references):
+        torch.testing.assert_close(
+            output.view(torch.uint8), reference.view(torch.uint8), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "wide_view", ["unified_kv", "unified_kv_scale", "kv", "kv_scale"]
+)
+@pytest.mark.parametrize("rows", [3, 5])
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("tokens", [512, 2048])
+def test_h64_prefill_address_width(wide_view, rows, prepared, tokens):
+    # Exercise unsigned offsets beyond 2 GiB and the fallback beyond 4 GiB.
+    # All four independently strided views must participate in the dispatch guard.
+    heads = 64
+    row_stride = 2**30 + 4
+    kwargs = {}
+    for key in ("unified_kv", "unified_kv_scale", "kv", "kv_scale"):
+        scale = key.endswith("scale")
+        width = 16 if scale else 512
+        if key == wide_view:
+            storage = torch.empty(
+                (rows - 1) * row_stride + width, device="cuda", dtype=torch.uint8
+            )
+            storage[:528] = 0
+            view = storage.as_strided((rows, width), (row_stride, 1))
+        else:
+            view = torch.empty(rows, width, device="cuda", dtype=torch.uint8)
+        view.fill_(127 if scale else 0x38)
+        kwargs[key] = view.view(torch.float8_e8m0fnu if scale else torch.float8_e4m3fn)
+    for source, count in (("prefix", 1024), ("extend", 128)):
+        kwargs[f"kv_indices_{source}"] = torch.full(
+            (tokens * count,), rows - 1, device="cuda", dtype=torch.int32
+        )
+        kwargs[f"kv_indptr_{source}"] = (
+            torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * count
+        )
+    q = torch.zeros(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+    kwargs.update(
+        q=q.to(torch.float8_e4m3fn) if prepared else q,
+        q_scale=(
+            torch.full((tokens, heads, 16), 127, device="cuda", dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            )
+            if prepared
+            else None
+        ),
+        q_is_rotated=True,
+        cos=torch.ones(1, 32, device="cuda", dtype=torch.bfloat16),
+        sin=torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
+        positions=torch.zeros(tokens, device="cuda", dtype=torch.int32),
+        debug_out=torch.empty_like(q, dtype=torch.float32),
+    )
+    out = fused_v41(**kwargs)
+    torch.testing.assert_close(
+        kwargs["debug_out"], torch.ones_like(q, dtype=torch.float32), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        dequantize(*out[:2]), torch.ones_like(q, dtype=torch.float32), rtol=0, atol=0
+    )

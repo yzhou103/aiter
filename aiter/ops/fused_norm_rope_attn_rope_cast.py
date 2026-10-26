@@ -11,6 +11,10 @@ import torch
 
 from ..jit.core import compile_ops
 
+# The ctypes ABI follows these signatures positionally. Keep argument order in
+# sync with csrc/py_itfs_cu/fused_norm_rope_attn_rope_cast_kernels.cu.
+MD_NAME = "module_fused_norm_rope_attn_rope_cast"
+
 __all__ = [
     "fused_norm_rope_attn_rope_cast",
     "fused_norm_rope_attn_rope_cast_bf16",
@@ -20,7 +24,7 @@ __all__ = [
 ]
 
 
-@compile_ops("module_fused_norm_rope_attn_rope_cast", develop=True)
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def fused_norm_rope_attn_rope_cast_legacy_fwd(
     q: torch.Tensor,
     pool: torch.Tensor,
@@ -101,7 +105,6 @@ def fused_norm_rope_attn_rope_cast_legacy(
     Set ``fp8_qk=True`` for scaled FP8 QK with fused group32 Q quantization
     after optional RoPE. This opt-in mode supports H64/H128 with FP8 KV
     and no BF16 extend. PV remains BF16 and accumulation remains FP32.
-    This experimental path is slower than BF16 QK on the measured fixtures;
     Q and KV use one E8M0 scale per group of 32 values.
     Alternatively supply FP8 E4M3FN ``q[T,H,512]`` and contiguous uint8
     ``q_scale[T,H,16]`` with ``fp8_qk=True, q_is_rotated=True`` to consume
@@ -247,7 +250,7 @@ def fused_norm_rope_attn_rope_cast_bf16(
     )
 
 
-@compile_ops("module_fused_norm_rope_attn_rope_cast", develop=True)
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def fused_norm_rope_attn_rope_cast_fwd(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,

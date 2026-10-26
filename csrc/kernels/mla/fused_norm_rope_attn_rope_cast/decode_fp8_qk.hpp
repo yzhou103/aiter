@@ -27,9 +27,11 @@ pack_fp8_qk_group(opus::vector_t<opus::fp8_t, 32> values, int lane)
 // Two FP8 K slots carry values, group32 scales and 32 validity flags each.
 // A single BF16 V slot is materialized from the current K slot before PV.
 // CTA barriers bracket V use so another wave cannot overwrite live PV inputs.
-template <int PageSize>
+template <int PageSize, int RawPitch = 528>
 struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
 {
+    static constexpr int raw_pitch = RawPitch;
+    static_assert(RawPitch >= 528 && RawPitch % 16 == 0);
     using Base = PackedDecodeSource64<true, PageSize>;
     // Preserve int32 paged indices until the next iteration consumes them.
     // Extending an async int32 load immediately would force a VMEM wait before QK.
@@ -88,22 +90,22 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
         const bool all_live = __builtin_amdgcn_ballot_w64(raw.live) == ~uint64_t(0);
         opus::static_for<4>([&](auto j) {
             const int d = int(j) * 128 + (lane % 8) * 16;
-            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * 528 + d) =
-                raw.bytes[int(j)];
+            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * RawPitch +
+                                                                          d) = raw.bytes[int(j)];
         });
         if((lane & 7) == 0)
         {
-            *reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(bytes + 32 * 528 + row * 4) =
+            *reinterpret_cast<OPUS_LDS_ADDR uint32_t*>(bytes + 32 * RawPitch + row * 4) =
                 uint32_t(raw.live) | (uint32_t(all_live) << 1);
             const opus::vector_t<uint32_t, 4> codes =
                 raw.live
                     ? raw.scales
                     : opus::vector_t<uint32_t, 4>{0x7f7f7f7f, 0x7f7f7f7f, 0x7f7f7f7f, 0x7f7f7f7f};
-            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * 528 + 512) =
-                codes;
+            *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<uint32_t, 4>*>(bytes + row * RawPitch +
+                                                                          512) = codes;
         }
     }
-    template <bool CacheScales, class Pointer, class RawPointer>
+    template <bool CacheScales, int WaveGroups = 1, class Pointer, class RawPointer>
     __device__ __forceinline__ void
     dequant_current(RawPointer raw_src,
                     Pointer dst,
@@ -120,15 +122,20 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
         // lifetimes and crosses the measured residency threshold.
         auto* lds = reinterpret_cast<OPUS_LDS_ADDR bf16_t*>(reinterpret_cast<uintptr_t>(dst));
         opus::static_for<4>([&](auto j) {
+            // The two wave groups dequantize opposite halves of V into disjoint
+            // LDS addresses. Both groups use the same four row-owner wave IDs.
+            if constexpr(WaveGroups == 2)
+                if(__builtin_amdgcn_readfirstlane(threadIdx.x / 256) != int(j) / 2)
+                    return;
             const int d = int(j) * 128 + (lane % 8) * 16;
             auto bits   = *reinterpret_cast<OPUS_LDS_ADDR const opus::vector_t<uint32_t, 4>*>(
-                bytes + row * 528 + d);
+                bytes + row * RawPitch + d);
             float scale;
             if constexpr(CacheScales)
                 scale =
                     __uint_as_float(((scale_words[int(j)] >> (((lane % 8) / 2) * 8)) & 255u) << 23);
             else
-                scale = __uint_as_float(uint32_t(bytes[row * 528 + 512 + d / 32]) << 23);
+                scale = __uint_as_float(uint32_t(bytes[row * RawPitch + 512 + d / 32]) << 23);
             opus::vector_t<bf16_t, 16> values;
             opus::static_for<4>([&](auto half) {
                 uint32_t word = bits[int(half)];
@@ -186,7 +193,7 @@ struct Fp8QkTwoSource64 : Fp8QkSource64<-3>
 };
 
 namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1 {
-template <class Traits, bool H64Schedule = false, class Source>
+template <class Traits, bool H64Schedule = false, int WaveGroups = 1, int PVReuse = 1, class Source>
 __device__ void fp8_qk_decode_accum64(const Source& source,
                                       int valid_kv_len,
                                       int num_kv_tiles,
@@ -203,7 +210,19 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
-    using D_ACC  = typename T::D_ACC;
+    static_assert(WaveGroups == 1 || WaveGroups == 2);
+    static_assert(PVReuse == 1 || (WaveGroups == 2 && (PVReuse == 2 || PVReuse == 4)));
+    constexpr int PVSlices = 16 / PVReuse;
+    constexpr int PVDepth  = 2;
+    const int full_wave    = __builtin_amdgcn_readfirstlane(thread_id_x() / 64);
+    const int head_base    = (full_wave / PVReuse) * PVReuse;
+    const int dim_base     = (full_wave % PVReuse) * PVSlices;
+    auto* shared_p =
+        reinterpret_cast<OPUS_LDS_ADDR bf16_t*>(reinterpret_cast<uintptr_t>(smem_kv_buf)) +
+        T::smem_kv_tile_elems;
+    auto* shared_f       = reinterpret_cast<OPUS_LDS_ADDR float*>(shared_p + 8 * 64 * 8);
+    const bool load_wave = WaveGroups == 1 || thread_id_x() < 256;
+    using D_ACC          = typename T::D_ACC;
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id)); // break CSE
@@ -244,15 +263,15 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
     };
 
     auto* raw_cur  = reinterpret_cast<OPUS_LDS_ADDR uint8_t*>(reinterpret_cast<uintptr_t>(raw_lds));
-    auto* raw_next = raw_cur + 32 * 528 + 128;
+    auto* raw_next = raw_cur + 32 * Source::raw_pitch + 128;
     vector_t<uint32_t, 4> tile_flags;
     auto mask_scores = [&](auto& s) {
         vector_t<uint32_t, 4> flags;
-        if constexpr(H64Schedule)
+        if constexpr(H64Schedule || WaveGroups == 2)
             flags = tile_flags;
         else
-            flags =
-                *reinterpret_cast<OPUS_LDS_ADDR const vector_t<uint32_t, 4>*>(raw_cur + 32 * 528);
+            flags = *reinterpret_cast<OPUS_LDS_ADDR const vector_t<uint32_t, 4>*>(
+                raw_cur + 32 * Source::raw_pitch);
         const uint32_t full = flags[0] & flags[1] & flags[2] & flags[3];
         if(__builtin_amdgcn_readfirstlane(full) & 2u)
             return;
@@ -265,7 +284,8 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
             int first = int(n) * 16 + (mask_lane / 16) * 4;
             static_for<4>([&](auto j) {
                 int k = first + int(j);
-                if(!reinterpret_cast<OPUS_LDS_ADDR const uint32_t*>(raw_cur + 32 * 528)[k])
+                if(!reinterpret_cast<OPUS_LDS_ADDR const uint32_t*>(raw_cur +
+                                                                    32 * Source::raw_pitch)[k])
                     s[int(n) * 4 + int(j)] = -INFINITY;
             });
         });
@@ -290,21 +310,22 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
                 // partial waits below. Immediate offsets avoid per-load VALU work.
                 vector_t<uint32_t, 4> words;
                 const uint32_t addr = uint32_t(reinterpret_cast<uintptr_t>(
-                    raw_cur + (lane_id % 16) * 528 + (lane_id / 16) * 16));
+                    raw_cur + (lane_id % 16) * Source::raw_pitch + (lane_id / 16) * 16));
                 asm volatile("ds_read_b128 %0, %1 offset:%2"
                              : "=v"(words)
-                             : "v"(addr), "n"(n * 16 * 528 + step * 128 + int(half) * 64)
+                             : "v"(addr),
+                               "n"(n * 16 * Source::raw_pitch + step * 128 + int(half) * 64)
                              : "memory");
                 auto part = __builtin_bit_cast(vector_t<fp8_t, 16>, words);
                 set_slice(
                     keys[slot], part, number<int(half) * 16>{}, number<int(half) * 16 + 16>{});
             });
-            const uint32_t scale_addr = uint32_t(
-                reinterpret_cast<uintptr_t>(raw_cur + (lane_id % 16) * 528 + lane_id / 16));
+            const uint32_t scale_addr = uint32_t(reinterpret_cast<uintptr_t>(
+                raw_cur + (lane_id % 16) * Source::raw_pitch + lane_id / 16));
             uint32_t code;
             asm volatile("ds_read_u8 %0, %1 offset:%2"
                          : "=v"(code)
-                         : "v"(scale_addr), "n"(n * 16 * 528 + 512 + step * 4)
+                         : "v"(scale_addr), "n"(n * 16 * Source::raw_pitch + 512 + step * 4)
                          : "memory");
             scales[slot] = code;
         };
@@ -379,43 +400,52 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
     opus::vector_t<uint32_t, 4> current_scales;
     if constexpr(Source::is_packed)
     {
-        const auto initial = source.prefetch(0, warp_id, lane_id);
-        if constexpr(H64Schedule)
-            current_scales = initial.scales;
-        source.commit_raw(initial, raw_cur, warp_id, lane_id);
+        if(load_wave)
+        {
+            const auto initial = source.prefetch(0, warp_id, lane_id);
+            if constexpr(H64Schedule)
+                current_scales = initial.scales;
+            source.commit_raw(initial, raw_cur, warp_id, lane_id);
+        }
     }
     else
         source.template load_tile<T>(0, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
     s_waitcnt_vmcnt(0_I);
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
-    auto next_row = source.prefetch_index(32 + (lane_id / 8) * 4 + warp_id);
+    typename Source::Index next_row = -1;
+    if(load_wave)
+        next_row = source.prefetch_index(32 + (lane_id / 8) * 4 + warp_id);
     for(int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx)
     {
         typename Source::RawTile next_raw;
         if constexpr(Source::is_packed)
         {
-            auto current_row = next_row;
-            asm volatile("" : "+v"(current_row));
-            next_raw = source.prefetch_row(current_row, warp_id, lane_id);
-            next_row = source.prefetch_index((tile_idx + 2) * 32 + (lane_id / 8) * 4 + warp_id);
+            if(load_wave)
+            {
+                auto current_row = next_row;
+                asm volatile("" : "+v"(current_row));
+                next_raw = source.prefetch_row(current_row, warp_id, lane_id);
+                next_row = source.prefetch_index((tile_idx + 2) * 32 + (lane_id / 8) * 4 + warp_id);
+            }
         }
         __builtin_amdgcn_sched_barrier(0);
 
-        if constexpr(H64Schedule)
+        if constexpr(H64Schedule || WaveGroups == 2)
         {
             // Issue validity before K operands. The first lgkmcnt(3) drains this
             // older read along with operand 0; no additional wait is needed after QK.
-            const uint32_t flags_addr = uint32_t(reinterpret_cast<uintptr_t>(raw_cur + 32 * 528));
+            const uint32_t flags_addr =
+                uint32_t(reinterpret_cast<uintptr_t>(raw_cur + 32 * Source::raw_pitch));
             asm volatile("ds_read_b128 %0, %1" : "=v"(tile_flags) : "v"(flags_addr) : "memory");
         }
         compute_qk(v_s);
         // Keep next-tile VMEM waits after QK, so QK covers raw prefetch
         // latency. This is a compiler fence, not a CTA barrier.
         __builtin_amdgcn_sched_barrier(0);
-        if constexpr(!H64Schedule)
+        if constexpr(!H64Schedule && WaveGroups == 1)
         {
-            if(tile_idx + 1 < num_kv_tiles)
+            if(load_wave && tile_idx + 1 < num_kv_tiles)
             {
                 if constexpr(Source::is_packed)
                     source.commit_raw(next_raw, raw_next, warp_id, lane_id);
@@ -428,7 +458,7 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         // Reuse the sole V slot only after the previous iteration's barrier.
         // The H64 schedule carries scale words across iterations; H128 keeps
         // native LDS scale reads to avoid its measured register-pressure cost.
-        source.template dequant_current<H64Schedule>(
+        source.template dequant_current<H64Schedule, WaveGroups>(
             raw_cur, s_kv.ptr, warp_id, lane_id, current_scales);
 
         D_ACC row_max = track_max<T>(v_s, temperature_scale, actual_max);
@@ -447,12 +477,23 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ATTN>(v_s);
-        if(!below)
-            scale_output_tile<T>(v_o, rescale_m);
-
-        if constexpr(H64Schedule)
+        if constexpr(PVReuse == 1)
         {
-            if(tile_idx + 1 < num_kv_tiles)
+            if(!below)
+                scale_output_tile<T>(v_o, rescale_m);
+        }
+        else
+        {
+            // P and online-softmax factors are shared with the other head waves.
+            *reinterpret_cast<OPUS_LDS_ADDR vector_t<D_ATTN, 8>*>(
+                shared_p + (full_wave * 64 + lane_id) * 8) = v_p;
+            if(lane_id < 16)
+                shared_f[full_wave * 16 + lane_id] = rescale_m;
+        }
+
+        if constexpr(H64Schedule || WaveGroups == 2)
+        {
+            if(load_wave && tile_idx + 1 < num_kv_tiles)
             {
                 if constexpr(Source::is_packed)
                     source.commit_raw(next_raw, raw_next, warp_id, lane_id);
@@ -464,17 +505,70 @@ __device__ void fp8_qk_decode_accum64(const Source& source,
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier(); // All waves have finished writing V.
-        static_for<3>(
-            [&](auto j) { v_v[int(j)] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(j)); });
-        s_waitcnt_lgkmcnt(number<(3 - 1) * T::v_ds_read_insts>{});
-        __builtin_amdgcn_sched_barrier(0);
-        compute_pv(v_p, v_v, v_o_slices, tile_idx);
+        if constexpr(PVReuse == 1)
+        {
+            static_for<3>(
+                [&](auto j) { v_v[int(j)] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(j)); });
+            s_waitcnt_lgkmcnt(number<(3 - 1) * T::v_ds_read_insts>{});
+            __builtin_amdgcn_sched_barrier(0);
+            compute_pv(v_p, v_v, v_o_slices, tile_idx);
+        }
+        else
+        {
+            // Each wave keeps 128 FP32 O values: PVReuse head groups times
+            // 16/PVReuse D32 slices. Reuse V for all those head groups.
+            vector_t<D_ATTN, 8> probs[PVReuse];
+            float factors[PVReuse];
+            static_for<PVReuse>([&](auto g) {
+                probs[int(g)] = *reinterpret_cast<OPUS_LDS_ADDR const vector_t<D_ATTN, 8>*>(
+                    shared_p + ((head_base + int(g)) * 64 + lane_id) * 8);
+                factors[int(g)] = shared_f[(head_base + int(g)) * 16 + lane_id % 16];
+            });
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_sched_barrier(0);
+            bool rescale = false;
+            static_for<PVReuse>([&](auto g) { rescale |= factors[int(g)] != 1.0f; });
+            if(__builtin_amdgcn_ballot_w64(rescale) != 0)
+                static_for<PVReuse>([&](auto g) {
+                    static_for<PVSlices>(
+                        [&](auto ds) { v_o[int(g) * PVSlices + int(ds)] *= factors[int(g)]; });
+                });
+            typename decltype(mma1)::vtype_b vals[PVDepth];
+            auto load_v = [&](auto ds) {
+                constexpr int local = int(ds);
+                const int slice     = dim_base + local;
+                const int offset =
+                    (slice / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) +
+                    (slice % 2) * T::SLICE_D;
+                vals[local % PVDepth] = tr_load<T::VEC_TR_V>(s_kv, u_rv + offset);
+            };
+            static_for<PVDepth>([&](auto ds) { load_v(ds); });
+            s_waitcnt_lgkmcnt(number<(PVDepth - 1) * T::v_ds_read_insts>{});
+            __builtin_amdgcn_sched_barrier(0);
+            static_for<PVSlices>([&](auto ds) {
+                constexpr int local = int(ds);
+                static_for<PVReuse>([&](auto g) {
+                    constexpr int idx = int(g) * PVSlices + local;
+                    v_o[idx]          = pv_vgpr(probs[int(g)], vals[local % PVDepth], v_o[idx]);
+                });
+                if constexpr(local + PVDepth < PVSlices)
+                    load_v(number<local + PVDepth>{});
+                if constexpr(local + 1 < PVSlices)
+                {
+                    constexpr int remaining   = PVSlices - local - 1;
+                    constexpr int outstanding = remaining < PVDepth ? remaining : PVDepth;
+                    s_waitcnt_lgkmcnt(number<(outstanding - 1) * T::v_ds_read_insts>{});
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+            });
+        }
         s_waitcnt_vmcnt(0_I);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier(); // All PV reads finish before V is reused.
 
         if constexpr(H64Schedule)
-            current_scales = next_raw.scales;
+            if(load_wave)
+                current_scales = next_raw.scales;
         std::swap(raw_cur, raw_next);
     }
 }

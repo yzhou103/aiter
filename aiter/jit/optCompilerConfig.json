@@ -704,7 +704,6 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/fused_norm_rope_attn_rope_cast.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fused_norm_rope_attn_rope_cast_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/fused_norm_rope_attn_rope_cast_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/fused_norm_rope_attn_rope_cast/fused_norm_rope_attn_rope_cast_fwd/kernel.cu'"
         ],
         "flags_extra_cc": [],

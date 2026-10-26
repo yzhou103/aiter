@@ -2,6 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_hip_common.h"
+#include "dispatch_policy.hpp"
 #include "fused_norm_rope_attn_rope_cast_fwd/kernel.h"
 #include "kernel_args.hpp"
 
@@ -18,19 +19,14 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
 
     // Host capacities estimate rows/query without synchronizing the device CSR.
     const int64_t capacity = int64_t(a.prefix_capacity) + (strided ? a.extend_capacity : 0);
-    const bool h128 = a.heads == 128 && a.tokens <= 320 && capacity >= int64_t(a.tokens) * 1024;
-    // The shared-V 64-row pipeline amortizes its LDS footprint earlier for
-    // two-source prefill after fusing the Q and output transforms. Keep short
-    // lists and large grids on the 32-row kernel; preserve single-source limits.
+    namespace policy       = fused_norm_rope_attn_rope_cast_policy;
     const bool two_sources = a.prefix_capacity > 0 && a.extend_capacity > 0;
-    const bool h64         = a.heads == 64 && strided &&
-                     ((a.tokens <= 256 && capacity >= int64_t(a.tokens) * 512) ||
-                      (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 1536) ||
-                      (two_sources && ((a.tokens <= 768 && capacity >= int64_t(a.tokens) * 768) ||
-                                       (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 896))));
-    const bool head32 = strided && two_sources && a.tokens * (a.heads / 64) == 128 &&
-                        capacity < int64_t(a.tokens) * 768;
-    if(!h64 && !h128 && !head32 && !(strided && a.num_splits > 1))
+    const bool prefill64 =
+        (a.heads == 64 && strided && policy::prefer_h64_64row(a.tokens, capacity, two_sources)) ||
+        (a.heads == 128 && policy::prefer_h128_64row(a.tokens, capacity));
+    const bool head32 =
+        strided && two_sources && policy::prefer_32head_tile(a.tokens, a.heads, capacity);
+    if(!prefill64 && !head32 && !(strided && a.num_splits > 1))
         return false;
     FusedNormRopeAttnRopeCastParams k{};
     k.partial_ptr          = a.partial;
