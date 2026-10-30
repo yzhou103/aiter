@@ -1082,8 +1082,8 @@ def derive(files, title="", raw_diff=""):
     if any(p.endswith((".csv", ".yaml", ".yml")) or
            (p.endswith(".json") and ("config" in p or "tuned" in p)) for p in paths):
         hit("tuning-config", "D3 HK4")
-    if re.search(r"^\s*(el)?if .*(dtype|arch|layout|quant|backend)", add, re.M):
-        hit("dispatch-change", "B1 B3 B4 A3")
+    if re.search(r"^\s*(el)?if .*(dtype|arch|layout|quant|backend|activation)", add, re.M):
+        hit("dispatch-change", "A4 B1 B3 B4 A3")
     # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
     if any(p in ("aiter/__init__.py", "aiter/jit/core.py") for p in paths):
         hit("tier1-import-chain", "STEP4 E5 C5")
@@ -2273,7 +2273,7 @@ def audit_core_files(text, diff_text, root=None):
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
 VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
-                   r"nullptr|None\b|2\^\d+", re.I)
+                   r"nullptr|None\b|2\^\d+|\b[0-9a-f]{7,40}\b", re.I)
 IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b")
 
 

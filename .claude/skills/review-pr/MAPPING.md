@@ -17,7 +17,7 @@ disagreement between this file and the deriver is caught.
 | `modified-kernel`       | A1 A4 B2 D1 D8 P6 |
 | `new-routing-value`     | A4 B4 C4 |
 | `tuning-config`         | D3 HK4 |
-| `dispatch-change`       | B1 B3 B4 A3 |
+| `dispatch-change`       | A4 B1 B3 B4 A3 |
 | `tier1-import-chain`    | STEP4 E5 C5 |
 | `tier2-dispatch`        | E5 E4 C5 |
 | `ops-wrapper`           | B6 C5 |

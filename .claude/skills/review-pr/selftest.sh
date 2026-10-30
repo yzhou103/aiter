@@ -244,6 +244,23 @@ t "an inconclusive HK20 warning reaches the card" \
   "$(card_problems "$repin" "$v_inc" $'⚠️ could not verify 3rdparty/composable_kernel at 2222222 (fetch failed)')" "none"
 t "an HK20 FIRE missing from the card is still caught" \
   "$(card_problems "$repin" "$v_red" '')" "UNREPORTED-FIRE"
+# Mixed-hex commit SHA (like 1f66d862) must be recognized as concrete evidence
+v_hex='HK20 FIRE -- 3rdparty/composable_kernel pinned to 1f66d862 which is on no ROCm/composable_kernel branch'
+t "a mixed-hex commit SHA is concrete evidence" \
+  "$(card_problems "$repin" "$v_hex" $'\360\237\224\264 3rdparty/composable_kernel is pinned to 1f66d862, on no ROCm/composable_kernel branch')" "none"
+
+# A4 must be selected when a host-side dispatch wrapper adds an activation branch
+dispatch_host='diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py
+--- a/aiter/fused_moe.py
++++ b/aiter/fused_moe.py
+@@ -100,6 +100,8 @@
+     if activation == ActivationType.Silu:
+         return silu(x)
++    elif activation == ActivationType.Relu2:
++        return relu2(x)
+'
+t "a host-side activation branch selects A4 via dispatch-change" \
+  "$(rules_of "$dispatch_host" dispatch-change | grep -ow A4)" "A4"
 
 echo "[mapping]"
 # MAPPING.md is generated; a family or rule added to derive() without regenerating it drifts.
